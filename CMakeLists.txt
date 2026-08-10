@@ -1,0 +1,32 @@
+cmake_minimum_required(VERSION 3.16)
+project(SlideCut CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+set(IMGUI third_party/imgui)
+
+add_executable(SlideCut WIN32
+    src/main.cpp
+    third_party/impl.cpp
+    ${IMGUI}/imgui.cpp
+    ${IMGUI}/imgui_draw.cpp
+    ${IMGUI}/imgui_tables.cpp
+    ${IMGUI}/imgui_widgets.cpp
+    ${IMGUI}/backends/imgui_impl_win32.cpp
+    ${IMGUI}/backends/imgui_impl_dx11.cpp
+)
+
+target_include_directories(SlideCut PRIVATE ${IMGUI} ${IMGUI}/backends third_party)
+target_compile_definitions(SlideCut PRIVATE UNICODE _UNICODE)
+target_link_libraries(SlideCut PRIVATE d3d11 dxgi d3dcompiler ole32 uuid dwmapi winmm
+                                       shell32 shlwapi)
+
+add_custom_command(TARGET SlideCut POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/assets $<TARGET_FILE_DIR:SlideCut>/assets)
+
+if(NOT MSVC)
+    target_compile_options(SlideCut PRIVATE -O2 -municode)
+    target_link_options(SlideCut PRIVATE -municode -static)
+endif()

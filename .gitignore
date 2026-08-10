@@ -1,0 +1,53 @@
+# ---- build output
+build/
+out/
+bin/
+obj/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+*.dir/
+compile_commands.json
+
+# ---- binaries / intermediates
+*.exe
+*.dll
+*.lib
+*.a
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.res
+
+# ---- MSVC / Visual Studio
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.*
+*.user
+*.suo
+
+# ---- editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# ---- OS junk
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# ---- SlideCut scratch (proxies/logs live in %TEMP%, but keep stray copies out)
+slidecut_*.log
+slidecut_progress.txt
+*.mp4
+*.mov
+*.mkv

@@ -141,9 +141,10 @@ struct LoadedImage {                       // produced on worker thread
     bool ok = false;
 };
 
-// A decoded low-res frame ladder for one video file, shared by every clip cut from
-// it. Frames are jpegs on disk (written progressively by a background ffmpeg) and
-// uploaded to the GPU on first use.
+// Information gathered in the background about a clip's video file, plus the
+// small low-fps jpeg ladder used for scrubbing instead of seeking the real file.
+struct Song;
+
 struct VideoSource {
     std::wstring path;
     std::wstring proxyDir;                 // holds %06d.jpg at PROXY_FPS
@@ -163,6 +164,7 @@ struct VideoSource {
     std::vector<float> apeaks;             // min,max per bucket
     std::atomic<bool>  apeaksReady{ false };
     double  apeakRate = 200.0;             // buckets per second
+    std::shared_ptr<Song> audio;           // full audio for playback
 };
 
 static int g_uidNext = 1;                  // stable per-clip id, used for filter labels
@@ -205,6 +207,7 @@ struct Clip {
     Grade        grade;                    // this shot's own colour
     double       xfade = 0.0;              // dissolve into the next shot, seconds
     bool         useAudio = true;          // mix this clip's own audio into the export
+    float        volume = 1.0f;            // multiplier for the clip's own audio
 
     // ---- placement on an overlay track (ignored on the base track, which packs)
     double       start = 0.0;              // timeline seconds where this clip begins
@@ -537,6 +540,16 @@ static void EnsureRootSeq() {
     if (g_nav.empty()) g_nav.push_back(0);
 }
 
+struct VideoAudioBlock {
+    std::shared_ptr<Song> audio;
+    double start;
+    double trimIn;
+    double duration;
+    float volume;
+    bool reversed;
+};
+static std::vector<VideoAudioBlock> g_videoAudio;
+
 static void AudioCallback(ma_device*, void* out, const void*, ma_uint32 frames) {
     MixGuard lock;
     float* o = (float*)out;
@@ -566,6 +579,25 @@ static void AudioCallback(ma_device*, void* out, const void*, ma_uint32 frames) 
             }
         }
     }
+    for (auto& c : g_videoAudio) {
+        Song& s = *c.audio;
+        float gain = c.volume;
+        long long start_base = current_frames - llround(c.start * SAMPLE_RATE);
+        long long lo = llround(c.trimIn * SAMPLE_RATE);
+        long long hi = llround((c.trimIn + c.duration) * SAMPLE_RATE);
+        long long total = (long long)(s.pcm.size() / 2);
+        if (hi > total) hi = total;
+        for (ma_uint32 i = 0; i < frames; i++) {
+            long long idx = c.reversed 
+                ? hi - 1 - (start_base + i)
+                : lo + (start_base + i);
+            if (idx >= lo && idx < hi) {
+                o[i * 2 + 0] += s.pcm[idx * 2 + 0] * gain;
+                o[i * 2 + 1] += s.pcm[idx * 2 + 1] * gain;
+            }
+        }
+    }
+
     for (ma_uint32 i = 0; i < frames * 2; i++)      // keep the sum inside the rails
         o[i] = o[i] > 1.0f ? 1.0f : (o[i] < -1.0f ? -1.0f : o[i]);
     g_playhead.store((double)(current_frames + frames) / SAMPLE_RATE, std::memory_order_relaxed);
@@ -872,36 +904,20 @@ static int CountProxyFrames(const std::wstring& dir) {
 // Background: pull the video's own audio down to mono 8k and reduce it to peaks,
 // cached next to the proxy frames so a reopened project draws instantly.
 static void BuildVideoPeaks(std::shared_ptr<VideoSource> vs) {
-    const int RATE = 8000;
-    std::wstring raw = vs->proxyDir + L"audio.f32";
-    if (GetFileAttributesW(raw.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    std::wstring wav = vs->proxyDir + L"audio.wav";
+    if (GetFileAttributesW(wav.c_str()) == INVALID_FILE_ATTRIBUTES) {
         wchar_t cmd[1024];
         swprintf(cmd, 1024,
-                 L"ffmpeg -v error -y -i \"%ls\" -vn -ac 1 -ar %d -f f32le \"%ls\"",
-                 vs->path.c_str(), RATE, raw.c_str());
+                 L"ffmpeg -v error -y -i \"%ls\" -vn -ac 2 -ar 48000 \"%ls\"",
+                 vs->path.c_str(), wav.c_str());
         if (!RunHidden(cmd)) return;
     }
-    HANDLE f = CreateFileW(raw.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                           OPEN_EXISTING, 0, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return;
-    int per = (int)(RATE / vs->apeakRate);
-    if (per < 1) per = 1;
-    std::vector<float> buf(per), out;
-    DWORD rd = 0;
-    while (ReadFile(f, buf.data(), (DWORD)(per * sizeof(float)), &rd, nullptr) && rd) {
-        size_t n = rd / sizeof(float);
-        float lo = 0, hi = 0;
-        for (size_t i = 0; i < n; i++) {
-            float v = buf[i];
-            if (v < lo) lo = v;
-            if (v > hi) hi = v;
-        }
-        out.push_back(lo);
-        out.push_back(hi);
+    vs->audio = std::move(DecodeSongFileUncached(wav));
+    if (vs->audio) {
+        vs->apeakRate = 48000.0 / vs->audio->framesPerPeak;
+        vs->apeaks = vs->audio->peaks;
+        vs->apeaksReady.store(true);
     }
-    CloseHandle(f);
-    vs->apeaks = std::move(out);
-    vs->apeaksReady.store(true);
 }
 
 // Background: probe metadata, then transcode a small jpeg ladder for scrubbing.
@@ -1444,32 +1460,102 @@ static void ExitSeq() { if (NestDepth() > 0 || !g_nav.empty()) NavToDepth((int)g
 // Nest clip that replaces them occupies one continuous slot in the cut.
 static void FoldSelection() {
     EnsureRootSeq();
-    int lo = -1, hi = -1, n = 0;
+    int loBase = -1, hiBase = -1, nBase = 0;
     for (int i = 0; i < (int)g_clips.size(); i++)
-        if (SelHas(g_clips[i]->uid)) { if (lo < 0) lo = i; hi = i; n++; }
-    if (n < 1 && g_selTrack == -1 && g_sel >= 0 && g_sel < (int)g_clips.size()) {
-        lo = hi = g_sel; n = 1;
+        if (SelHas(g_clips[i]->uid)) { if (loBase < 0) loBase = i; hiBase = i; nBase++; }
+
+    std::vector<std::pair<int, int>> selOver;
+    for (int t = 0; t < (int)g_over.size(); t++) {
+        for (int i = 0; i < (int)g_over[t]->clips.size(); i++) {
+            if (SelHas(g_over[t]->clips[i]->uid)) selOver.push_back({t, i});
+        }
     }
-    if (n < 1) { g_intakeStatus = "pick shots on the picture track first"; return; }
-    if (hi - lo + 1 != n) { g_intakeStatus = "fold needs shots that sit next to each other"; return; }
+
+    if (nBase == 0 && selOver.empty()) {
+        if (g_selTrack == -1 && g_sel >= 0 && g_sel < (int)g_clips.size()) {
+            loBase = hiBase = g_sel; nBase = 1;
+        } else if (g_selTrack >= 0 && g_selTrack < (int)g_over.size() && g_sel >= 0 && g_sel < (int)g_over[g_selTrack]->clips.size()) {
+            selOver.push_back({g_selTrack, g_sel});
+        } else {
+            g_intakeStatus = "pick shots to fold"; return;
+        }
+    }
+
+    if (nBase > 0 && hiBase - loBase + 1 != nBase) {
+        g_intakeStatus = "fold needs base shots that sit next to each other"; return;
+    }
 
     char nm[64];
     snprintf(nm, sizeof(nm), "seq %d", g_seqNext);
     Sequence* q = MakeSeq(nm);
-    for (int i = lo; i <= hi; i++) {
-        g_clips[i]->group = 0;                            // the sequence is the grouping now
-        q->clips.push_back(std::move(g_clips[i]));
+
+    double startTime = 0.0;
+    double endTime = 0.0;
+    bool hasBounds = false;
+
+    if (nBase > 0) {
+        double acc = 0;
+        for (int i = 0; i < loBase; i++) acc += g_clips[i]->duration;
+        startTime = acc;
+        double dur = 0;
+        for (int i = loBase; i <= hiBase; i++) dur += g_clips[i]->duration;
+        endTime = startTime + dur;
+        hasBounds = true;
+    } else {
+        for (auto& p : selOver) {
+            Clip& c = *g_over[p.first]->clips[p.second];
+            if (!hasBounds || c.start < startTime) { startTime = c.start; hasBounds = true; }
+            if (!hasBounds || c.start + c.duration > endTime) { endTime = c.start + c.duration; hasBounds = true; }
+        }
     }
-    g_clips.erase(g_clips.begin() + lo, g_clips.begin() + hi + 1);
+
+    std::sort(selOver.begin(), selOver.end(), [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+        if (a.first != b.first) return a.first > b.first;
+        return a.second > b.second;
+    });
+
+    for (auto& p : selOver) {
+        int t = p.first;
+        int i = p.second;
+        auto c = std::move(g_over[t]->clips[i]);
+        g_over[t]->clips.erase(g_over[t]->clips.begin() + i);
+        c->group = 0;
+        c->start -= startTime;
+        while (q->over.size() <= t) {
+            auto tr = std::make_unique<VideoTrack>();
+            tr->name = "layer " + std::to_string(q->over.size() + 1);
+            q->over.push_back(std::move(tr));
+        }
+        q->over[t]->clips.push_back(std::move(c));
+    }
 
     auto nc = std::make_unique<Clip>();
     nc->kind = Clip::Nest;
     nc->nest = q->id;
     nc->label = q->name;
-    nc->duration = SeqDurationOf(*q);
-    g_clips.insert(g_clips.begin() + lo, std::move(nc));
-    g_sel = lo; g_selTrack = -1;
+
+    if (nBase > 0) {
+        for (int i = loBase; i <= hiBase; i++) {
+            g_clips[i]->group = 0;
+            q->clips.push_back(std::move(g_clips[i]));
+        }
+        g_clips.erase(g_clips.begin() + loBase, g_clips.begin() + hiBase + 1);
+        double baseDur = 0;
+        for (auto& c : q->clips) baseDur += c->duration;
+        nc->duration = baseDur;
+        g_clips.insert(g_clips.begin() + loBase, std::move(nc));
+        g_sel = loBase; g_selTrack = -1;
+    } else {
+        nc->duration = endTime - startTime;
+        nc->start = startTime;
+        int targetTrack = selOver.empty() ? 0 : selOver.back().first;
+        g_over[targetTrack]->clips.push_back(std::move(nc));
+        g_sel = (int)g_over[targetTrack]->clips.size() - 1;
+        g_selTrack = targetTrack;
+    }
+
     g_selUids.clear();
+    int n = nBase + (int)selOver.size();
     g_intakeStatus = std::string(nm) + " — " + std::to_string(n) + " shots folded";
 }
 
@@ -2404,8 +2490,8 @@ static void StartExport(const std::wstring& outPath) {
             if (own) {
                 swprintf(seg2, 512,
                          L"[%d:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-                         L"%lsasetpts=PTS-STARTPTS,apad,atrim=end=%.4f[a%d];",
-                         vIn[c.uid], c.reversed ? L"areverse," : L"", c.duration, c.uid);
+                         L"%lsasetpts=PTS-STARTPTS,volume=%.4f,apad,atrim=end=%.4f[a%d];",
+                         vIn[c.uid], c.reversed ? L"areverse," : L"", c.volume, c.duration, c.uid);
             } else {
                 swprintf(seg2, 512,
                          L"anullsrc=r=48000:cl=stereo,atrim=end=%.4f,asetpts=PTS-STARTPTS[a%d];",
@@ -5344,6 +5430,11 @@ static void DrawClipInspector() {
         ImGui::BeginDisabled(!c.vid->hasAudio);
         if (ImGui::Checkbox("keep this clip's own audio", &c.useAudio))
             ForEachOtherSelected(c, [&](Clip& o) { o.useAudio = c.useAudio; });
+        if (c.useAudio) {
+            Prop("volume");
+            if (ImGui::SliderFloat("##vol", &c.volume, 0.0f, 2.0f, "%.2f"))
+                ForEachOtherSelected(c, [&](Clip& o) { o.volume = c.volume; });
+        }
         ImGui::EndDisabled();
         Prop("direction");
         if (ImGui::Checkbox("play backwards", &c.reversed))
@@ -5706,6 +5797,7 @@ static void WriteClip(std::string& o, const Clip& c, int track, int seq = 0) {
     PutI(o, "reversed", c.reversed);
     PutI(o, "group", c.group);
     PutI(o, "useAudio", c.useAudio);
+    PutN(o, "volume", c.volume);
     Put(o, "text", c.text);
     PutN(o, "textScale", c.textScale);
     PutN(o, "start", c.start);
@@ -5938,6 +6030,7 @@ static Clip* MakeClipFromKV(const KV& kv) {
     c->grade.mono = kv.b("gMono");
     if (c->group >= g_groupNext) g_groupNext = c->group + 1;
     c->useAudio = kv.b("useAudio", true);
+    c->volume = (float)kv.num("volume", 1.0);
     c->text = kv.str("text");
     c->textScale = (float)kv.num("textScale", 0.13);
     c->start = kv.num("start");
@@ -7126,6 +7219,27 @@ static void DrawApp() {
     ApplyNavRequests();                     // stepping levels rebuilds the clip lists
     RefreshNestDurations();
     UndoCapture();                          // one snapshot per frame, once idle
+
+    {
+        MixGuard lock;
+        g_videoAudio.clear();
+        double acc = 0;
+        for (auto& c : g_clips) {
+            if (!c->skip && c->useAudio && c->kind == Clip::Video && c->volume > 0.0f && c->vid && c->vid->audio && c->vid->audio->loaded) {
+                g_videoAudio.push_back(VideoAudioBlock{ c->vid->audio, acc, c->trimIn, c->duration, c->volume, c->reversed });
+            }
+            acc += c->duration;
+        }
+        for (auto& t : g_over) {
+            if (!t->visible) continue;
+            for (auto& c : t->clips) {
+                if (!c->skip && c->useAudio && c->kind == Clip::Video && c->volume > 0.0f && c->vid && c->vid->audio && c->vid->audio->loaded) {
+                    g_videoAudio.push_back(VideoAudioBlock{ c->vid->audio, c->start, c->trimIn, c->duration, c->volume, c->reversed });
+                }
+            }
+        }
+    }
+
     ImGui::End();
 }
 

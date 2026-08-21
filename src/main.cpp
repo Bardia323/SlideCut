@@ -543,19 +543,22 @@ static void AudioCallback(ma_device*, void* out, const void*, ma_uint32 frames) 
     memset(o, 0, sizeof(float) * frames * 2);
     if (!g_playing.load(std::memory_order_relaxed)) return;
     double ph = g_playhead.load(std::memory_order_relaxed);
+    long long current_frames = llround(ph * SAMPLE_RATE);
     for (auto& tr : g_atracks) {           // every track, every block, summed
         if (tr->mute) continue;
         float gain = tr->volume * 0.9f;
         for (auto& sp : tr->blocks) {
             Song& s = *sp;
             if (!s.loaded) continue;
-            long long start = llround((ph - s.offset + s.trimStart) * SAMPLE_RATE);
+            long long start_base = current_frames - llround(s.offset * SAMPLE_RATE);
             long long lo = llround(s.trimStart * SAMPLE_RATE);
             long long hi = llround(s.trimEnd * SAMPLE_RATE);
             long long total = (long long)(s.pcm.size() / 2);
             if (hi > total) hi = total;
             for (ma_uint32 i = 0; i < frames; i++) {
-                long long idx = start + i;
+                long long idx = s.reversed 
+                    ? hi - 1 - (start_base + i)
+                    : lo + (start_base + i);
                 if (idx >= lo && idx < hi) {
                     o[i * 2 + 0] += s.pcm[idx * 2 + 0] * gain;
                     o[i * 2 + 1] += s.pcm[idx * 2 + 1] * gain;
@@ -565,7 +568,7 @@ static void AudioCallback(ma_device*, void* out, const void*, ma_uint32 frames) 
     }
     for (ma_uint32 i = 0; i < frames * 2; i++)      // keep the sum inside the rails
         o[i] = o[i] > 1.0f ? 1.0f : (o[i] < -1.0f ? -1.0f : o[i]);
-    g_playhead.store(ph + (double)frames / SAMPLE_RATE, std::memory_order_relaxed);
+    g_playhead.store((double)(current_frames + frames) / SAMPLE_RATE, std::memory_order_relaxed);
 }
 
 static void InitAudio() {
@@ -574,6 +577,7 @@ static void InitAudio() {
     cfg.playback.channels = 2;
     cfg.sampleRate = SAMPLE_RATE;
     cfg.dataCallback = AudioCallback;
+    cfg.periodSizeInMilliseconds = 50;
     g_audioReady = ma_device_init(nullptr, &cfg, &g_audioDevice) == MA_SUCCESS &&
                    ma_device_start(&g_audioDevice) == MA_SUCCESS;
 }
@@ -2507,8 +2511,11 @@ static void StartExport(const std::wstring& outPath) {
                 swprintf(af, 420,
                          L";[%d:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
                          L"atrim=start=%.4f:end=%.4f,asetpts=PTS-STARTPTS,"
+                         L"%ls"
                          L"adelay=%d|%d:all=1,volume=%d/100,apad[m%d]",
-                         ai.in, effStart, effEnd, delayMs, delayMs, volPct, ai.in);
+                         ai.in, effStart, effEnd,
+                         s.reversed ? L"areverse," : L"",
+                         delayMs, delayMs, volPct, ai.in);
             }
             fc += af;
         }
@@ -6052,7 +6059,6 @@ static bool LoadProjectFromText(const std::string& text) {
             Sequence* q = seqFor(kv.i("id", 0));
             q->name = kv.str("name", q->name.c_str());
             q->playhead = kv.num("playhead");
-            q->reversed = kv.b("reversed");
         } else if (section == "vtrack") {
             auto t = std::make_unique<VideoTrack>();
             t->name = kv.str("name", "Video");
@@ -6419,7 +6425,7 @@ static std::string g_undoBase;             // the state the stack was built from
 static const size_t UNDO_MAX = 120;
 
 static void UndoCapture() {
-    if (g_undoBusy || g_projectLoading.load()) return;
+    if (g_undoBusy || g_projectLoading.load() || g_playing.load(std::memory_order_relaxed)) return;
     if (g_tl.drag != TimelineState::None) return;      // mid-gesture, wait for the drop
     std::string now = ProjectToText();
     if (g_undoBase.empty()) { g_undoBase = now; return; }

@@ -263,6 +263,7 @@ struct Song {
     std::vector<float> peaks;              // min,max pairs per bucket
     int     framesPerPeak = 1024;
     bool    loaded = false;
+    bool    reversed = false;
 };
 
 static const int SAMPLE_RATE = 48000;
@@ -1502,21 +1503,40 @@ static void UnfoldNest(int index) {
     std::vector<BaseSpan> lay;
     BaseLayout(lay);
     double at = lay[index].start;
+    double dur = g_clips[index]->duration;
+    bool rev = g_clips[index]->reversed;
 
     g_clips.erase(g_clips.begin() + index);
     int k = index;
-    for (auto& c : q->clips) g_clips.insert(g_clips.begin() + k++, std::move(c));
+    if (rev) std::reverse(q->clips.begin(), q->clips.end());
+    for (auto& c : q->clips) {
+        if (rev) c->reversed = !c->reversed;
+        g_clips.insert(g_clips.begin() + k++, std::move(c));
+    }
     q->clips.clear();
     for (auto& t : q->over) {
         int dst = NewOverlayTrack();
-        for (auto& c : t->clips) { c->start += at; g_over[dst]->clips.push_back(std::move(c)); }
+        for (auto& c : t->clips) {
+            if (rev) {
+                c->start = dur - (c->start + c->duration);
+                c->reversed = !c->reversed;
+            }
+            c->start += at; 
+            g_over[dst]->clips.push_back(std::move(c)); 
+        }
     }
     q->over.clear();
     {
         MixGuard lock;
         for (auto& t : q->atracks) {
             g_atracks.push_back(std::move(t));
-            for (auto& b : g_atracks.back()->blocks) b->offset += at;
+            for (auto& b : g_atracks.back()->blocks) {
+                if (rev) {
+                    b->offset = dur - (b->offset + b->duration);
+                    b->reversed = !b->reversed;
+                }
+                b->offset += at;
+            }
         }
         q->atracks.clear();
     }
@@ -2090,9 +2110,12 @@ static bool FlattenNestsHere() {
             double at = nc->start;
             int mode = nc->lblend;
             float op = nc->lopacity;
+            bool rev = nc->reversed;
             int dst = NewOverlayTrack();       // may reallocate g_over: index after
             double acc = 0;
+            if (rev) std::reverse(q->clips.begin(), q->clips.end());
             for (auto& c : q->clips) {
+                if (rev) c->reversed = !c->reversed;
                 c->start = at + acc;
                 acc += c->duration;
                 c->lblend = mode;
@@ -4764,7 +4787,8 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
         ID3D11ShaderResourceView* srv = nullptr;
         float ar = 1.0f;
         if (c.kind == Clip::Video && c.vid) {
-            srv = ProxyFrame(*c.vid, c.trimIn + local);
+            double at = c.reversed ? c.duration - local : local;
+            srv = ProxyFrame(*c.vid, c.trimIn + at);
             ar = c.vid->aspect > 0 ? c.vid->aspect : 1.0f;
         } else if (c.kind == Clip::Image) {
             srv = c.tex;
@@ -5206,6 +5230,9 @@ static void DrawClipInspector() {
     bool isLayer = g_selTrack >= 0;
 
     if (c.kind == Clip::Nest) {              // a folded sequence: its own small panel
+        Prop("direction");
+        if (ImGui::Checkbox("play backwards", &c.reversed))
+            ForEachOtherSelected(c, [&](Clip& o) { o.reversed = c.reversed; });
         Prop("mute");
         if (ImGui::Checkbox("skip this sequence", &c.skip)) {
             ForEachOtherSelected(c, [&](Clip& o) { o.skip = c.skip; });
@@ -5798,6 +5825,7 @@ static std::string ProjectToText() {
                 PutN(o, "offset", b->offset);
                 PutN(o, "trimStart", b->trimStart);
                 PutN(o, "trimEnd", b->trimEnd);
+                PutI(o, "reversed", b->reversed);
             }
         }
     }
@@ -5986,7 +6014,7 @@ static void ApplySettings(const KV& kv) {
     g_fxScratch  = (float)kv.num("fxScratch", 1.0);
     g_fxVignette = (float)kv.num("fxVignette", 1.0);
     g_projCrf = kv.i("projCrf", g_projCrf);
-    snprintf(g_pythonExe, sizeof(g_pythonExe), "%s", kv.str("pythonExe", "python").c_str());
+snprintf(g_pythonExe, sizeof(g_pythonExe), "%s", kv.str("pythonExe", "python").c_str());
 }
 
 static bool LoadProjectFromText(const std::string& text) {
@@ -5997,7 +6025,7 @@ static bool LoadProjectFromText(const std::string& text) {
     ClearProject();
 
     struct SongReq { std::wstring path; std::string label; int track; int seq;
-                     double offset, trimStart, trimEnd; };
+                     double offset, trimStart, trimEnd; bool reversed; };
     std::vector<SongReq> songs;
 
     std::string section;
@@ -6024,6 +6052,7 @@ static bool LoadProjectFromText(const std::string& text) {
             Sequence* q = seqFor(kv.i("id", 0));
             q->name = kv.str("name", q->name.c_str());
             q->playhead = kv.num("playhead");
+            q->reversed = kv.b("reversed");
         } else if (section == "vtrack") {
             auto t = std::make_unique<VideoTrack>();
             t->name = kv.str("name", "Video");
@@ -6048,7 +6077,7 @@ static bool LoadProjectFromText(const std::string& text) {
         } else if (section == "song") {
             songs.push_back({ Widen(kv.str("path")), kv.str("label"), kv.i("track", 0),
                               kv.i("seq", 0),
-                              kv.num("offset"), kv.num("trimStart"), kv.num("trimEnd") });
+                              kv.num("offset"), kv.num("trimStart"), kv.num("trimEnd"), kv.b("reversed") });
         }
         kv.v.clear();
     };
@@ -6101,6 +6130,7 @@ static bool LoadProjectFromText(const std::string& text) {
                 sp->offset = r.offset;
                 sp->trimStart = r.trimStart;
                 sp->trimEnd = r.trimEnd > r.trimStart ? r.trimEnd : sp->duration;
+                sp->reversed = r.reversed;
                 if (!r.label.empty()) sp->label = r.label;
                 MixGuard lock;
                 auto* tracks = ATracksOf(r.seq);
@@ -6658,7 +6688,7 @@ static void ClipToolBar(bool doAdd) {
             int n = 0;
             auto flip = [&](std::vector<std::unique_ptr<Clip>>& v) {
                 for (auto& c : v)
-                    if (SelHas(c->uid) && c->kind != Clip::Nest) {
+                    if (SelHas(c->uid)) {
                         c->reversed = !c->reversed; n++;
                     }
             };
@@ -6666,7 +6696,7 @@ static void ClipToolBar(bool doAdd) {
             for (auto& t : g_over) flip(t->clips);
             if (!n) {
                 Clip* c = SelectedClip();
-                if (c && c->kind != Clip::Nest) { c->reversed = !c->reversed; n = 1; }
+                if (c) { c->reversed = !c->reversed; n = 1; }
             }
             char buf[64];
             snprintf(buf, sizeof(buf), "reversed %d shot%s", n, n == 1 ? "" : "s");

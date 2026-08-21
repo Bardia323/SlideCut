@@ -256,6 +256,8 @@ static const char* BLEND_ITEMS =
     "Soft light\0" "Difference\0" "Addition\0" "Darken\0";
 
 struct Song {
+    int     uid = g_uidNext++;
+    int     group = 0;
     std::wstring path;
     std::string  label;
     double  offset = 0.0;                  // timeline position of the block start (can be < 0)
@@ -340,7 +342,16 @@ static void ForEachOtherSelected(const Clip& primary, F fn) {
     run(g_clips);
     for (auto& t : g_over) run(t->clips);
 }
-// How many shots a panel edit would land on, the primary included.
+
+template <class F>
+static void ForEachOtherSelectedSong(const Song& primary, F fn) {
+    auto run = [&](std::vector<std::unique_ptr<Song>>& v) {
+        for (auto& o : v) if (o.get() != &primary && SelHas(o->uid)) fn(*o);
+    };
+    for (auto& t : g_atracks) run(t->blocks);
+}
+
+// How many shots/blocks a panel edit would land on, the primary included.
 static int SelCount() {
     int n = 0;
     auto run = [&](std::vector<std::unique_ptr<Clip>>& v) {
@@ -348,6 +359,12 @@ static int SelCount() {
     };
     run(g_clips);
     for (auto& t : g_over) run(t->clips);
+    
+    auto runS = [&](std::vector<std::unique_ptr<Song>>& v) {
+        for (auto& o : v) if (SelHas(o->uid)) n++;
+    };
+    for (auto& t : g_atracks) runS(t->blocks);
+    
     return n;
 }
 
@@ -369,12 +386,38 @@ static void SelAddGroupOf(const Clip& c) {
     };
     scan(g_clips);
     for (auto& t : g_over) scan(t->clips);
+    auto scanS = [&](const std::vector<std::unique_ptr<Song>>& v) {
+        for (auto& o : v)
+            if (o->group == c.group && !SelHas(o->uid)) g_selUids.push_back(o->uid);
+    };
+    for (auto& t : g_atracks) scanS(t->blocks);
+}
+
+static void SelAddGroupOf(const Song& c) {
+    if (!c.group) return;
+    auto scan = [&](const std::vector<std::unique_ptr<Clip>>& v) {
+        for (auto& o : v)
+            if (o->group == c.group && !SelHas(o->uid)) g_selUids.push_back(o->uid);
+    };
+    scan(g_clips);
+    for (auto& t : g_over) scan(t->clips);
+    auto scanS = [&](const std::vector<std::unique_ptr<Song>>& v) {
+        for (auto& o : v)
+            if (o->group == c.group && !SelHas(o->uid)) g_selUids.push_back(o->uid);
+    };
+    for (auto& t : g_atracks) scanS(t->blocks);
 }
 
 static Clip* ClipByUid(int uid) {
     for (auto& c : g_clips) if (c->uid == uid) return c.get();
     for (auto& t : g_over)
         for (auto& c : t->clips) if (c->uid == uid) return c.get();
+    return nullptr;
+}
+
+static Song* SongByUid(int uid) {
+    for (auto& t : g_atracks)
+        for (auto& s : t->blocks) if (s->uid == uid) return s.get();
     return nullptr;
 }
 
@@ -1471,11 +1514,20 @@ static void FoldSelection() {
         }
     }
 
-    if (nBase == 0 && selOver.empty()) {
+    std::vector<std::pair<int, int>> selAud;
+    for (int t = 0; t < (int)g_atracks.size(); t++) {
+        for (int i = 0; i < (int)g_atracks[t]->blocks.size(); i++) {
+            if (SelHas(g_atracks[t]->blocks[i]->uid)) selAud.push_back({t, i});
+        }
+    }
+
+    if (nBase == 0 && selOver.empty() && selAud.empty()) {
         if (g_selTrack == -1 && g_sel >= 0 && g_sel < (int)g_clips.size()) {
             loBase = hiBase = g_sel; nBase = 1;
         } else if (g_selTrack >= 0 && g_selTrack < (int)g_over.size() && g_sel >= 0 && g_sel < (int)g_over[g_selTrack]->clips.size()) {
             selOver.push_back({g_selTrack, g_sel});
+        } else if (g_selTrack == -2 && g_selAT >= 0 && g_selAT < (int)g_atracks.size() && g_sel >= 0 && g_sel < (int)g_atracks[g_selAT]->blocks.size()) {
+            selAud.push_back({g_selAT, g_sel});
         } else {
             g_intakeStatus = "pick shots to fold"; return;
         }
@@ -1507,6 +1559,12 @@ static void FoldSelection() {
             if (!hasBounds || c.start < startTime) { startTime = c.start; hasBounds = true; }
             if (!hasBounds || c.start + c.duration > endTime) { endTime = c.start + c.duration; hasBounds = true; }
         }
+        for (auto& p : selAud) {
+            Song& s = *g_atracks[p.first]->blocks[p.second];
+            double blockLen = s.trimEnd - s.trimStart;
+            if (!hasBounds || s.offset < startTime) { startTime = s.offset; hasBounds = true; }
+            if (!hasBounds || s.offset + blockLen > endTime) { endTime = s.offset + blockLen; hasBounds = true; }
+        }
     }
 
     std::sort(selOver.begin(), selOver.end(), [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
@@ -1527,6 +1585,26 @@ static void FoldSelection() {
             q->over.push_back(std::move(tr));
         }
         q->over[t]->clips.push_back(std::move(c));
+    }
+
+    std::sort(selAud.begin(), selAud.end(), [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+        if (a.first != b.first) return a.first > b.first;
+        return a.second > b.second;
+    });
+
+    for (auto& p : selAud) {
+        int t = p.first;
+        int i = p.second;
+        auto s = std::move(g_atracks[t]->blocks[i]);
+        g_atracks[t]->blocks.erase(g_atracks[t]->blocks.begin() + i);
+        s->group = 0;
+        s->offset -= startTime;
+        while (q->atracks.size() <= t) {
+            auto tr = std::make_unique<AudioTrack>();
+            tr->name = "sound " + std::to_string(q->atracks.size() + 1);
+            q->atracks.push_back(std::move(tr));
+        }
+        q->atracks[t]->blocks.push_back(std::move(s));
     }
 
     auto nc = std::make_unique<Clip>();
@@ -1555,8 +1633,8 @@ static void FoldSelection() {
     }
 
     g_selUids.clear();
-    int n = nBase + (int)selOver.size();
-    g_intakeStatus = std::string(nm) + " — " + std::to_string(n) + " shots folded";
+    int n = nBase + (int)selOver.size() + (int)selAud.size();
+    g_intakeStatus = std::string(nm) + " — " + std::to_string(n) + " items folded";
 }
 
 // A brand new empty sequence, dropped into the cut at the playhead and opened.
@@ -3841,6 +3919,16 @@ static void DrawTimeline() {
             }
         } else if (hotAudBlock >= 0) {
             Song& s = *g_atracks[hotAudTrack]->blocks[hotAudBlock];
+            if (io.KeyCtrl) SelToggle(s.uid);
+            else if (io.KeyShift && g_selTrack == -2 && g_sel >= 0) {
+                int lo = hotAudBlock < g_sel ? hotAudBlock : g_sel;
+                int hi = hotAudBlock < g_sel ? g_sel : hotAudBlock;
+                auto& v = g_atracks[hotAudTrack]->blocks;
+                for (int i = lo; i <= hi && i < (int)v.size(); i++)
+                    if (!SelHas(v[i]->uid)) g_selUids.push_back(v[i]->uid);
+            } else if (!SelHas(s.uid)) SelSet(s.uid);
+            else if (g_selUids.size() > 1) g_tl.clickCollapseUid = s.uid;
+            SelAddGroupOf(s);
             g_sel = hotAudBlock; g_selTrack = -2; g_selAT = hotAudTrack;
             g_tl.dragTrack = hotAudTrack;
             g_tl.dragIndex = hotAudBlock;
@@ -4017,13 +4105,19 @@ static void DrawTimeline() {
             c.start = pos < 0 ? 0 : pos;
             // everything else in the selection rides along
             double moved = c.start - before;
-            if (moved != 0.0 && g_selUids.size() > 1)
+            if (moved != 0.0 && g_selUids.size() > 1) {
                 for (auto& t : g_over)
                     for (auto& o : t->clips)
                         if (o->uid != c.uid && SelHas(o->uid)) {
                             o->start += moved;
                             if (o->start < 0) o->start = 0;
                         }
+                for (auto& t : g_atracks)
+                    for (auto& o : t->blocks)
+                        if (SelHas(o->uid)) {
+                            o->offset += moved;
+                        }
+            }
             // dragged onto the base row: fold it back into the cut at that point
             bool ontoBase = false;
             for (auto& r : rows)
@@ -4101,7 +4195,22 @@ static void DrawTimeline() {
             if (g_tl.dragIndex < 0 || g_tl.dragIndex >= (int)blocks.size()) break;
             Song& s = *blocks[g_tl.dragIndex];
             if (g_tl.drag == TimelineState::Audio) {
+                double before = s.offset;
                 s.offset = snapPos(g_tl.dragStartVal + dSec);
+                double moved = s.offset - before;
+                if (moved != 0.0 && g_selUids.size() > 1) {
+                    for (auto& t : g_over)
+                        for (auto& o : t->clips)
+                            if (SelHas(o->uid)) {
+                                o->start += moved;
+                                if (o->start < 0) o->start = 0;
+                            }
+                    for (auto& t : g_atracks)
+                        for (auto& o : t->blocks)
+                            if (o->uid != s.uid && SelHas(o->uid)) {
+                                o->offset += moved;
+                            }
+                }
                 ImGui::SetTooltip("offset %+.3f s", s.offset);
                 // onto another audio row, or the strip, which spawns a track
                 int dest = -2;
@@ -4155,6 +4264,71 @@ static void DrawTimeline() {
             Clip* pc = ClipByUid(g_tl.clickCollapseUid);
             SelSet(g_tl.clickCollapseUid);
             if (pc) SelAddGroupOf(*pc);
+        } else if (g_tl.drag == TimelineState::Audio && fabsf(io.MousePos.x - g_tl.dragStartMouseX) >= 4.0f) {
+            double t = XToSec(io.MousePos.x);
+            Clip* dropNest = nullptr;
+            double nestStart = 0;
+            
+            for (auto& r : rows) {
+                if (r.kind == 0 && io.MousePos.y >= r.y0 && io.MousePos.y <= r.y1) {
+                    std::vector<BaseSpan> layD;
+                    BaseLayout(layD);
+                    for (int i = 0; i < (int)g_clips.size(); i++) {
+                        if (t >= layD[i].start && t < layD[i].end) {
+                            if (g_clips[i]->kind == Clip::Nest) {
+                                dropNest = g_clips[i].get();
+                                nestStart = layD[i].start;
+                            }
+                            break;
+                        }
+                    }
+                } else if (r.kind == 1 && io.MousePos.y >= r.y0 && io.MousePos.y <= r.y1) {
+                    int dest = r.idx;
+                    for (auto& c : g_over[dest]->clips) {
+                        if (t >= c->start && t < c->start + c->duration) {
+                            if (c->kind == Clip::Nest) {
+                                dropNest = c.get();
+                                nestStart = c->start;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            if (dropNest) {
+                Sequence* q = FindSeq(dropNest->nest);
+                if (q) {
+                    MixGuard lock;
+                    int movedCount = 0;
+                    for (int tr = 0; tr < (int)g_atracks.size(); tr++) {
+                        for (int i = (int)g_atracks[tr]->blocks.size() - 1; i >= 0; i--) {
+                            if (SelHas(g_atracks[tr]->blocks[i]->uid)) {
+                                auto s = std::move(g_atracks[tr]->blocks[i]);
+                                g_atracks[tr]->blocks.erase(g_atracks[tr]->blocks.begin() + i);
+                                s->offset -= nestStart;
+                                while (q->atracks.size() <= tr) {
+                                    auto trNew = std::make_unique<AudioTrack>();
+                                    trNew->name = "sound " + std::to_string(q->atracks.size() + 1);
+                                    q->atracks.push_back(std::move(trNew));
+                                }
+                                q->atracks[tr]->blocks.push_back(std::move(s));
+                                movedCount++;
+                            }
+                        }
+                    }
+                    if (movedCount > 0) {
+                        g_selUids.clear();
+                        g_sel = -1;
+                        g_selTrack = -1;
+                        g_selAT = -1;
+                        
+                        char buf[64];
+                        snprintf(buf, sizeof(buf), "moved %d item%s into sequence", movedCount, movedCount == 1 ? "" : "s");
+                        g_intakeStatus = buf;
+                    }
+                }
+            }
         }
         g_tl.clickCollapseUid = -1;
         g_tl.drag = TimelineState::None;
@@ -4192,7 +4366,7 @@ static void DrawTimeline() {
         // something outside it, in which case that one clip goes instead.
         bool hotOutside = (hotBody >= 0 && !SelHas(g_clips[hotBody]->uid)) ||
                           (hotLayer >= 0 && !SelHas(g_over[hotLayerTrack]->clips[hotLayer]->uid)) ||
-                          hotAudBlock >= 0;
+                          (hotAudBlock >= 0 && !SelHas(g_atracks[hotAudTrack]->blocks[hotAudBlock]->uid));
         if (!g_selUids.empty() && !hotOutside) {
             auto sweep = [&](std::vector<std::unique_ptr<Clip>>& v) {
                 for (int i = (int)v.size() - 1; i >= 0; i--) {
@@ -4204,6 +4378,15 @@ static void DrawTimeline() {
             };
             sweep(g_clips);
             for (auto& t : g_over) sweep(t->clips);
+            
+            auto sweepS = [&](std::vector<std::unique_ptr<Song>>& v) {
+                for (int i = (int)v.size() - 1; i >= 0; i--) {
+                    if (SelHas(v[i]->uid)) v.erase(v.begin() + i);
+                }
+            };
+            MixGuard lock;
+            for (auto& t : g_atracks) sweepS(t->blocks);
+
             g_selUids.clear();
             g_sel = -1;
         } else if (hotBody >= 0) {
@@ -5776,6 +5959,18 @@ static void PutI(std::string& out, const char* k, int v) {
     out += k; out += '='; out += buf; out += "\r\n";
 }
 
+static void WriteSong(std::string& o, const Song& b, int track, int seq = 0) {
+    o += "[song]\r\n";
+    PutI(o, "seq", seq);
+    PutI(o, "track", track);
+    PutW(o, "path", b.path);
+    Put(o, "label", b.label);
+    PutN(o, "offset", b.offset);
+    PutN(o, "trimStart", b.trimStart);
+    PutN(o, "trimEnd", b.trimEnd);
+    PutI(o, "reversed", b.reversed);
+    PutI(o, "group", b.group);
+}
 static void WriteClip(std::string& o, const Clip& c, int track, int seq = 0) {
     o += "[clip]\r\n";
     PutI(o, "seq", seq);
@@ -5919,15 +6114,7 @@ static std::string ProjectToText(bool undoMode = false) {
             for (auto& c : q->over[t]->clips) WriteClip(o, *c, t, q->id);
         for (int t = 0; t < (int)q->atracks.size(); t++) {
             for (auto& b : q->atracks[t]->blocks) {
-                o += "[song]\r\n";
-                PutI(o, "seq", q->id);
-                PutI(o, "track", t);
-                PutW(o, "path", b->path);
-                Put(o, "label", b->label);
-                PutN(o, "offset", b->offset);
-                PutN(o, "trimStart", b->trimStart);
-                PutN(o, "trimEnd", b->trimEnd);
-                PutI(o, "reversed", b->reversed);
+                WriteSong(o, *b, t, q->id);
             }
         }
     }
@@ -6560,15 +6747,28 @@ static void CopySelection() {
     for (int t = 0; t < (int)g_over.size(); t++)
         for (auto& c : g_over[t]->clips)
             if (SelHas(c->uid)) { WriteClip(o, *c, t); n++; }
+    for (int t = 0; t < (int)g_atracks.size(); t++)
+        for (auto& b : g_atracks[t]->blocks)
+            if (SelHas(b->uid)) { WriteSong(o, *b, t); n++; }
+            
     if (!n) {                                // nothing multi-picked: use the primary
-        Clip* c = SelectedClip();
-        if (!c) return;
-        WriteClip(o, *c, g_selTrack);
-        n = 1;
+        if (g_selTrack == -2) {
+            if (g_selAT >= 0 && g_selAT < (int)g_atracks.size() && g_sel >= 0 && g_sel < (int)g_atracks[g_selAT]->blocks.size()) {
+                WriteSong(o, *g_atracks[g_selAT]->blocks[g_sel], g_selAT);
+                n = 1;
+            }
+        } else {
+            Clip* c = SelectedClip();
+            if (c) {
+                WriteClip(o, *c, g_selTrack);
+                n = 1;
+            }
+        }
     }
+    if (!n) return;
     g_clipboard = o;
     char buf[64];
-    snprintf(buf, sizeof(buf), "copied %d clip%s", n, n == 1 ? "" : "s");
+    snprintf(buf, sizeof(buf), "copied %d item%s", n, n == 1 ? "" : "s");
     g_projectStatus = buf;
 }
 
@@ -6585,7 +6785,7 @@ static void PasteClipboard() {
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
-        if (line.front() == '[') { flush(); inClip = line.substr(0, 6) == "[clip]"; continue; }
+        if (line.front() == '[') { flush(); inClip = line.substr(0, 6) == "[clip]" || line.substr(0, 6) == "[song]"; continue; }
         size_t eq = line.find('=');
         if (eq != std::string::npos)
             kv.v.push_back({ line.substr(0, eq), UnescVal(line.substr(eq + 1)) });
@@ -6611,6 +6811,29 @@ static void PasteClipboard() {
     }
     int made = 0, lastTrack = -1, lastIdx = -1, skipped = 0;
     for (auto& b : blocks) {
+        bool isSong = b.find("offset") != nullptr;
+        if (isSong) {
+            auto s = std::make_unique<Song>();
+            s->path = Widen(b.str("path"));
+            s->label = b.str("label");
+            s->offset = b.num("offset");
+            s->trimStart = b.num("trimStart");
+            s->trimEnd = b.num("trimEnd");
+            s->reversed = b.i("reversed");
+            s->group = b.i("group");
+            
+            int tr = b.i("track", -1);
+            if (tr < 0) tr = 0;
+            while (tr >= (int)g_atracks.size()) NewAudioTrack();
+            
+            s->offset = ph + (first < 1e17 ? s->offset - first : 0.0);
+            
+            MixGuard lock;
+            g_atracks[tr]->blocks.push_back(std::move(s));
+            made++;
+            continue;
+        }
+        
         if (b.i("kind", 0) == (int)Clip::Nest) { skipped++; continue; }
         std::unique_ptr<Clip> c(MakeClipFromKV(b));
         if (!c) continue;
@@ -7193,7 +7416,10 @@ static void DrawApp() {
                 } else if (g_selTrack == -2 && g_selAT >= 0 && g_selAT < (int)g_atracks.size() &&
                            g_sel >= 0 && g_sel < (int)g_atracks[g_selAT]->blocks.size()) {
                     MixGuard lock;
-                    g_atracks[g_selAT]->blocks[g_sel]->offset += dir * step;
+                    for (auto& t : g_atracks)
+                        for (auto& b : t->blocks)
+                            if (SelHas(b->uid) || (&*b == &*g_atracks[g_selAT]->blocks[g_sel]))
+                                b->offset += dir * step;
                 }
             } else {
                 double np = g_playhead.load() + dir * step;

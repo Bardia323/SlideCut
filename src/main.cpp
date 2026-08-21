@@ -1602,6 +1602,7 @@ struct NestHit { Clip* clip; double local; int mode; float opacity; };
 static void NestResolve(Clip& c, double local, std::vector<NestHit>& out, int depth = 0) {
     if (depth > 8) return;                                // paranoia, not a real case
     if (c.kind != Clip::Nest) return;
+    if (c.reversed) local = c.duration - local;
     const std::vector<std::unique_ptr<Clip>>* base = nullptr;
     const std::vector<std::unique_ptr<VideoTrack>>* over = nullptr;
     Sequence* q = FindSeq(c.nest);
@@ -5727,7 +5728,7 @@ static void WriteClip(std::string& o, const Clip& c, int track, int seq = 0) {
     PutN(o, "dxTrimIn", c.dxTrimIn);
 }
 
-static std::string ProjectToText() {
+static std::string ProjectToText(bool undoMode = false) {
     CommitLevel();                          // put the working copy back first
     std::string navPath;
     std::string o = "slidecut 1\r\n";
@@ -5754,9 +5755,11 @@ static std::string ProjectToText() {
     PutW(o, "lastExportDir", g_lastExportDir);
     PutN(o, "sceneThresh", g_sceneThresh);
     PutN(o, "sceneMinLen", g_sceneMinLen);
-    PutN(o, "playhead", g_playhead.load());
-    PutN(o, "pps", g_tl.pps);
-    PutN(o, "scrollSec", g_tl.scrollSec);
+    if (!undoMode) {
+        PutN(o, "playhead", g_playhead.load());
+        PutN(o, "pps", g_tl.pps);
+        PutN(o, "scrollSec", g_tl.scrollSec);
+    }
     // projector
     PutI(o, "projOn", g_projOn);
     PutI(o, "projLive", g_projLive);
@@ -5803,7 +5806,7 @@ static std::string ProjectToText() {
         o += "[seq]\r\n";
         PutI(o, "id", q->id);
         Put(o, "name", q->name);
-        PutN(o, "playhead", q->playhead);
+        if (!undoMode) PutN(o, "playhead", q->playhead);
         for (auto& t : q->over) {
             o += "[vtrack]\r\n";
             PutI(o, "seq", q->id);
@@ -5964,7 +5967,7 @@ static Clip* MakeClipFromKV(const KV& kv) {
     return c.release();
 }
 
-static void ApplySettings(const KV& kv) {
+static void ApplySettings(const KV& kv, double savedPh, float savedPps, float savedScroll) {
     g_fps = kv.i("fps", g_fps);
     g_fpsAuto = kv.b("fpsAuto", false);
     g_preset = kv.i("preset", g_preset);
@@ -5980,16 +5983,16 @@ static void ApplySettings(const KV& kv) {
     g_abrIdx = kv.i("abrIdx", g_abrIdx);
     g_loudnorm = kv.b("loudnorm");
     g_faststart = kv.b("faststart", true);
-    g_fadeIn = (float)kv.num("fadeIn");
-    g_fadeOut = (float)kv.num("fadeOut");
+    g_fadeIn = (float)kv.num("fadeIn", g_fadeIn);
+    g_fadeOut = (float)kv.num("fadeOut", g_fadeOut);
     g_preview = kv.i("preview", g_preview);
-    g_namePrefix = Widen(kv.str("namePrefix"));
+    g_namePrefix = Widen(kv.str("namePrefix", Narrow(g_namePrefix).c_str()));
     g_lastExportDir = Widen(kv.str("lastExportDir"));
     g_sceneThresh = (float)kv.num("sceneThresh", g_sceneThresh);
     g_sceneMinLen = kv.num("sceneMinLen", g_sceneMinLen);
-    g_playhead.store(kv.num("playhead"));
-    g_tl.pps = (float)kv.num("pps", g_tl.pps);
-    g_tl.scrollSec = (float)kv.num("scrollSec");
+    g_playhead.store(kv.num("playhead", savedPh));
+    g_tl.pps = (float)kv.num("pps", savedPps);
+    g_tl.scrollSec = (float)kv.num("scrollSec", savedScroll);
     g_projOn = kv.b("projOn");
     g_projLive = kv.b("projLive");
     g_projMargin = (float)kv.num("projMargin", g_projMargin);
@@ -6029,6 +6032,9 @@ static bool LoadProjectFromText(const std::string& text) {
         g_projectStatus = "not a SlideCut project file";
         return false;
     }
+    double savedPh = g_playhead.load();
+    float savedPps = g_tl.pps;
+    float savedScroll = g_tl.scrollSec;
     ClearProject();
 
     struct SongReq { std::wstring path; std::string label; int track; int seq;
@@ -6054,7 +6060,7 @@ static bool LoadProjectFromText(const std::string& text) {
         return q;
     };
     auto commit = [&]() {
-        if (section == "settings") { ApplySettings(kv); navPath = kv.str("nav"); }
+        if (section == "settings") { ApplySettings(kv, savedPh, savedPps, savedScroll); navPath = kv.str("nav"); }
         else if (section == "seq") {
             Sequence* q = seqFor(kv.i("id", 0));
             q->name = kv.str("name", q->name.c_str());
@@ -6427,7 +6433,7 @@ static const size_t UNDO_MAX = 120;
 static void UndoCapture() {
     if (g_undoBusy || g_projectLoading.load() || g_playing.load(std::memory_order_relaxed)) return;
     if (g_tl.drag != TimelineState::None) return;      // mid-gesture, wait for the drop
-    std::string now = ProjectToText();
+    std::string now = ProjectToText(true);
     if (g_undoBase.empty()) { g_undoBase = now; return; }
     if (now == g_undoBase) return;
     g_undo.push_back(g_undoBase);

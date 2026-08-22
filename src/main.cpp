@@ -2979,6 +2979,22 @@ struct TimelineState {
     bool   editOpenText = false;          // request to open the text-card editor
     double snapAt = -1e18;                // where the last snap landed, for the guide
     const char* snapWhat = nullptr;       // what it snapped to
+    // Roll ("ripple off"): Ctrl while dragging a base-track edge moves the cut
+    // rather than the clip's length, so the neighbour absorbs the change and every
+    // shot after the seam keeps its place on the timeline.
+    int    rollIndex = -1;                // neighbour clip absorbing the roll
+    double rollDur = 0;                   // its duration at drag start
+    double rollIn = 0;                    // its trimIn at drag start
+    // While an edge is being dragged the playhead parks on that edge, so the
+    // viewer shows the frame the trim is landing on. -1 = in-point, +1 = out-point.
+    int    previewEdge = 0;
+    // Ripple held off during the drag: the base track is packed, so trimming a shot
+    // would slide every shot after it under the cursor. While the mouse is down the
+    // timeline instead draws clips from holdFrom on shifted by holdShift, which is
+    // exactly the amount that keeps them where they were. Letting go clears the
+    // hold and the film closes up in one step -- the ripple.
+    int    holdFrom = -1;
+    double holdShift = 0;
 } g_tl;
 
 // text-card editor state, shared by "Add Text" and double-click-to-edit
@@ -3003,6 +3019,17 @@ static double MaxDuration(const Clip& c) {
     if (c.kind != Clip::Video || !c.vid || c.vid->duration <= 0) return 1e9;
     double m = c.vid->duration - c.trimIn;
     return m < MinClipDur() ? MinClipDur() : m;
+}
+
+// The shot before / after this one on the base track, skipping muted shots: those
+// are off the film, so a roll reaches past them to the next real neighbour.
+static int PrevVisibleClip(int i) {
+    for (int j = i - 1; j >= 0; j--) if (!g_clips[j]->skip) return j;
+    return -1;
+}
+static int NextVisibleClip(int i) {
+    for (int j = i + 1; j < (int)g_clips.size(); j++) if (!g_clips[j]->skip) return j;
+    return -1;
 }
 
 // Trim every selected shot to one length. A video whose in-point sits too late to
@@ -3446,7 +3473,9 @@ static void DrawTimeline() {
         BaseLayout(lay);
         for (int i = 0; i < (int)g_clips.size(); i++) {
             Clip& c = *g_clips[i];
-            float x0 = SecToX(lay[i].start), x1 = SecToX(lay[i].end);
+            double hold = (g_tl.holdFrom >= 0 && i >= g_tl.holdFrom) ? g_tl.holdShift : 0.0;
+            float x0 = SecToX(lay[i].start + hold), x1 = SecToX(lay[i].end + hold);
+            float rawX0 = x0;                  // unclamped: the real in-point edge
             start = lay[i].end;
             if (c.skip) {
                 tabs.push_back({ x0, i });
@@ -3558,18 +3587,19 @@ static void DrawTimeline() {
                             IM_COL32(235, 235, 235, 255), dur);
             }
 
-            // hit zones — a cut between two clips always grabs the RIGHT edge of the
-            // left clip; interior left edges are not grabbable (only clip 0's).
+            // hit zones — every clip owns the band on its own side of a cut, so the
+            // left half of a seam trims the out-point of the shot before it and the
+            // right half trims the in-point of the shot after it. Claiming the left
+            // edge overrides a previous clip's right-edge claim on the same pixel.
             if (inTracks && io.MousePos.y >= clipY && io.MousePos.y <= clipY + clipH) {
                 if (c.kind == Clip::Nest) {
-                if (io.MousePos.x > x0 && io.MousePos.x < x1) hotBody = i;
-            } else if (hotEdgeClip == -1 && fabsf(io.MousePos.x - x1) <= EDGE) {
-                    bool nextIsVideo = i + 1 < (int)g_clips.size() &&
-                                       g_clips[i + 1]->kind == Clip::Video;
-                    if (nextIsVideo && io.MousePos.x > x1) { hotEdgeClip = i + 1; hotEdgeSide = -1; }
-                    else { hotEdgeClip = i; hotEdgeSide = +1; }
-                } else if (hotEdgeClip == -1 && i == 0 && fabsf(io.MousePos.x - x0) <= EDGE) {
-                    hotEdgeClip = 0; hotEdgeSide = -1;
+                    if (io.MousePos.x > x0 && io.MousePos.x < x1) hotBody = i;
+                } else if (rawX0 >= trackX && io.MousePos.x >= rawX0 &&
+                           io.MousePos.x - rawX0 <= EDGE && io.MousePos.x < x1) {
+                    hotEdgeClip = i; hotEdgeSide = -1;
+                    hotBody = -1;
+                } else if (hotEdgeClip == -1 && fabsf(io.MousePos.x - x1) <= EDGE) {
+                    hotEdgeClip = i; hotEdgeSide = +1;
                 } else if (hotEdgeClip == -1 && io.MousePos.x > x0 && io.MousePos.x < x1) {
                     hotBody = i;
                 }
@@ -3579,7 +3609,8 @@ static void DrawTimeline() {
         // a wedge, with a grip in the middle to drag its length.
         for (int i = 0; i < (int)g_clips.size(); i++) {
             if (g_clips[i]->skip || lay[i].fade <= 0.0001) continue;
-            float fx0 = SecToX(lay[i].end - lay[i].fade), fx1 = SecToX(lay[i].end);
+            double hold = (g_tl.holdFrom >= 0 && i >= g_tl.holdFrom) ? g_tl.holdShift : 0.0;
+            float fx0 = SecToX(lay[i].end - lay[i].fade + hold), fx1 = SecToX(lay[i].end + hold);
             if (fx1 < trackX || fx0 > origin.x + avail.x) continue;
             float ytop = clipY + 2, ybot = clipY + clipH - 2;
             dl->AddRectFilled(ImVec2(fx0, ytop), ImVec2(fx1, ybot), IM_COL32(0, 0, 0, 90));
@@ -3838,6 +3869,11 @@ static void DrawTimeline() {
 
     if (hotEdgeClip >= 0 || hotLayerSide != 0 || hotAudSide != 0)
         ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    if (hotEdgeClip >= 0 && g_tl.drag == TimelineState::None) {
+        int nb = hotEdgeSide < 0 ? PrevVisibleClip(hotEdgeClip) : NextVisibleClip(hotEdgeClip);
+        if (nb >= 0 && g_clips[nb]->kind != Clip::Nest)
+            ImGui::SetTooltip("drag trims, ctrl+drag rolls the cut");
+    }
 
     // Shift+wheel slips the picture inside a shot: the shot keeps its place on the
     // timeline and its length, the source slides under it. Over a selected shot it
@@ -3887,6 +3923,14 @@ static void DrawTimeline() {
             g_tl.dragIndex = hotEdgeClip;
             g_tl.dragStartVal = g_clips[hotEdgeClip]->duration;
             g_tl.dragStartVal2 = g_clips[hotEdgeClip]->trimIn;
+            g_tl.rollIndex = hotEdgeSide < 0 ? PrevVisibleClip(hotEdgeClip)
+                                             : NextVisibleClip(hotEdgeClip);
+            if (g_tl.rollIndex >= 0 && g_clips[g_tl.rollIndex]->kind == Clip::Nest)
+                g_tl.rollIndex = -1;              // a folded run owns its own length
+            if (g_tl.rollIndex >= 0) {
+                g_tl.rollDur = g_clips[g_tl.rollIndex]->duration;
+                g_tl.rollIn = g_clips[g_tl.rollIndex]->trimIn;
+            }
         } else if (hotLayer >= 0) {
             Clip& c = *g_over[hotLayerTrack]->clips[hotLayer];
             if (io.KeyCtrl) SelToggle(c.uid);
@@ -4002,26 +4046,81 @@ static void DrawTimeline() {
         }
         case TimelineState::RightEdge: {
             Clip& c = *g_clips[g_tl.dragIndex];
-            double d = SnapDuration(g_tl.dragStartVal + dSec);
-            double mx = MaxDuration(c);
-            c.duration = d > mx ? mx : d;
-            ImGui::SetTooltip("%.3f s", c.duration);
+            if (io.KeyCtrl && g_tl.rollIndex >= 0) {
+                // Move the cut: this shot grows by delta, the next one gives up the
+                // same amount off its head. The seam is the only thing that moves.
+                Clip& n = *g_clips[g_tl.rollIndex];
+                double delta = SnapDuration(g_tl.dragStartVal + dSec) - g_tl.dragStartVal;
+                double lo = MinClipDur() - g_tl.dragStartVal;          // this shot's floor
+                double hi = g_tl.rollDur - MinClipDur();               // neighbour's floor
+                if (c.kind == Clip::Video && c.vid && c.vid->duration > 0) {
+                    double room = c.vid->duration - c.trimIn - g_tl.dragStartVal;
+                    if (room < hi) hi = room;                          // source runs out
+                }
+                if (n.kind == Clip::Video) { double v = -g_tl.rollIn; if (v > lo) lo = v; }  // no source before 0
+                if (hi < lo) hi = lo;
+                delta = delta < lo ? lo : (delta > hi ? hi : delta);
+                c.duration = g_tl.dragStartVal + delta;
+                n.duration = g_tl.rollDur - delta;
+                if (n.kind == Clip::Video) n.trimIn = g_tl.rollIn + delta;
+                ImGui::SetTooltip("roll %+.3f s  ·  %.3f s | %.3f s",
+                                  delta, c.duration, n.duration);
+                g_tl.holdFrom = -1;                  // a roll moves nothing downstream
+            } else {
+                double d = SnapDuration(g_tl.dragStartVal + dSec);
+                double mx = MaxDuration(c);
+                c.duration = d > mx ? mx : d;
+                // Everything after this shot stays put: only the edge moves.
+                g_tl.holdFrom = g_tl.dragIndex + 1;
+                g_tl.holdShift = g_tl.dragStartVal - c.duration;
+                ImGui::SetTooltip("%.3f s", c.duration);
+            }
+            g_tl.previewEdge = +1;
             break;
         }
         case TimelineState::LeftEdge: {
             Clip& c = *g_clips[g_tl.dragIndex];
-            if (c.kind == Clip::Video) {    // move the in-point, keep the out-point
+            // How far the head moved, snapped through the clip's own length so the
+            // grid lands on the same values the right edge would give.
+            double delta = g_tl.dragStartVal - SnapDuration(g_tl.dragStartVal - dSec);
+            if (io.KeyCtrl && g_tl.rollIndex >= 0) {
+                // Move the cut: this shot gives up delta off its head and the shot
+                // before it grows by the same amount, so nothing downstream shifts.
+                Clip& p = *g_clips[g_tl.rollIndex];
+                double lo = MinClipDur() - g_tl.rollDur;               // previous shot's floor
+                double hi = g_tl.dragStartVal - MinClipDur();          // this shot's floor
+                if (c.kind == Clip::Video) { double v = -g_tl.dragStartVal2; if (v > lo) lo = v; }
+                if (p.kind == Clip::Video && p.vid && p.vid->duration > 0) {
+                    double room = p.vid->duration - g_tl.rollIn - g_tl.rollDur;
+                    if (room < hi) hi = room;                          // source runs out
+                }
+                if (hi < lo) hi = lo;
+                delta = delta < lo ? lo : (delta > hi ? hi : delta);
+                if (c.kind == Clip::Video) c.trimIn = g_tl.dragStartVal2 + delta;
+                c.duration = g_tl.dragStartVal - delta;
+                p.duration = g_tl.rollDur + delta;
+                ImGui::SetTooltip("roll %+.3f s  ·  %.3f s | %.3f s",
+                                  delta, p.duration, c.duration);
+                g_tl.holdFrom = -1;                  // a roll moves nothing downstream
+            } else if (c.kind == Clip::Video) {   // move the in-point, keep the out-point
                 double outPoint = g_tl.dragStartVal2 + g_tl.dragStartVal;
-                double in = g_tl.dragStartVal2 + dSec;
+                double in = g_tl.dragStartVal2 + delta;
                 if (in < 0) in = 0;
                 if (in > outPoint - MinClipDur()) in = outPoint - MinClipDur();
                 c.trimIn = in;
                 c.duration = outPoint - in;
+                // The shot itself slides right by what it lost, so its out-point and
+                // every shot after it stay where they are and only the head moves.
+                g_tl.holdFrom = g_tl.dragIndex;
+                g_tl.holdShift = g_tl.dragStartVal - c.duration;
                 ImGui::SetTooltip("in %.3f s  ·  %.3f s", c.trimIn, c.duration);
             } else {
                 c.duration = SnapDuration(g_tl.dragStartVal - dSec);
+                g_tl.holdFrom = g_tl.dragIndex;
+                g_tl.holdShift = g_tl.dragStartVal - c.duration;
                 ImGui::SetTooltip("%.3f s", c.duration);
             }
+            g_tl.previewEdge = -1;
             break;
         }
         case TimelineState::Fade: {
@@ -4255,6 +4354,19 @@ static void DrawTimeline() {
         }
         default: break;
         }
+        // Live preview: the playhead follows the edge under the cursor, so the
+        // viewer shows the frame the trim is landing on. The in-point shows the
+        // first frame that survives, the out-point the last one.
+        if (g_tl.previewEdge != 0 && !g_playing.load() &&
+            g_tl.dragIndex >= 0 && g_tl.dragIndex < (int)g_clips.size()) {
+            std::vector<BaseSpan> now;
+            BaseLayout(now);
+            const BaseSpan& sp = now[g_tl.dragIndex];
+            double t = g_tl.previewEdge < 0 ? sp.start : sp.end - 1.0 / g_fps;
+            if (t < 0) t = 0;
+            g_playhead.store(t);
+        }
+        g_tl.previewEdge = 0;
     }
     if (ImGui::IsItemDeactivated()) {
         // A press inside a multi-selection that never turned into a drag was a
@@ -4334,6 +4446,10 @@ static void DrawTimeline() {
         g_tl.drag = TimelineState::None;
         g_tl.dragIndex = -1;
         g_tl.dragTrack = -1;
+        g_tl.rollIndex = -1;
+        g_tl.previewEdge = 0;
+        g_tl.holdFrom = -1;
+        g_tl.holdShift = 0;
     }
 
     // mute: the film runs straight past these shots without losing them
@@ -4451,7 +4567,13 @@ static void DrawTimeline() {
 
     // ---- playhead
     double ph = g_playhead.load();
-    float phx = SecToX(ph);
+    double phHold = 0.0;
+    if (g_tl.holdFrom >= 0 && g_tl.holdFrom < (int)g_clips.size()) {
+        std::vector<BaseSpan> phLay;
+        BaseLayout(phLay);
+        if (ph >= phLay[g_tl.holdFrom].start) phHold = g_tl.holdShift;
+    }
+    float phx = SecToX(ph + phHold);
     if (phx >= trackX && phx <= origin.x + avail.x) {
         float bottom = rows.empty() ? origin.y + needH : rows.back().y1;
         if (g_tl.snapAt > -1e17) {          // where the drag just locked on

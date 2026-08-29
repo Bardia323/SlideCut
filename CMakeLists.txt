@@ -20,13 +20,15 @@ add_executable(SlideCut WIN32
 target_include_directories(SlideCut PRIVATE ${IMGUI} ${IMGUI}/backends third_party)
 target_compile_definitions(SlideCut PRIVATE UNICODE _UNICODE)
 target_link_libraries(SlideCut PRIVATE d3d11 dxgi d3dcompiler ole32 uuid dwmapi winmm
-                                       shell32 shlwapi)
+                                       shell32 shlwapi dbghelp)
 
 add_custom_command(TARGET SlideCut POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_CURRENT_SOURCE_DIR}/assets $<TARGET_FILE_DIR:SlideCut>/assets)
 
 if(NOT MSVC)
-    target_compile_options(SlideCut PRIVATE -O2 -municode)
+    # -g keeps the symbol tables in the exe. They cost disk, not speed, and without
+    # them a crash dump is a list of raw addresses nobody can read.
+    target_compile_options(SlideCut PRIVATE -O2 -g -municode)
     target_link_options(SlideCut PRIVATE -municode -static)
 endif()

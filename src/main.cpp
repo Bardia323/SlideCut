@@ -12,6 +12,7 @@
 #include <shobjidl.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#include <dbghelp.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <algorithm>
@@ -368,6 +369,18 @@ static int SelCount() {
     return n;
 }
 
+// A point on the aspect track. It is a point, not a span: the plate aspect it
+// names holds from its offset until the next point. Nothing before the first
+// point, which leaves the plate on the projector panel's own value.
+struct AspectPoint {
+    int    uid = g_uidNext++;
+    double offset = 0.0;
+    float  aspect = 1.777f;
+};
+static std::vector<std::unique_ptr<AspectPoint>> g_aspects;
+static bool  g_aspectsVisible = true;
+static const float ASPECT_ROW_H = 22.0f;
+
 // Last frame's timeline layout, so a shell drop can tell which track it landed on.
 // (SelAddGroupOf is defined once the track lists exist.)
 struct TlGeom {
@@ -376,6 +389,22 @@ struct TlGeom {
     float trackX = 0, pps = 60, scroll = 0;
     std::vector<Row> rows;
 } g_geom;
+
+// Shift-click means "everything between these two", and between is a matter of
+// where they sit on the timeline. A track's vector is in the order clips were
+// added to it, which is not that order once anything has been dragged about, so
+// the run is worked out from the times.
+template <class V, class Pos>
+static void SelectRunBetween(V& v, int a, int b, Pos pos) {
+    if (a < 0 || b < 0 || a >= (int)v.size() || b >= (int)v.size()) return;
+    double lo = pos(*v[a]), hi = pos(*v[b]);
+    if (lo > hi) { double t = lo; lo = hi; hi = t; }
+    for (int i = 0; i < (int)v.size(); i++) {
+        double at = pos(*v[i]);
+        if (at >= lo - 1e-9 && at <= hi + 1e-9 && !SelHas(v[i]->uid))
+            g_selUids.push_back(v[i]->uid);
+    }
+}
 
 // A grouped shot never travels alone: touching one pulls in every sibling.
 static void SelAddGroupOf(const Clip& c) {
@@ -486,16 +515,17 @@ static double ClampFade(double want, double a, double b) {
     return want < 0 ? 0 : want;
 }
 
-static void BaseLayout(std::vector<BaseSpan>& out) {
-    out.assign(g_clips.size(), BaseSpan());
+static void BaseLayoutIn(const std::vector<std::unique_ptr<Clip>>& v,
+                         std::vector<BaseSpan>& out) {
+    out.assign(v.size(), BaseSpan());
     double at = 0;
     int prev = -1;                         // last visible shot, the one that fades
-    for (int i = 0; i < (int)g_clips.size(); i++) {
-        Clip& c = *g_clips[i];
+    for (int i = 0; i < (int)v.size(); i++) {
+        Clip& c = *v[i];
         if (c.skip) { out[i].start = out[i].end = at; continue; }
         double d = c.duration;
         if (prev >= 0) {
-            double f = ClampFade(g_clips[prev]->xfade, g_clips[prev]->duration, d);
+            double f = ClampFade(v[prev]->xfade, v[prev]->duration, d);
             out[prev].fade = f;
             at -= f;                       // the overlap: this shot starts early
         }
@@ -505,6 +535,15 @@ static void BaseLayout(std::vector<BaseSpan>& out) {
         prev = i;
     }
 }
+
+// The cut being edited is just one clip list among several: a folded sequence has
+// its own, and cutting one open needs its layout too.
+static void BaseLayout(std::vector<BaseSpan>& out) { BaseLayoutIn(g_clips, out); }
+
+// A ripple on the base track moves every later shot. Anything parked over that
+// stretch - layer clips, sound blocks - belongs to those shots, so it travels the
+// same distance and stays lined up with the picture it was cut against.
+static void RippleOthers(double fromTime, double shift);
 
 static double TotalDuration() {
     std::vector<BaseSpan> lay;
@@ -1034,6 +1073,26 @@ static void BuildProxy(std::shared_ptr<VideoSource> vs) {
     vs->framesOnDisk.store(CountProxyFrames(vs->proxyDir));
 }
 
+// A texture handed to ImGui this frame is not drawn until the frame is rendered,
+// so releasing one mid-frame leaves a draw command pointing at freed memory. Every
+// picture texture goes through here instead and is let go a few frames later, once
+// nothing can still be holding it.
+static std::vector<std::pair<ID3D11ShaderResourceView*, int>> g_retire;
+
+static void RetireTexture(ID3D11ShaderResourceView* t) {
+    if (t) g_retire.push_back({ t, 3 });
+}
+
+static void PumpRetiredTextures() {
+    for (size_t i = 0; i < g_retire.size(); ) {
+        if (--g_retire[i].second <= 0) {
+            g_retire[i].first->Release();
+            g_retire[i] = g_retire.back();
+            g_retire.pop_back();
+        } else i++;
+    }
+}
+
 static void ReleaseProxyCache(VideoSource& vs);
 
 // Preview quality changed: drop the uploaded frames and re-extract at the new size.
@@ -1095,7 +1154,7 @@ static ID3D11ShaderResourceView* ProxyFrame(VideoSource& vs, double t) {
              span /= 2) {
             for (auto i = vs.cache.begin(); i != vs.cache.end(); ) {
                 if (abs(i->first - idx) > span) {
-                    if (i->second) i->second->Release();
+                    RetireTexture(i->second);
                     vs.cacheBytes -= vs.frameBytes;
                     i = vs.cache.erase(i);
                 } else ++i;
@@ -1108,7 +1167,7 @@ static ID3D11ShaderResourceView* ProxyFrame(VideoSource& vs, double t) {
 }
 
 static void ReleaseProxyCache(VideoSource& vs) {
-    for (auto& kv : vs.cache) if (kv.second) kv.second->Release();
+    for (auto& kv : vs.cache) RetireTexture(kv.second);
     vs.cache.clear();
     vs.cacheBytes = 0;
 }
@@ -1158,7 +1217,7 @@ static bool LooksLikeVideo(const std::wstring& p) {
 
 static void ClearDoubleExposure(Clip& c) {
     if (c.dxPending.valid()) c.dxPending.get();   // else it would land on the next layer
-    if (c.dxTex && !c.dxIsVideo) c.dxTex->Release();
+    if (c.dxTex && !c.dxIsVideo) RetireTexture(c.dxTex);
     c.dxTex = nullptr;
     c.dxVid.reset();
     c.dxOn = false;
@@ -1335,6 +1394,117 @@ static void SplitClipIn(std::vector<std::unique_ptr<Clip>>& v, int i, double off
 }
 static void SplitClip(int i, double off) { SplitClipIn(g_clips, i, off); }
 
+// Cut a folded sequence in two at `off` seconds into it. The first half keeps the
+// sequence it had; everything past the cut - shots, layers, sound - moves into a
+// new sequence that gets its own nest clip right after. Fold and unfold still put
+// it back the way it was.
+static void RefreshNestDurations();
+
+static bool SplitNest(int index, double off) {
+    if (index < 0 || index >= (int)g_clips.size()) return false;
+    Clip& n = *g_clips[index];
+    if (n.kind != Clip::Nest) return false;
+    Sequence* q = FindSeq(n.nest);
+    if (!q) return false;
+    const double MIN = MinClipDur();
+    if (off <= MIN || off >= n.duration - MIN) return false;
+
+    char nm[64];
+    snprintf(nm, sizeof(nm), "seq %d", g_seqNext);
+    Sequence* q2 = MakeSeq(nm);
+    q = FindSeq(n.nest);                    // MakeSeq may have moved the vector
+
+    // base cut: split the shot the blade lands in, then hand the tail over
+    std::vector<BaseSpan> lay;
+    BaseLayoutIn(q->clips, lay);
+    int k = (int)q->clips.size();
+    for (int i = 0; i < (int)q->clips.size(); i++) {
+        if (q->clips[i]->skip) continue;
+        if (off <= lay[i].start + 1e-4) { k = i; break; }
+        if (off < lay[i].end - 1e-4) {
+            // A nest inside a nest keeps its own shape: the cut falls on whichever
+            // of its two edges is nearer rather than tearing it in half.
+            if (q->clips[i]->kind == Clip::Nest) {
+                double mid = (lay[i].start + lay[i].end) * 0.5;
+                k = off < mid ? i : i + 1;
+            } else {
+                SplitClipIn(q->clips, i, off - lay[i].start);
+                k = i + 1;
+            }
+            break;
+        }
+    }
+    for (int i = k; i < (int)q->clips.size(); i++) q2->clips.push_back(std::move(q->clips[i]));
+    q->clips.resize(k);
+
+    // layers: a clip straddling the cut is split, the rest travels whole
+    for (auto& t : q->over) {
+        auto nt = std::make_unique<VideoTrack>();
+        nt->name = t->name; nt->visible = t->visible; nt->height = t->height;
+        for (int i = (int)t->clips.size() - 1; i >= 0; i--) {
+            Clip& c = *t->clips[i];
+            if (c.start + c.duration <= off + 1e-9) continue;
+            int take = i;
+            if (c.start < off - 1e-9) {                   // straddles the cut
+                SplitClipIn(t->clips, i, off - c.start);
+                take = i + 1;
+            }
+            auto mv = std::move(t->clips[take]);
+            t->clips.erase(t->clips.begin() + take);
+            mv->start -= off;
+            if (mv->start < 0) mv->start = 0;
+            nt->clips.push_back(std::move(mv));
+        }
+        q2->over.push_back(std::move(nt));
+    }
+
+    // sound: same rule, on trims instead of durations
+    {
+        MixGuard lock;
+        for (auto& t : q->atracks) {
+            auto nt = std::make_unique<AudioTrack>();
+            nt->name = t->name; nt->volume = t->volume;
+            nt->mute = t->mute; nt->height = t->height;
+            for (int i = (int)t->blocks.size() - 1; i >= 0; i--) {
+                Song& b = *t->blocks[i];
+                double len = b.trimEnd - b.trimStart;
+                if (b.offset + len <= off + 1e-9) continue;
+                if (b.offset < off - 1e-9) {              // straddles the cut
+                    auto tail = std::make_unique<Song>(b);
+                    tail->uid = g_uidNext++;
+                    tail->trimStart = b.trimStart + (off - b.offset);
+                    tail->offset = 0;
+                    b.trimEnd = tail->trimStart;
+                    nt->blocks.push_back(std::move(tail));
+                    continue;
+                }
+                auto mv = std::move(t->blocks[i]);
+                t->blocks.erase(t->blocks.begin() + i);
+                mv->offset -= off;
+                nt->blocks.push_back(std::move(mv));
+            }
+            q2->atracks.push_back(std::move(nt));
+        }
+    }
+
+    auto nc = std::make_unique<Clip>();
+    nc->kind = Clip::Nest;
+    nc->nest = q2->id;
+    nc->label = q2->name;
+    nc->duration = n.duration - off;
+    nc->reversed = n.reversed;
+    nc->skip = n.skip;
+    nc->grade = n.grade;
+    nc->lblend = n.lblend;
+    nc->lopacity = n.lopacity;
+    nc->start = n.start + off;
+    g_clips[index]->duration = off;
+    g_clips.insert(g_clips.begin() + index + 1, std::move(nc));
+    RefreshNestDurations();
+    g_intakeStatus = "sequence split";
+    return true;
+}
+
 // Timeline index where a clip inserted at time t would go, splitting whatever
 // clip straddles t. Used for injecting cards mid-shot.
 static int SplitPoint(double t) {
@@ -1345,10 +1515,31 @@ static int SplitPoint(double t) {
     for (int i = 0; i < (int)g_clips.size(); i++) {
         if (g_clips[i]->skip) continue;                            // no time, no cut
         if (t <= lay[i].start + EPS) return i;
-        if (g_clips[i]->kind == Clip::Nest) continue;              // never split a sequence
-        if (t < lay[i].end - EPS) { SplitClip(i, t - lay[i].start); return i + 1; }
+        if (t < lay[i].end - EPS) {
+            // A sequence is a clip like any other: cutting it cuts what it holds.
+            if (g_clips[i]->kind == Clip::Nest) {
+                if (!SplitNest(i, t - lay[i].start)) return i;
+            } else {
+                SplitClip(i, t - lay[i].start);
+            }
+            return i + 1;
+        }
     }
     return (int)g_clips.size();
+}
+
+static void RippleOthers(double fromTime, double shift) {
+    if (fabs(shift) < 1e-9) return;
+    for (auto& t : g_over)
+        for (auto& c : t->clips)
+            if (c->start >= fromTime - 1e-9) {
+                c->start += shift;
+                if (c->start < 0) c->start = 0;
+            }
+    MixGuard lock;
+    for (auto& t : g_atracks)
+        for (auto& b : t->blocks)
+            if (b->offset >= fromTime - 1e-9) b->offset += shift;
 }
 
 // ------------------------------------------------------- scene-change split
@@ -1713,6 +1904,64 @@ static void UnfoldNest(int index) {
     g_selUids.clear();
 }
 
+// The same tear-open on an overlay track: the sequence's own cut is laid out
+// along the track from where the nest sat, and its layers and sound come up
+// beside it. Folding the run again puts it back.
+static void UnfoldNestOnTrack(int track, int index) {
+    if (track < 0 || track >= (int)g_over.size()) return;
+    auto& v = g_over[track]->clips;
+    if (index < 0 || index >= (int)v.size() || v[index]->kind != Clip::Nest) return;
+    Sequence* q = FindSeq(v[index]->nest);
+    if (!q) return;
+    double at = v[index]->start;
+    double dur = v[index]->duration;
+    int blend = v[index]->lblend;
+    float opacity = v[index]->lopacity;
+    bool rev = v[index]->reversed;
+
+    v.erase(v.begin() + index);
+    if (rev) std::reverse(q->clips.begin(), q->clips.end());
+    double run = at;
+    for (auto& c : q->clips) {
+        if (rev) c->reversed = !c->reversed;
+        c->start = run;
+        c->lblend = blend;
+        c->lopacity = opacity;
+        run += c->duration;
+        v.push_back(std::move(c));
+    }
+    q->clips.clear();
+    for (auto& t : q->over) {
+        int dst = NewOverlayTrack();
+        for (auto& c : t->clips) {
+            if (rev) {
+                c->start = dur - (c->start + c->duration);
+                c->reversed = !c->reversed;
+            }
+            c->start += at;
+            g_over[dst]->clips.push_back(std::move(c));
+        }
+    }
+    q->over.clear();
+    {
+        MixGuard lock;
+        for (auto& t : q->atracks) {
+            g_atracks.push_back(std::move(t));
+            for (auto& b : g_atracks.back()->blocks) {
+                if (rev) {
+                    b->offset = dur - (b->offset + b->duration);
+                    b->reversed = !b->reversed;
+                }
+                b->offset += at;
+            }
+        }
+        q->atracks.clear();
+    }
+    g_intakeStatus = q->name + " unfolded";
+    g_sel = -1; g_selTrack = -1;
+    g_selUids.clear();
+}
+
 // ---- what a nest shows at a given moment
 // Base picture first, then the nested overlay tracks bottom-up, each with the
 // blend and opacity it carries inside. Recurses, so a nest inside a nest resolves.
@@ -1745,7 +1994,8 @@ static bool g_navNew = false;               // start a fresh empty sequence
 static bool g_muteToggle = false;           // mute or unmute the selection
 static std::wstring g_vaultRestore;         // a shelf copy the panel asked for
 static bool RestoreFromVault(const std::wstring& path);
-static int  g_navUnfold = -1;               // base index of a nest to tear open
+static int  g_navUnfold = -1;               // index of a nest to tear open
+static int  g_navUnfoldTrack = -1;          // which track it sits on, -1 = base
 
 static void ApplyNavRequests() {
     if (g_navFold)        { g_navFold = false;   FoldSelection(); RefreshNestDurations(); }
@@ -1756,8 +2006,12 @@ static void ApplyNavRequests() {
         g_vaultRestore.clear();
         RestoreFromVault(path);
     }
-    if (g_navUnfold >= 0) { int i = g_navUnfold; g_navUnfold = -1; UnfoldNest(i);
-                            RefreshNestDurations(); }
+    if (g_navUnfold >= 0) {
+        int i = g_navUnfold, t = g_navUnfoldTrack;
+        g_navUnfold = -1; g_navUnfoldTrack = -1;
+        if (t < 0) UnfoldNest(i); else UnfoldNestOnTrack(t, i);
+        RefreshNestDurations();
+    }
     if (g_navEnter >= 0)  { int id = g_navEnter; g_navEnter = -1; EnterSeq(id); }
     if (g_navDepth >= 0)  { int d = g_navDepth;  g_navDepth = -1; NavToDepth(d); }
 }
@@ -1987,6 +2241,54 @@ static int   g_projFit = 0;                // 0 cover, 1 contain, 2 stretch
 static bool  g_projGate = true;
 static float g_projGateInset = 0.0f;
 static float g_projPlateAr = 0.0f;         // 0 = follow the source
+
+// ---- the aspect track drives that same plate, over time
+static void SortAspects() {
+    std::stable_sort(g_aspects.begin(), g_aspects.end(),
+                     [](const std::unique_ptr<AspectPoint>& a,
+                        const std::unique_ptr<AspectPoint>& b) { return a->offset < b->offset; });
+}
+
+// The point in force at t: the last one at or before it, -1 when none is.
+static int AspectAt(double t) {
+    int best = -1;
+    for (int i = 0; i < (int)g_aspects.size(); i++)
+        if (g_aspects[i]->offset <= t + 1e-9) best = i;
+    return best;
+}
+
+// Where a point's hold ends on the timeline: the next point, or the end.
+static double AspectSpanEnd(int i) {
+    if (i + 1 < (int)g_aspects.size()) return g_aspects[i + 1]->offset;
+    double tot = TotalDuration();
+    double end = g_aspects[i]->offset + 2.0;
+    return tot > end ? tot : end;
+}
+
+// What the plate should be right now: the point in force, else the panel's value.
+static float PlateAspect() {
+    int i = AspectAt(g_playhead.load());
+    return i >= 0 ? g_aspects[i]->aspect : g_projPlateAr;
+}
+
+// Editing the aspect from the projector panel writes to the point in force; with
+// no point in force it stays the plain global it always was.
+static void SetPlateAspect(float ar) {
+    int i = AspectAt(g_playhead.load());
+    if (i >= 0) g_aspects[i]->aspect = ar;
+    else        g_projPlateAr = ar;
+}
+
+// Drop a point at the playhead carrying whatever the plate is showing now.
+static void AddAspectPoint(double at) {
+    if (at < 0) at = 0;
+    float carry = PlateAspect();
+    auto b = std::make_unique<AspectPoint>();
+    b->offset = at;
+    b->aspect = carry > 0.01f ? carry : 1.777f;
+    g_aspects.push_back(std::move(b));
+    SortAspects();
+}
 static float g_projWall[3] = { 0, 0, 0 };
 static float g_projTimeOffset = 0.0f;
 // Per-effect amounts. 1.0 is the look as the shader was written; 0 removes that
@@ -2037,9 +2339,9 @@ static std::wstring ProjectorArgs(int W, int H, bool still) {
              g_fxFlicker, g_fxDust, g_fxHair, g_fxScratch, g_fxVignette);
     std::wstring s = buf;
     if (!g_projGate) s += L" --no-gate";
-    if (g_projPlateAr > 0.01f) {
+    if (PlateAspect() > 0.01f) {
         wchar_t ar[48];
-        swprintf(ar, 48, L" --plate-ar %.5f", g_projPlateAr);
+        swprintf(ar, 48, L" --plate-ar %.5f", PlateAspect());
         s += ar;
     }
     if (still) s += L" --audio none";
@@ -2959,7 +3261,8 @@ struct TimelineState {
     float  scrollSec = 0.0f;              // left edge of view, seconds
     // drag state
     enum DragKind { None, LeftEdge, RightEdge, Move, Audio, AudioLeft, AudioRight,
-                    LayerMove, LayerLeft, LayerRight, Scrub, RowResize, Fade } drag = None;
+                    LayerMove, LayerLeft, LayerRight, Scrub, RowResize, Fade,
+                    AspectMove, Marquee } drag = None;
     int    rzKind = 0;                    // 0 base, 1 overlay, 2 audio
     float  rzStartH = 0;
     float  rzStartY = 0;
@@ -2995,6 +3298,12 @@ struct TimelineState {
     // hold and the film closes up in one step -- the ripple.
     int    holdFrom = -1;
     double holdShift = 0;
+    // Where the ripple starts on the timeline, measured before the drag changed
+    // anything: layer clips and sound at or after this point ride the ripple out.
+    double rippleAt = -1e18;
+    // Ctrl-drag over the tracks draws a box; everything it touches is selected.
+    ImVec2 boxFrom = ImVec2(0, 0);
+    std::vector<int> boxKeep;             // what was already selected when it started
 } g_tl;
 
 // text-card editor state, shared by "Add Text" and double-click-to-edit
@@ -3231,6 +3540,7 @@ static void DrawTimeline() {
     bool anyMuted = false;
     for (auto& c : g_clips) if (c->skip) { anyMuted = true; break; }
     float rowsH = g_baseH + ROW_GAP + (anyMuted ? MUTE_ROW_H + ROW_GAP : 0.0f);
+    if (g_aspectsVisible) rowsH += ASPECT_ROW_H + ROW_GAP;
     for (auto& t : g_over)   rowsH += t->height + ROW_GAP;
     for (auto& t : g_atracks) rowsH += t->height + ROW_GAP;
     float needH = RULER_H + 4 + GHOST_H + ROW_GAP + rowsH + 6 + GHOST_H + 6;
@@ -3316,6 +3626,10 @@ static void DrawTimeline() {
     struct Row { float y0, y1; int kind; int idx; };   // kind 0 base, 1 overlay, 2 audio
     std::vector<Row> rows;
     float y = origin.y + RULER_H + 4;
+    if (g_aspectsVisible) {                            // aspect points, kind 6
+        rows.push_back({ y, y + ASPECT_ROW_H, 6, -1 });
+        y += ASPECT_ROW_H + ROW_GAP;
+    }
     float ghostVy0 = y, ghostVy1 = y + GHOST_H;        // new video track
     y += GHOST_H + ROW_GAP;
     for (int t = nOver - 1; t >= 0; t--) {             // last track drawn topmost
@@ -3380,10 +3694,14 @@ static void DrawTimeline() {
         for (float sy = r.y0 + 7; sy + 9 < r.y1; sy += 15)
             dl->AddRectFilled(ImVec2(trackX - 13, sy), ImVec2(trackX - 7, sy + 9),
                               IM_COL32(255, 255, 255, 26), 1.5f);
+        // Only the picture and sound rows stand for a track; the siding and the
+        // aspect row carry no index, so they never reach for one.
         const char* name = r.kind == 0 ? "PICTURE"
                          : r.kind == 5 ? "MUTED"
+                         : r.kind == 6 ? "ASPECT"
                          : r.kind == 1 ? g_over[r.idx]->name.c_str()
-                                       : g_atracks[r.idx]->name.c_str();
+                         : r.kind == 2 ? g_atracks[r.idx]->name.c_str()
+                                       : "";
         bool on = r.kind == 1 ? g_over[r.idx]->visible
                 : r.kind == 2 ? !g_atracks[r.idx]->mute
                 : r.kind != 5;
@@ -3449,7 +3767,7 @@ static void DrawTimeline() {
         // The grab is the TOP edge: rows grow downward and the timeline pane is
         // anchored to the window bottom, so pulling the top up is what visually
         // makes the row taller.
-        if (r.kind == 5) continue;         // the mute siding is a fixed height
+        if (r.kind == 5 || r.kind == 6) continue;   // siding and aspect row: fixed height
         if (fabsf(io.MousePos.y - r.y0) <= 5.0f) { hotResizeKind = r.kind; hotResizeIdx = r.idx; }
     }
     if (hotResizeKind >= 0 || g_tl.drag == TimelineState::RowResize)
@@ -3461,6 +3779,7 @@ static void DrawTimeline() {
     int hotEdgeClip = -1, hotEdgeSide = 0, hotBody = -1;          // base track
     int hotLayerTrack = -1, hotLayer = -1, hotLayerSide = 0;      // overlay tracks
     int hotAudTrack = -1, hotAudBlock = -1, hotAudSide = 0;
+    int hotAspect = -1;
 
     // ---- base video track
     float clipY = 0, clipH = g_baseH;
@@ -3781,6 +4100,43 @@ static void DrawTimeline() {
                         "Drop audio here");
     }
 
+    // ---- aspect track: each point holds until the next one
+    for (auto& r : rows) {
+        if (r.kind != 6) continue;
+        for (int b = 0; b < (int)g_aspects.size(); b++) {
+            AspectPoint& a = *g_aspects[b];
+            float ax0 = SecToX(a.offset), ax1 = SecToX(AspectSpanEnd(b));
+            if (ax1 < trackX || ax0 > origin.x + avail.x) continue;
+            bool selected = g_selTrack == -3 && g_sel == b;
+            float dx0 = ax0 < trackX ? trackX : ax0;
+            dl->AddRectFilled(ImVec2(dx0, r.y0 + 2), ImVec2(ax1 - 1, r.y1 - 2),
+                              IM_COL32(50, 60, 70, 255), 4.0f);
+            dl->AddRect(ImVec2(dx0, r.y0 + 2), ImVec2(ax1 - 1, r.y1 - 2),
+                        selected ? IM_COL32(255, 255, 255, 255) : IM_COL32(255, 255, 255, 40),
+                        4.0f, 0, selected ? 2.0f : 1.0f);
+            if (ax0 >= trackX)             // the point itself reads as a tick
+                dl->AddRectFilled(ImVec2(ax0, r.y0 + 2), ImVec2(ax0 + 2, r.y1 - 2),
+                                  IM_COL32(235, 205, 130, 255));
+            char lab[48];
+            if (a.aspect < 0.01f) snprintf(lab, sizeof(lab), "source");
+            else                  snprintf(lab, sizeof(lab), "%.2f", a.aspect);
+            if (ax1 - dx0 > 34)
+                dl->AddText(ImVec2(dx0 + 6, r.y0 + 3), IM_COL32(225, 225, 225, 220), lab);
+            // a point has no out edge to drag: the whole hold is the move handle
+            if (inTracks && io.MousePos.y >= r.y0 && io.MousePos.y <= r.y1 &&
+                hotAspect == -1 && io.MousePos.x > dx0 - EDGE && io.MousePos.x < ax1)
+                hotAspect = b;
+        }
+        if (g_aspects.empty())
+            dl->AddText(ImVec2(trackX + 10, r.y0 + 3), IM_COL32(85, 85, 85, 255),
+                        "Double-click for an aspect point");
+        bool overRow = inTracks && io.MousePos.y >= r.y0 && io.MousePos.y <= r.y1;
+        if (overRow && hotAspect == -1 && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            AddAspectPoint(XToSec(io.MousePos.x));
+            g_intakeStatus = "aspect point added";
+        }
+    }
+
     // Grouped shots get a bar across the top of the run, so a sequence reads as
     // one object even though it is still a row of separate shots.
     {
@@ -3920,6 +4276,11 @@ static void DrawTimeline() {
                                                : g_atracks[hotResizeIdx]->height;
         } else if (hotEdgeClip >= 0) {
             g_tl.drag = hotEdgeSide < 0 ? TimelineState::LeftEdge : TimelineState::RightEdge;
+            {   // the shot's out-point as it stands now: the seam the ripple opens at
+                std::vector<BaseSpan> lay0;
+                BaseLayout(lay0);
+                g_tl.rippleAt = lay0[hotEdgeClip].end;
+            }
             g_tl.dragIndex = hotEdgeClip;
             g_tl.dragStartVal = g_clips[hotEdgeClip]->duration;
             g_tl.dragStartVal2 = g_clips[hotEdgeClip]->trimIn;
@@ -3935,11 +4296,8 @@ static void DrawTimeline() {
             Clip& c = *g_over[hotLayerTrack]->clips[hotLayer];
             if (io.KeyCtrl) SelToggle(c.uid);
             else if (io.KeyShift && g_selTrack == hotLayerTrack) {
-                auto& v = g_over[hotLayerTrack]->clips;      // whole run between the two
-                int lo = hotLayer < g_sel ? hotLayer : g_sel;
-                int hi = hotLayer < g_sel ? g_sel : hotLayer;
-                for (int i = lo; i <= hi && i < (int)v.size(); i++)
-                    if (!SelHas(v[i]->uid)) g_selUids.push_back(v[i]->uid);
+                SelectRunBetween(g_over[hotLayerTrack]->clips, hotLayer, g_sel,
+                                 [](const Clip& o) { return o.start; });
             } else if (!SelHas(c.uid)) SelSet(c.uid);
             // clicked one shot inside a multi-selection: the press still drags the
             // whole group, but a click that never moves drops down to this one.
@@ -3959,17 +4317,17 @@ static void DrawTimeline() {
                 g_tl.editIndex = hotLayer;
                 g_tl.editTrack = hotLayerTrack;
                 g_tl.editValue = c.duration;
-                ImGui::OpenPopup("edit_duration");
+                // A card is a card wherever it sits: double-click edits its words,
+                // the same as one on the base track.
+                if (c.kind == Clip::Text) g_tl.editOpenText = true;
+                else ImGui::OpenPopup("edit_duration");
             }
         } else if (hotAudBlock >= 0) {
             Song& s = *g_atracks[hotAudTrack]->blocks[hotAudBlock];
             if (io.KeyCtrl) SelToggle(s.uid);
-            else if (io.KeyShift && g_selTrack == -2 && g_sel >= 0) {
-                int lo = hotAudBlock < g_sel ? hotAudBlock : g_sel;
-                int hi = hotAudBlock < g_sel ? g_sel : hotAudBlock;
-                auto& v = g_atracks[hotAudTrack]->blocks;
-                for (int i = lo; i <= hi && i < (int)v.size(); i++)
-                    if (!SelHas(v[i]->uid)) g_selUids.push_back(v[i]->uid);
+            else if (io.KeyShift && g_selTrack == -2 && g_sel >= 0 && g_selAT == hotAudTrack) {
+                SelectRunBetween(g_atracks[hotAudTrack]->blocks, hotAudBlock, g_sel,
+                                 [](const Song& o) { return o.offset; });
             } else if (!SelHas(s.uid)) SelSet(s.uid);
             else if (g_selUids.size() > 1) g_tl.clickCollapseUid = s.uid;
             SelAddGroupOf(s);
@@ -3981,6 +4339,13 @@ static void DrawTimeline() {
             g_tl.drag = hotAudSide < 0 ? TimelineState::AudioLeft
                       : hotAudSide > 0 ? TimelineState::AudioRight
                                        : TimelineState::Audio;
+        } else if (hotAspect >= 0) {
+            AspectPoint& a = *g_aspects[hotAspect];
+            SelSet(a.uid);
+            g_sel = hotAspect; g_selTrack = -3;
+            g_tl.dragIndex = hotAspect;
+            g_tl.dragStartVal = a.offset;
+            g_tl.drag = TimelineState::AspectMove;
         } else if (hotFade >= 0) {
             g_tl.drag = TimelineState::Fade;
             g_tl.dragIndex = hotFade;
@@ -4024,6 +4389,11 @@ static void DrawTimeline() {
             g_sel = hotBody; g_selTrack = -1;
             g_tl.drag = TimelineState::Move;
             g_tl.dragIndex = hotBody;
+        } else if (inTracks && io.KeyCtrl) {
+            g_tl.drag = TimelineState::Marquee;   // ctrl-drag: box out a selection
+            g_tl.boxFrom = io.MousePos;
+            if (!io.KeyShift) g_selUids.clear();
+            g_tl.boxKeep = g_selUids;             // shift keeps what was already picked
         } else if (overRuler || inTracks) {
             g_tl.drag = TimelineState::Scrub;
         }
@@ -4345,6 +4715,53 @@ static void DrawTimeline() {
             }
             break;
         }
+        case TimelineState::AspectMove: {
+            if (g_tl.dragIndex < 0 || g_tl.dragIndex >= (int)g_aspects.size()) break;
+            AspectPoint& a = *g_aspects[g_tl.dragIndex];
+            double at = snapPos(g_tl.dragStartVal + dSec, a.uid);
+            a.offset = at < 0 ? 0 : at;
+            ImGui::SetTooltip("aspect %.3f at %.3f s", a.aspect, a.offset);
+            break;
+        }
+        case TimelineState::Marquee: {
+            float minX = g_tl.boxFrom.x < io.MousePos.x ? g_tl.boxFrom.x : io.MousePos.x;
+            float maxX = g_tl.boxFrom.x < io.MousePos.x ? io.MousePos.x : g_tl.boxFrom.x;
+            float minY = g_tl.boxFrom.y < io.MousePos.y ? g_tl.boxFrom.y : io.MousePos.y;
+            float maxY = g_tl.boxFrom.y < io.MousePos.y ? io.MousePos.y : g_tl.boxFrom.y;
+            g_selUids = g_tl.boxKeep;
+            auto touches = [&](float x0, float x1) { return maxX >= x0 && minX <= x1; };
+            auto take = [&](int uid) { if (!SelHas(uid)) g_selUids.push_back(uid); };
+            std::vector<BaseSpan> layM;
+            BaseLayout(layM);
+            for (auto& r : rows) {
+                if (maxY < r.y0 || minY > r.y1) continue;
+                if (r.kind == 0) {
+                    for (int i = 0; i < (int)g_clips.size(); i++)
+                        if (touches(SecToX(layM[i].start), SecToX(layM[i].end)))
+                            take(g_clips[i]->uid);
+                } else if (r.kind == 5) {          // the mute siding
+                    for (int i = 0; i < (int)g_clips.size(); i++)
+                        if (g_clips[i]->skip) take(g_clips[i]->uid);
+                } else if (r.kind == 1 && r.idx >= 0 && r.idx < (int)g_over.size()) {
+                    for (auto& c : g_over[r.idx]->clips)
+                        if (touches(SecToX(c->start), SecToX(c->start + c->duration)))
+                            take(c->uid);
+                } else if (r.kind == 2 && r.idx >= 0 && r.idx < (int)g_atracks.size()) {
+                    for (auto& b : g_atracks[r.idx]->blocks)
+                        if (touches(SecToX(b->offset),
+                                    SecToX(b->offset + (b->trimEnd - b->trimStart))))
+                            take(b->uid);
+                } else if (r.kind == 6) {
+                    for (int i = 0; i < (int)g_aspects.size(); i++)
+                        if (touches(SecToX(g_aspects[i]->offset), SecToX(AspectSpanEnd(i))))
+                            take(g_aspects[i]->uid);
+                }
+            }
+            dl->AddRectFilled(ImVec2(minX, minY), ImVec2(maxX, maxY),
+                              IM_COL32(120, 170, 255, 45));
+            dl->AddRect(ImVec2(minX, minY), ImVec2(maxX, maxY), IM_COL32(150, 200, 255, 200));
+            break;
+        }
         case TimelineState::Scrub: {
             double t = XToSec(io.MousePos.x);
             if (t < 0) t = 0;
@@ -4442,6 +4859,12 @@ static void DrawTimeline() {
                 }
             }
         }
+        // The ripple lands here: base shots downstream close up on their own, so the
+        // layers and the sound over them move by the same amount.
+        if ((g_tl.drag == TimelineState::LeftEdge || g_tl.drag == TimelineState::RightEdge) &&
+            g_tl.holdFrom >= 0 && g_tl.rippleAt > -1e17)
+            RippleOthers(g_tl.rippleAt, -g_tl.holdShift);
+        g_tl.rippleAt = -1e18;
         g_tl.clickCollapseUid = -1;
         g_tl.drag = TimelineState::None;
         g_tl.dragIndex = -1;
@@ -4470,13 +4893,65 @@ static void DrawTimeline() {
         }
     }
 
-    // split the clip under the playhead
+    // Split at the playhead. A selection says what to cut: a layer clip or a sound
+    // block is cut on its own row, and only with nothing picked does the blade fall
+    // on the base cut.
     if (g_tl.drag == TimelineState::None && !io.WantTextInput &&
-        ImGui::IsKeyPressed(ImGuiKey_S, false) && !g_clips.empty())
-        SplitPoint(g_playhead.load());
+        ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+        double ph = g_playhead.load();
+        const double MIN = MinClipDur();
+        bool did = false;
+        if (g_selTrack >= 0 && g_selTrack < (int)g_over.size() &&
+            g_sel >= 0 && g_sel < (int)g_over[g_selTrack]->clips.size()) {
+            auto& v = g_over[g_selTrack]->clips;
+            Clip& c = *v[g_sel];
+            double off = ph - c.start;
+            if (off > MIN && off < c.duration - MIN) {
+                SplitClipIn(v, g_sel, off);
+                SelSet(v[g_sel]->uid);
+                did = true;
+                g_intakeStatus = "layer clip split";
+            }
+        } else if (g_selTrack == -2 && g_selAT >= 0 && g_selAT < (int)g_atracks.size() &&
+                   g_sel >= 0 && g_sel < (int)g_atracks[g_selAT]->blocks.size()) {
+            auto& v = g_atracks[g_selAT]->blocks;
+            Song& b = *v[g_sel];
+            double off = ph - b.offset;                  // seconds into the block
+            double len = b.trimEnd - b.trimStart;
+            if (off > MIN && off < len - MIN) {
+                auto t = std::make_unique<Song>(b);      // same audio, second half
+                t->uid = g_uidNext++;
+                t->offset = b.offset + off;
+                t->trimStart = b.trimStart + off;
+                b.trimEnd = b.trimStart + off;
+                MixGuard lock;
+                v.insert(v.begin() + g_sel + 1, std::move(t));
+                did = true;
+                g_intakeStatus = "sound block split";
+            }
+        } else if (g_selTrack == -1 && g_sel >= 0 && g_sel < (int)g_clips.size()) {
+            std::vector<BaseSpan> layS;
+            BaseLayout(layS);
+            Clip& c = *g_clips[g_sel];
+            double off = ph - layS[g_sel].start;
+            if (!c.skip && off > MIN && off < c.duration - MIN) {
+                if (c.kind == Clip::Nest) did = SplitNest(g_sel, off);
+                else { SplitClip(g_sel, off); did = true; g_intakeStatus = "shot split"; }
+            }
+        }
+        if (!did && !g_clips.empty()) SplitPoint(ph);
+    }
 
     // delete whatever the cursor is over
-    if (g_tl.drag == TimelineState::None &&
+    if (g_tl.drag == TimelineState::None && g_selTrack == -3 &&
+        (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
+        if (g_sel >= 0 && g_sel < (int)g_aspects.size()) {
+            g_aspects.erase(g_aspects.begin() + g_sel);
+            g_intakeStatus = "aspect point removed";
+        }
+        g_sel = -1; g_selTrack = -1;
+        g_selUids.clear();
+    } else if (g_tl.drag == TimelineState::None &&
         (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
         // A multi-selection is deleted wholesale unless the cursor is parked on
         // something outside it, in which case that one clip goes instead.
@@ -4484,10 +4959,19 @@ static void DrawTimeline() {
                           (hotLayer >= 0 && !SelHas(g_over[hotLayerTrack]->clips[hotLayer]->uid)) ||
                           (hotAudBlock >= 0 && !SelHas(g_atracks[hotAudTrack]->blocks[hotAudBlock]->uid));
         if (!g_selUids.empty() && !hotOutside) {
+            {   // removing a base shot closes the film up, so whatever sat over it
+                // moves back by the same length. Back to front, so each seam is
+                // still measured in the world the one before it left behind.
+                std::vector<BaseSpan> lay0;
+                BaseLayout(lay0);
+                for (int i = (int)g_clips.size() - 1; i >= 0; i--)
+                    if (SelHas(g_clips[i]->uid))
+                        RippleOthers(lay0[i].end, -TimeLen(*g_clips[i]));
+            }
             auto sweep = [&](std::vector<std::unique_ptr<Clip>>& v) {
                 for (int i = (int)v.size() - 1; i >= 0; i--) {
                     if (!SelHas(v[i]->uid)) continue;
-                    if (v[i]->tex && v[i]->kind != Clip::Video) v[i]->tex->Release();
+                    if (v[i]->kind != Clip::Video) RetireTexture(v[i]->tex);
                     ClearDoubleExposure(*v[i]);
                     v.erase(v.begin() + i);
                 }
@@ -4506,8 +4990,13 @@ static void DrawTimeline() {
             g_selUids.clear();
             g_sel = -1;
         } else if (hotBody >= 0) {
+            {
+                std::vector<BaseSpan> lay0;
+                BaseLayout(lay0);
+                RippleOthers(lay0[hotBody].end, -TimeLen(*g_clips[hotBody]));
+            }
             if (g_clips[hotBody]->tex && g_clips[hotBody]->kind != Clip::Video)
-                g_clips[hotBody]->tex->Release();
+                RetireTexture(g_clips[hotBody]->tex);
             ClearDoubleExposure(*g_clips[hotBody]);
             g_clips.erase(g_clips.begin() + hotBody);
             if (g_selTrack == -1) {
@@ -4516,7 +5005,7 @@ static void DrawTimeline() {
             }
         } else if (hotLayer >= 0) {
             auto& v = g_over[hotLayerTrack]->clips;
-            if (v[hotLayer]->tex && v[hotLayer]->kind != Clip::Video) v[hotLayer]->tex->Release();
+            if (v[hotLayer]->kind != Clip::Video) RetireTexture(v[hotLayer]->tex);
             ClearDoubleExposure(*v[hotLayer]);
             v.erase(v.begin() + hotLayer);
             if (g_selTrack == hotLayerTrack && g_sel >= hotLayer) g_sel = -1;
@@ -5132,7 +5621,10 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
     g_d3dContext->PSSetSamplers(0, 1, &g_sampLinear);
     g_d3dContext->GSSetShader(nullptr, nullptr, 0);
 
-    bool cover = g_fit != FIT_BARS || g_preset == PRESET_ORIGINAL;
+    // Only "Crop to fill" cuts the picture. Blur fill scales the shot down inside
+    // the canvas and puts a blurred copy behind it, and "Original" needs no fill at
+    // all, so both of those fit the whole frame in - the same as the export.
+    bool cover = (g_preset != PRESET_ORIGINAL ? g_fit : FIT_BARS) == FIT_CROP;
     double ph = g_playhead.load();
     double clipStart = 0;
     int ci = ClipAt(ph, &clipStart);
@@ -5243,7 +5735,8 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
     cb.outSize[0] = (float)outW;
     cb.outSize[1] = (float)outH;
     float boxW = outW * g_projMargin, boxH = outH * g_projMargin;
-    float ar = g_projPlateAr > 0.01f ? g_projPlateAr : (float)outW / (float)outH;
+    float pAr = PlateAspect();
+    float ar = pAr > 0.01f ? pAr : (float)outW / (float)outH;
     float pw = boxW, phh = boxW / ar;
     if (phh > boxH) { phh = boxH; pw = phh * ar; }
     cb.plateOrg[0] = (outW - pw) * 0.5f;
@@ -5381,7 +5874,10 @@ static void DrawPreviewArea(ImVec2 size) {
     double tot = TotalDuration();
     double clipStart = 0;
     int ci = ClipAt(ph, &clipStart);
-    bool cover = g_fit != FIT_BARS || g_preset == PRESET_ORIGINAL;
+    // Only "Crop to fill" cuts the picture. Blur fill scales the shot down inside
+    // the canvas and puts a blurred copy behind it, and "Original" needs no fill at
+    // all, so both of those fit the whole frame in - the same as the export.
+    bool cover = (g_preset != PRESET_ORIGINAL ? g_fit : FIT_BARS) == FIT_CROP;
     // Live film look: composite this frame offscreen and run the projector shader
     // over it, at the pixel size it will be shown at so the grain stays crisp.
     // The compositor runs whether or not the film look is on, so layer blend modes
@@ -5586,6 +6082,34 @@ static void ApplyGradeFields(Grade& dst, const Grade& src, int fields) {
 }
 
 static void DrawClipInspector() {
+    // an aspect point is selected
+    if (g_selTrack == -3) {
+        if (g_sel < 0 || g_sel >= (int)g_aspects.size()) { ImGui::TextDisabled("nothing selected"); return; }
+        AspectPoint& a = *g_aspects[g_sel];
+        ImGui::TextUnformatted("Aspect point");
+        ImGui::TextDisabled("holds until the next point");
+        Prop("start");
+        float off = (float)a.offset;
+        if (ImGui::InputFloat("##aoff", &off, 0.1f, 1.0f, "%.3f s")) {
+            a.offset = off < 0 ? 0 : off;
+            SortAspects();
+        }
+        Prop("aspect");
+        ImGui::SliderFloat("##aar", &a.aspect, 0.0f, 3.0f,
+                           a.aspect < 0.01f ? "source" : "%.3f");
+        Prop("");
+        if (ImGui::Button("16:9")) a.aspect = 16.0f / 9.0f; ImGui::SameLine();
+        if (ImGui::Button("9:16")) a.aspect = 9.0f / 16.0f; ImGui::SameLine();
+        if (ImGui::Button("4:3"))  a.aspect = 4.0f / 3.0f;  ImGui::SameLine();
+        if (ImGui::Button("1:1"))  a.aspect = 1.0f;
+        Prop("");
+        if (ImGui::Button("delete point", ImVec2(-1, 0))) {
+            g_aspects.erase(g_aspects.begin() + g_sel);
+            g_sel = -1; g_selTrack = -1;
+            g_selUids.clear();
+        }
+        return;
+    }
     // an audio block is selected: its own small panel
     if (g_selTrack == -2) {
         if (g_selAT < 0 || g_selAT >= (int)g_atracks.size() ||
@@ -5655,7 +6179,10 @@ static void DrawClipInspector() {
         float half = ColW(2);
         if (ImGui::Button("open", ImVec2(half, 0))) g_navEnter = c.nest;
         ImGui::SameLine();
-        if (ImGui::Button("unfold here", ImVec2(half, 0))) g_navUnfold = g_sel;
+        if (ImGui::Button("unfold here", ImVec2(half, 0))) {
+            g_navUnfold = g_sel;
+            g_navUnfoldTrack = g_selTrack;      // a layer nest unfolds on its layer
+        }
         return;
     }
 
@@ -5882,7 +6409,7 @@ static void DrawTracksPanel() {
         ImGui::BeginDisabled(g_over.size() < 2);
         if (ImGui::Button("remove", ImVec2(-1, 0))) {
             for (auto& c : tr.clips) {
-                if (c->tex && c->kind != Clip::Video) c->tex->Release();
+                if (c->kind != Clip::Video) RetireTexture(c->tex);
                 ClearDoubleExposure(*c);
             }
             g_over.erase(g_over.begin() + t);
@@ -5969,9 +6496,27 @@ static void DrawProjectorPanel() {
     ImGui::SetNextItemWidth(-1);
     ImGui::SliderFloat("##pgi", &g_projGateInset, 0.0f, 60.0f, "inset %.1f px");
     ImGui::EndDisabled();
+    // The plate aspect. With a point on the aspect track in force this edits that
+    // point, so the value is time-bound; with none it is the plain global.
     Prop("aspect");
-    ImGui::SliderFloat("##par", &g_projPlateAr, 0.0f, 3.0f,
-                       g_projPlateAr < 0.01f ? "source" : "%.3f");
+    float par = PlateAspect();
+    bool onPoint = AspectAt(g_playhead.load()) >= 0;
+    if (ImGui::SliderFloat("##par", &par, 0.0f, 3.0f, par < 0.01f ? "source" : "%.3f"))
+        SetPlateAspect(par);
+    Prop("");
+    if (ImGui::Button("16:9")) SetPlateAspect(16.0f / 9.0f); ImGui::SameLine();
+    if (ImGui::Button("9:16")) SetPlateAspect(9.0f / 16.0f); ImGui::SameLine();
+    if (ImGui::Button("4:3"))  SetPlateAspect(4.0f / 3.0f);  ImGui::SameLine();
+    if (ImGui::Button("1:1"))  SetPlateAspect(1.0f);
+    Prop("");
+    if (ImGui::Button("set point here", ImVec2(-1, 0))) {
+        AddAspectPoint(g_playhead.load());
+        g_aspectsVisible = true;
+        g_intakeStatus = "aspect point added";
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("holds this aspect from the playhead until the next point");
+    ImGui::TextDisabled(onPoint ? "editing the point in force" : "no point here - global");
     Prop("wall");
     ImGui::ColorEdit3("##pwall", g_projWall, ImGuiColorEditFlags_NoInputs);
     static bool oWear = false;
@@ -6179,6 +6724,7 @@ static std::string ProjectToText(bool undoMode = false) {
     PutI(o, "projFit", g_projFit);
     PutI(o, "projGate", g_projGate);
     PutN(o, "projGateInset", g_projGateInset);
+    PutI(o, "aspectsVisible", g_aspectsVisible);
     PutN(o, "projPlateAr", g_projPlateAr);
     PutN(o, "projWallR", g_projWall[0]);
     PutN(o, "projWallG", g_projWall[1]);
@@ -6240,6 +6786,11 @@ static std::string ProjectToText(bool undoMode = false) {
             }
         }
     }
+    for (auto& a : g_aspects) {
+        o += "[aspect]\r\n";
+        PutN(o, "offset", a->offset);
+        PutN(o, "aspect", a->aspect);
+    }
     LoadLevel(CurSeqId(), false);
     return o;
 }
@@ -6279,6 +6830,7 @@ static bool SaveProjectTo(const std::wstring& path) {
 
 static void ClearProject() {
     bool wasPlaying = g_playing.exchange(false);
+    if (g_songLoadFut.valid()) g_songLoadFut.wait();    // let the last restore land
     Sleep(20);
     {
         std::vector<Clip*> all;
@@ -6292,12 +6844,13 @@ static void ClearProject() {
             for (auto& t : q->over) sweep(t->clips);
         }
         for (Clip* c : all) {
-            if (c->tex && c->kind != Clip::Video) c->tex->Release();
+            if (c->kind != Clip::Video) RetireTexture(c->tex);
             ClearDoubleExposure(*c);
         }
     }
     g_clips.clear();
     g_over.clear();
+    g_aspects.clear();
     { MixGuard lock; g_atracks.clear(); g_seqs.clear(); }
     g_nav.assign(1, 0);
     g_seqNext = 1;
@@ -6404,6 +6957,7 @@ static void ApplySettings(const KV& kv, double savedPh, float savedPps, float sa
     g_projFit = kv.i("projFit", g_projFit);
     g_projGate = kv.b("projGate", true);
     g_projGateInset = (float)kv.num("projGateInset");
+    g_aspectsVisible = kv.b("aspectsVisible", true);
     g_projPlateAr = (float)kv.num("projPlateAr");
     g_projWall[0] = (float)kv.num("projWallR");
     g_projWall[1] = (float)kv.num("projWallG");
@@ -6429,7 +6983,7 @@ static void ApplySettings(const KV& kv, double savedPh, float savedPps, float sa
 snprintf(g_pythonExe, sizeof(g_pythonExe), "%s", kv.str("pythonExe", "python").c_str());
 }
 
-static bool LoadProjectFromText(const std::string& text) {
+static bool LoadProjectFromText(const std::string& text, bool syncAudio = false) {
     if (text.compare(0, 8, "slidecut") != 0) {
         g_projectStatus = "not a SlideCut project file";
         return false;
@@ -6488,6 +7042,11 @@ static bool LoadProjectFromText(const std::string& text) {
             if (c->nest >= g_seqNext) g_seqNext = c->nest + 1;
             if (tr < 0 || tr >= (int)q->over.size()) q->clips.push_back(std::move(c));
             else q->over[tr]->clips.push_back(std::move(c));
+        } else if (section == "aspect") {
+            auto a = std::make_unique<AspectPoint>();
+            a->offset = kv.num("offset");
+            a->aspect = (float)kv.num("aspect", 1.777);
+            g_aspects.push_back(std::move(a));
         } else if (section == "song") {
             songs.push_back({ Widen(kv.str("path")), kv.str("label"), kv.i("track", 0),
                               kv.i("seq", 0),
@@ -6531,28 +7090,43 @@ static bool LoadProjectFromText(const std::string& text) {
     }
     LoadLevel(g_nav.back());
     RefreshNestDurations();
+    SortAspects();
 
-    // Audio is decoded off the UI thread; the tracks already exist, so the blocks
-    // just drop into place as they finish.
-    if (!songs.empty()) {
-        g_projectLoading.store(true);
-        g_songLoadFut = std::async(std::launch::async, [songs] {
-            int ok = 0;
-            for (auto& r : songs) {
-                auto sp = DecodeSongFile(r.path);
-                if (!sp) continue;
-                sp->offset = r.offset;
-                sp->trimStart = r.trimStart;
-                sp->trimEnd = r.trimEnd > r.trimStart ? r.trimEnd : sp->duration;
-                sp->reversed = r.reversed;
-                if (!r.label.empty()) sp->label = r.label;
-                MixGuard lock;
-                auto* tracks = ATracksOf(r.seq);
-                if (tracks && r.track >= 0 && r.track < (int)tracks->size()) {
-                    (*tracks)[r.track]->blocks.push_back(std::move(sp));
-                    ok++;
-                }
+    // Rebuild the sound blocks. A block whose track index runs past the list grows
+    // the list rather than being dropped, which is how a restore used to lose audio.
+    auto restoreSongs = [](const std::vector<SongReq>& reqs) {
+        int ok = 0;
+        for (auto& r : reqs) {
+            auto sp = DecodeSongFile(r.path);
+            if (!sp || r.track < 0) continue;
+            sp->offset = r.offset;
+            sp->trimStart = r.trimStart;
+            sp->trimEnd = r.trimEnd > r.trimStart ? r.trimEnd : sp->duration;
+            sp->reversed = r.reversed;
+            if (!r.label.empty()) sp->label = r.label;
+            MixGuard lock;
+            auto* tracks = ATracksOf(r.seq);
+            if (!tracks) continue;
+            while (r.track >= (int)tracks->size()) {
+                auto t = std::make_unique<AudioTrack>();
+                t->name = "sound " + std::to_string(tracks->size() + 1);
+                tracks->push_back(std::move(t));
             }
+            (*tracks)[r.track]->blocks.push_back(std::move(sp));
+            ok++;
+        }
+        return ok;
+    };
+
+    // Opening a project decodes off the UI thread, so the window stays alive. Undo
+    // is one step and must not half-apply, so it restores in place: the blocks it
+    // wants were on the timeline a moment ago, so the song cache is already warm.
+    if (!songs.empty() && syncAudio) {
+        restoreSongs(songs);
+    } else if (!songs.empty()) {
+        g_projectLoading.store(true);
+        g_songLoadFut = std::async(std::launch::async, [songs, restoreSongs] {
+            int ok = restoreSongs(songs);
             g_projectLoading.store(false);
             return ok;
         });
@@ -6611,6 +7185,196 @@ static std::wstring AutosavePath() {
     return dir + L"\\autosave.slidecut";
 }
 
+
+// ---- crash dumps: %LOCALAPPDATA%\SlideCut\crash\
+// A crash in the preview is a pointer that outlived what it pointed at, and the
+// only way to see which one is a dump written at the moment it happens. Every
+// unhandled fault lands here as a .dmp next to a .txt naming the fault, so a
+// debugger can be pointed at the exact frame that died.
+
+static std::wstring CrashDir() {
+    std::wstring dir = AutosavePath();
+    dir.resize(dir.rfind(L'\\'));           // strip \autosave.slidecut
+    dir += L"\\crash";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir;
+}
+
+static std::wstring CrashStamp() {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t buf[64];
+    swprintf(buf, 64, L"%04d%02d%02d-%02d%02d%02d",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return buf;
+}
+
+// What the fault was, in plain words, so the .txt is readable without a debugger.
+static const char* ExceptionName(DWORD code) {
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:      return "access violation";
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED: return "array bounds exceeded";
+    case EXCEPTION_DATATYPE_MISALIGNMENT: return "datatype misalignment";
+    case EXCEPTION_FLT_DIVIDE_BY_ZERO:    return "float divide by zero";
+    case EXCEPTION_ILLEGAL_INSTRUCTION:   return "illegal instruction";
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:    return "integer divide by zero";
+    case EXCEPTION_PRIV_INSTRUCTION:      return "privileged instruction";
+    case EXCEPTION_STACK_OVERFLOW:        return "stack overflow";
+    case EXCEPTION_IN_PAGE_ERROR:         return "in-page error";
+    case 0xE06D7363:                      return "unhandled C++ exception";
+    default:                              return "unknown";
+    }
+}
+
+static std::wstring g_lastCrashDump;        // shown in the panel on the next run
+
+static void WriteCrashNote(const std::wstring& stem, EXCEPTION_POINTERS* ep,
+                           const char* what) {
+    std::string note = "SlideCut crash\r\n";
+    note += "when: " + Narrow(CrashStamp()) + "\r\n";
+    note += std::string("what: ") + what + "\r\n";
+    if (ep && ep->ExceptionRecord) {
+        char line[256];
+        DWORD code = ep->ExceptionRecord->ExceptionCode;
+        snprintf(line, sizeof(line), "code: 0x%08lX (%s)\r\n",
+                 (unsigned long)code, ExceptionName(code));
+        note += line;
+        snprintf(line, sizeof(line), "address: %p\r\n", ep->ExceptionRecord->ExceptionAddress);
+        note += line;
+        // On an access violation the record says whether it was a read or a write
+        // and which address was touched - usually enough to name the bug alone.
+        if (code == EXCEPTION_ACCESS_VIOLATION &&
+            ep->ExceptionRecord->NumberParameters >= 2) {
+            ULONG_PTR kind = ep->ExceptionRecord->ExceptionInformation[0];
+            snprintf(line, sizeof(line), "operation: %s\r\naddress touched: 0x%llX\r\n",
+                     kind == 0 ? "read" : kind == 1 ? "write" : "execute",
+                     (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1]);
+            note += line;
+        }
+        HMODULE mod = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)ep->ExceptionRecord->ExceptionAddress, &mod) && mod) {
+            wchar_t path[MAX_PATH] = L"";
+            GetModuleFileNameW(mod, path, MAX_PATH);
+            note += "module: " + Narrow(path) + "\r\n";
+            snprintf(line, sizeof(line), "module base: %p\r\noffset: 0x%llX\r\n",
+                     (void*)mod,
+                     (unsigned long long)((char*)ep->ExceptionRecord->ExceptionAddress -
+                                          (char*)mod));
+            note += line;
+        }
+    }
+    char line[128];
+    snprintf(line, sizeof(line), "thread: %lu\r\n", (unsigned long)GetCurrentThreadId());
+    note += line;
+    note += "playing: " + std::string(g_playing.load() ? "yes" : "no") + "\r\n";
+    snprintf(line, sizeof(line), "playhead: %.3f s\r\n", g_playhead.load());
+    note += line;
+    snprintf(line, sizeof(line), "clips: %d  layers: %d  sound tracks: %d\r\n",
+             (int)g_clips.size(), (int)g_over.size(), (int)g_atracks.size());
+    note += line;
+    WriteWholeFile(stem + L".txt", note);
+}
+
+static bool WriteMiniDump(const std::wstring& stem, EXCEPTION_POINTERS* ep) {
+    HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
+    if (!dbg) return false;
+    typedef BOOL (WINAPI *WriteFn)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
+                                   PMINIDUMP_EXCEPTION_INFORMATION,
+                                   PMINIDUMP_USER_STREAM_INFORMATION,
+                                   PMINIDUMP_CALLBACK_INFORMATION);
+    WriteFn writeDump = (WriteFn)(void*)GetProcAddress(dbg, "MiniDumpWriteDump");
+    if (!writeDump) { FreeLibrary(dbg); return false; }
+
+    std::wstring path = stem + L".dmp";
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) { FreeLibrary(dbg); return false; }
+
+    MINIDUMP_EXCEPTION_INFORMATION mei = {};
+    mei.ThreadId = GetCurrentThreadId();
+    mei.ExceptionPointers = ep;
+    mei.ClientPointers = FALSE;
+    // Stacks, handles and referenced memory: enough to see which freed object a
+    // pointer landed in, without dumping the whole heap.
+    MINIDUMP_TYPE type = (MINIDUMP_TYPE)(MiniDumpWithIndirectlyReferencedMemory |
+                                         MiniDumpWithDataSegs |
+                                         MiniDumpWithHandleData |
+                                         MiniDumpWithThreadInfo |
+                                         MiniDumpWithUnloadedModules);
+    BOOL ok = writeDump(GetCurrentProcess(), GetCurrentProcessId(), f, type,
+                        ep ? &mei : nullptr, nullptr, nullptr);
+    CloseHandle(f);
+    FreeLibrary(dbg);
+    if (!ok) DeleteFileW(path.c_str());
+    return ok != FALSE;
+}
+
+// Keep the folder from growing without end: oldest dumps fall off.
+static void TrimCrashDumps(size_t keep) {
+    std::wstring dir = CrashDir();
+    std::vector<std::wstring> stems;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*.dmp").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do { stems.push_back(fd.cFileName); } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (stems.size() <= keep) return;
+    std::sort(stems.begin(), stems.end());          // names are timestamps
+    for (size_t i = 0; i + keep < stems.size(); i++) {
+        std::wstring base = dir + L"\\" + stems[i];
+        DeleteFileW(base.c_str());
+        base.resize(base.size() - 4);
+        DeleteFileW((base + L".txt").c_str());
+    }
+}
+
+static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
+    static LONG once = 0;
+    if (InterlockedExchange(&once, 1)) return EXCEPTION_EXECUTE_HANDLER;
+    g_playing.store(false);                 // stop the mixer touching anything else
+    std::wstring stem = CrashDir() + L"\\" + CrashStamp();
+    WriteCrashNote(stem, ep, "unhandled exception");
+    WriteMiniDump(stem, ep);
+    TrimCrashDumps(20);
+    std::wstring msg = L"SlideCut hit a bug and has to close.\n\nA crash report was "
+                       L"written to:\n" + stem + L".dmp\n\nYour work is in BACKUPS.";
+    MessageBoxW(nullptr, msg.c_str(), L"SlideCut crashed", MB_OK | MB_ICONERROR);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// The runtime swallows some faults before the filter above ever sees them, so the
+// paths that bypass it are pointed back at it.
+static void TerminateHandler() {
+    CrashHandler(nullptr);
+    _exit(3);
+}
+
+static void InvalidParameterHandler(const wchar_t*, const wchar_t*, const wchar_t*,
+                                    unsigned int, uintptr_t) {
+    CrashHandler(nullptr);
+    _exit(3);
+}
+
+static void InstallCrashHandler() {
+    SetUnhandledExceptionFilter(CrashHandler);
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+    std::set_terminate(TerminateHandler);
+    _set_invalid_parameter_handler(InvalidParameterHandler);
+    // Note the newest report, so the last run's crash is visible in the app.
+    std::wstring dir = CrashDir();
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*.dmp").c_str(), &fd);
+    std::wstring newest;
+    if (h != INVALID_HANDLE_VALUE) {
+        do { if (std::wstring(fd.cFileName) > newest) newest = fd.cFileName; }
+        while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (!newest.empty()) g_lastCrashDump = dir + L"\\" + newest;
+}
 
 // ---- the vault: a rolling shelf of timestamped copies
 // The recovery file is one file that keeps being overwritten, which is no good if
@@ -6851,7 +7615,7 @@ static void UndoStep(bool redo) {
     from.pop_back();
     (redo ? g_undo : g_redo).push_back(g_undoBase);
     g_undoBusy = true;
-    LoadProjectFromText(text);
+    LoadProjectFromText(text, true);       // audio comes back with the step
     g_undoBusy = false;
     g_undoBase = text;
     g_selUids.clear();
@@ -7510,8 +8274,13 @@ static void DrawApp() {
         if (chord && ImGui::IsKeyPressed(ImGuiKey_F, false)) g_navFold = true;
         if (chord && ImGui::IsKeyPressed(ImGuiKey_U, false)) {
             if (g_selTrack == -1 && g_sel >= 0 && g_sel < (int)g_clips.size() &&
-                g_clips[g_sel]->kind == Clip::Nest) g_navUnfold = g_sel;
-            else g_intakeStatus = "pick a folded sequence to unfold";
+                g_clips[g_sel]->kind == Clip::Nest) {
+                g_navUnfold = g_sel; g_navUnfoldTrack = -1;
+            } else if (g_selTrack >= 0 && g_selTrack < (int)g_over.size() &&
+                       g_sel >= 0 && g_sel < (int)g_over[g_selTrack]->clips.size() &&
+                       g_over[g_selTrack]->clips[g_sel]->kind == Clip::Nest) {
+                g_navUnfold = g_sel; g_navUnfoldTrack = g_selTrack;
+            } else g_intakeStatus = "pick a folded sequence to unfold";
         }
         if (chord && ImGui::IsKeyPressed(ImGuiKey_DownArrow, false)) {
             if (g_selTrack == -1 && g_sel >= 0 && g_sel < (int)g_clips.size() &&
@@ -7553,6 +8322,8 @@ static void DrawApp() {
         if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) g_playhead.store(0.0);
         if (ImGui::IsKeyPressed(ImGuiKey_End, false))  g_playhead.store(tot);
     }
+
+    if (g_tl.drag == TimelineState::None && !g_aspects.empty()) SortAspects();
 
     // ---- transport
     if (ImGui::IsKeyPressed(ImGuiKey_Space, false) && !ImGui::GetIO().WantTextInput) {
@@ -7755,6 +8526,7 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
+    InstallCrashHandler();          // before anything that can fault
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     ImGui_ImplWin32_EnableDpiAwareness();
 
@@ -7844,6 +8616,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         g_d3dContext->ClearRenderTargetView(g_mainRTV, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_swapChain->Present(1, 0);
+        PumpRetiredTextures();             // frames old enough that nothing draws them
         if (++framesDrawn == 3) StartupMarkClear();   // it draws: no longer suspect
     }
 
@@ -7859,9 +8632,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         for (auto& c : g_clips) all.push_back(c.get());
         for (auto& t : g_over) for (auto& c : t->clips) all.push_back(c.get());
         for (Clip* c : all) {
-            if (c->tex && c->kind != Clip::Video) c->tex->Release();
-            if (c->dxTex && !c->dxIsVideo) c->dxTex->Release();
+            if (c->kind != Clip::Video) RetireTexture(c->tex);
+            if (!c->dxIsVideo) RetireTexture(c->dxTex);
         }
+        for (auto& r : g_retire) r.first->Release();
+        g_retire.clear();
     }
     if (g_projPS) g_projPS->Release();
     if (g_quadPS) g_quadPS->Release();

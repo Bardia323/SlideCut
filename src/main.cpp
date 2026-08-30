@@ -274,6 +274,176 @@ struct Song {
 
 static const int SAMPLE_RATE = 48000;
 
+// ------------------------------------------------------------------ audio fx
+// A chain a track can be run through: a cinematic dialogue polish (shape, a
+// squeeze, a touch of room) and a telephone futz (band-limited, mono, driven).
+// The preview mixer runs it sample by sample and the export asks ffmpeg for the
+// same shape, so what you hear is what lands in the file.
+enum { AFX_NONE = 0, AFX_CINE, AFX_PHONE, AFX_PHONE_CINE, AFX_COUNT };
+static const char* kAfxNames[AFX_COUNT] = { "none", "cinematic", "telephone",
+                                            "cinematic + telephone" };
+
+// RBJ biquad, transposed direct form II, two channels of state.
+struct Biquad {
+    float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+    float z1[2] = { 0, 0 }, z2[2] = { 0, 0 };
+    void Set(float nb0, float nb1, float nb2, float a0, float na1, float na2) {
+        b0 = nb0 / a0; b1 = nb1 / a0; b2 = nb2 / a0; a1 = na1 / a0; a2 = na2 / a0;
+    }
+    void Reset() { z1[0] = z1[1] = z2[0] = z2[1] = 0; }
+    inline float Run(int ch, float x) {
+        float y = b0 * x + z1[ch];
+        z1[ch] = b1 * x - a1 * y + z2[ch];
+        z2[ch] = b2 * x - a2 * y;
+        return y;
+    }
+    void HighPass(float f, float q) {
+        float w = 6.2831853f * f / SAMPLE_RATE, c = cosf(w), s = sinf(w);
+        float al = s / (2 * q);
+        Set((1 + c) / 2, -(1 + c), (1 + c) / 2, 1 + al, -2 * c, 1 - al);
+    }
+    void LowPass(float f, float q) {
+        float w = 6.2831853f * f / SAMPLE_RATE, c = cosf(w), s = sinf(w);
+        float al = s / (2 * q);
+        Set((1 - c) / 2, 1 - c, (1 - c) / 2, 1 + al, -2 * c, 1 - al);
+    }
+    void Peak(float f, float q, float gainDb) {
+        float A = powf(10.0f, gainDb / 40.0f);
+        float w = 6.2831853f * f / SAMPLE_RATE, c = cosf(w), s = sinf(w);
+        float al = s / (2 * q);
+        Set(1 + al * A, -2 * c, 1 - al * A, 1 + al / A, -2 * c, 1 - al / A);
+    }
+    void Shelf(float f, float gainDb, bool high) {
+        float A = powf(10.0f, gainDb / 40.0f);
+        float w = 6.2831853f * f / SAMPLE_RATE, c = cosf(w), s = sinf(w);
+        float al = s / 2 * sqrtf((A + 1 / A) * (1 / 0.9f - 1) + 2);
+        float sa = 2 * sqrtf(A) * al;
+        if (high)
+            Set(A * ((A + 1) + (A - 1) * c + sa), -2 * A * ((A - 1) + (A + 1) * c),
+                A * ((A + 1) + (A - 1) * c - sa),
+                (A + 1) - (A - 1) * c + sa, 2 * ((A - 1) - (A + 1) * c),
+                (A + 1) - (A - 1) * c - sa);
+        else
+            Set(A * ((A + 1) - (A - 1) * c + sa), 2 * A * ((A - 1) - (A + 1) * c),
+                A * ((A + 1) - (A - 1) * c - sa),
+                (A + 1) + (A - 1) * c + sa, -2 * ((A - 1) + (A + 1) * c),
+                (A + 1) + (A - 1) * c - sa);
+    }
+};
+
+// Everything the chain remembers between callbacks. Fixed size: the audio thread
+// never allocates.
+static const int AFX_DELAY = 4800;         // 100 ms of room, per channel
+struct AudioFxState {
+    Biquad hp1, hp2, lp1, lp2, mid, bass, mud, air;
+    float env[2] = { 0, 0 };               // compressor followers, linear
+    float dl[2][AFX_DELAY] = {};
+    int   dw = 0;
+    int   built = -1;                      // which preset the state was built for
+
+    void Build(int preset) {
+        if (built == preset) return;
+        built = preset;
+        // telephone: a narrow band with a presence bump where a handset lives
+        hp1.HighPass(300.0f, 0.707f);  hp2.HighPass(300.0f, 0.707f);
+        lp1.LowPass(3400.0f, 0.707f);  lp2.LowPass(3400.0f, 0.707f);
+        mid.Peak(1800.0f, 1.2f, 6.0f);
+        // cinematic: weight underneath, the boxy mids out, the top open
+        bass.Shelf(110.0f, 2.5f, false);
+        mud.Peak(400.0f, 1.2f, -3.0f);
+        air.Shelf(8000.0f, 3.0f, true);
+        hp1.Reset(); hp2.Reset(); lp1.Reset(); lp2.Reset();
+        mid.Reset(); bass.Reset(); mud.Reset(); air.Reset();
+        env[0] = env[1] = 0;
+        memset(dl, 0, sizeof(dl));
+        dw = 0;
+    }
+
+    // One peak-following compressor both flavours share: cinematic breathes
+    // slowly, the phone squeezes hard and fast.
+    inline float Squeeze(int ch, float x, float thr, float ratio,
+                         float atkMs, float relMs) {
+        float a = expf(-1.0f / (atkMs * 0.001f * SAMPLE_RATE));
+        float r = expf(-1.0f / (relMs * 0.001f * SAMPLE_RATE));
+        float mag = fabsf(x);
+        float& e = env[ch];
+        e = mag > e ? a * e + (1 - a) * mag : r * e + (1 - r) * mag;
+        if (e <= thr) return x;
+        return x * powf(e / thr, 1.0f / ratio - 1.0f);
+    }
+
+    void Process(float* buf, ma_uint32 frames, int preset, float mix) {
+        if (preset <= AFX_NONE || preset >= AFX_COUNT || mix <= 0.0001f) return;
+        Build(preset);
+        bool cine  = preset == AFX_CINE  || preset == AFX_PHONE_CINE;
+        bool phone = preset == AFX_PHONE || preset == AFX_PHONE_CINE;
+        for (ma_uint32 i = 0; i < frames; i++) {
+            float dry[2] = { buf[i * 2], buf[i * 2 + 1] };
+            float w[2] = { dry[0], dry[1] };
+            if (phone) w[0] = w[1] = 0.5f * (dry[0] + dry[1]);   // one capsule
+            for (int ch = 0; ch < 2; ch++) {
+                float x = w[ch];
+                if (cine) {
+                    x = bass.Run(ch, x);
+                    x = mud.Run(ch, x);
+                    x = air.Run(ch, x);
+                    x = Squeeze(ch, x, 0.09f, 3.0f, 20.0f, 250.0f) * 1.6f;
+                }
+                if (phone) {
+                    x = hp1.Run(ch, x); x = hp2.Run(ch, x);
+                    x = lp1.Run(ch, x); x = lp2.Run(ch, x);
+                    x = mid.Run(ch, x);
+                    x = Squeeze(ch, x, 0.05f, 6.0f, 5.0f, 80.0f) * 2.0f;
+                    x = tanhf(x * 1.8f) * 0.7f;     // the line itself, driven
+                }
+                w[ch] = x;
+            }
+            if (cine) {                    // a short room, three taps, barely there
+                const int taps[3] = { 1200, 1920, 2880 };        // 25 / 40 / 60 ms
+                const float lvl[3] = { 0.20f, 0.13f, 0.08f };
+                float pre[2] = { w[0], w[1] };
+                for (int ch = 0; ch < 2; ch++) {
+                    float wet = 0;
+                    for (int t = 0; t < 3; t++) {
+                        int idx = dw - taps[t] - (ch ? 90 : 0);  // right sits later
+                        while (idx < 0) idx += AFX_DELAY;
+                        wet += dl[ch][idx] * lvl[t];
+                    }
+                    w[ch] += wet;
+                }
+                dl[0][dw] = pre[0];
+                dl[1][dw] = pre[1];
+                dw = (dw + 1) % AFX_DELAY;
+            }
+            buf[i * 2]     = dry[0] * (1 - mix) + w[0] * mix;
+            buf[i * 2 + 1] = dry[1] * (1 - mix) + w[1] * mix;
+        }
+    }
+};
+
+// The same chain as an ffmpeg filter string, no labels, trailing comma dropped.
+// Empty when the track is dry.
+static std::wstring AfxChain(int preset) {
+    if (preset <= AFX_NONE || preset >= AFX_COUNT) return L"";
+    bool cine  = preset == AFX_CINE  || preset == AFX_PHONE_CINE;
+    bool phone = preset == AFX_PHONE || preset == AFX_PHONE_CINE;
+    std::wstring f;
+    if (cine)
+        f += L"bass=g=2.5:f=110,equalizer=f=400:t=q:w=1.2:g=-3,treble=g=3:f=8000,"
+             L"acompressor=threshold=0.09:ratio=3:attack=20:release=250:makeup=1.6,"
+             L"aecho=1:0.85:25|40|60:0.20|0.13|0.08,";
+    if (phone)
+        f += L"aformat=channel_layouts=mono,"
+             L"highpass=f=300:poles=2,lowpass=f=3400:poles=2,"
+             L"equalizer=f=1800:t=q:w=1.2:g=6,"
+             L"acompressor=threshold=0.05:ratio=6:attack=5:release=80:makeup=2,"
+             L"volume=1.8,asoftclip=type=tanh,volume=0.7,"
+             L"aformat=channel_layouts=stereo,";
+    if (!f.empty()) f.pop_back();
+    return f;
+}
+
+
 // ---- tracks
 // Video track 0 is the base cut: its clips are packed end to end and their order
 // is the film. Every track above it is an overlay — clips sit at a free position
@@ -289,6 +459,9 @@ struct AudioTrack {
     std::string name;
     float volume = 1.0f;
     bool  mute = false;
+    int   fx = AFX_NONE;                   // chain the whole track runs through
+    float fxMix = 1.0f;                    // how much of it survives, 0 = dry
+    AudioFxState fxs;                      // live filter state, never saved
     float height = 44.0f;                  // row height, dragged from the header
     std::vector<std::unique_ptr<Song>> blocks;
 };
@@ -666,9 +839,16 @@ static void AudioCallback(ma_device*, void* out, const void*, ma_uint32 frames) 
     if (!g_playing.load(std::memory_order_relaxed)) return;
     double ph = g_playhead.load(std::memory_order_relaxed);
     long long current_frames = llround(ph * SAMPLE_RATE);
-    for (auto& tr : g_atracks) {           // every track, every block, summed
+    // Every track, every block. A track with a chain on it is summed into its own
+    // scratch first so the chain sees the whole track, then folded into the mix.
+    static std::vector<float> scratch;
+    if (scratch.size() < (size_t)frames * 2) scratch.resize((size_t)frames * 2);
+    for (auto& tr : g_atracks) {
         if (tr->mute) continue;
         float gain = tr->volume * 0.9f;
+        bool  fx = tr->fx > AFX_NONE && tr->fxMix > 0.0001f;
+        float* dst = fx ? scratch.data() : o;
+        if (fx) memset(dst, 0, sizeof(float) * frames * 2);
         for (auto& sp : tr->blocks) {
             Song& s = *sp;
             if (!s.loaded) continue;
@@ -682,10 +862,14 @@ static void AudioCallback(ma_device*, void* out, const void*, ma_uint32 frames) 
                     ? hi - 1 - (start_base + i)
                     : lo + (start_base + i);
                 if (idx >= lo && idx < hi) {
-                    o[i * 2 + 0] += s.pcm[idx * 2 + 0] * gain;
-                    o[i * 2 + 1] += s.pcm[idx * 2 + 1] * gain;
+                    dst[i * 2 + 0] += s.pcm[idx * 2 + 0] * gain;
+                    dst[i * 2 + 1] += s.pcm[idx * 2 + 1] * gain;
                 }
             }
+        }
+        if (fx) {
+            tr->fxs.Process(dst, frames, tr->fx, tr->fxMix);
+            for (ma_uint32 i = 0; i < frames * 2; i++) o[i] += dst[i];
         }
     }
     if (!g_hushClips.load(std::memory_order_relaxed))
@@ -1493,6 +1677,7 @@ static bool SplitNest(int index, double off) {
             auto nt = std::make_unique<AudioTrack>();
             nt->name = t->name; nt->volume = t->volume;
             nt->mute = t->mute; nt->height = t->height;
+            nt->fx = t->fx; nt->fxMix = t->fxMix;
             for (int i = (int)t->blocks.size() - 1; i >= 0; i--) {
                 Song& b = *t->blocks[i];
                 double len = b.trimEnd - b.trimStart;
@@ -2762,14 +2947,14 @@ static void StartExport(const std::wstring& outPath) {
     for (Clip* c : layers)  addClipInputs(*c);
 
     // audio blocks, in track order
-    struct AudioIn { Song* s; int in; float vol; };
+    struct AudioIn { Song* s; int in; float vol; int fx; float fxMix; };
     std::vector<AudioIn> aIns;
     for (auto& tr : g_atracks) {
         if (tr->mute) continue;
         for (auto& b : tr->blocks) {
             if (!b->loaded || b->path.empty()) continue;
             cmd += L" -i \"" + b->path + L"\"";
-            aIns.push_back({ b.get(), nIn++, tr->volume });
+            aIns.push_back({ b.get(), nIn++, tr->volume, tr->fx, tr->fxMix });
         }
     }
 
@@ -3014,19 +3199,41 @@ static void StartExport(const std::wstring& outPath) {
             int volPct = (int)lround(ai.vol * 100.0f);
             wchar_t af[420];
             if (effStart >= effEnd) {          // trimmed entirely off-screen: silence
-                swprintf(af, 420, L";[%d:a]atrim=end=0,asetpts=PTS-STARTPTS,apad[m%d]",
+                swprintf(af, 420, L";[%d:a]atrim=end=0,asetpts=PTS-STARTPTS,apad[p%d]",
                          ai.in, ai.in);
             } else {
                 swprintf(af, 420,
                          L";[%d:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
                          L"atrim=start=%.4f:end=%.4f,asetpts=PTS-STARTPTS,"
                          L"%ls"
-                         L"adelay=%d|%d:all=1,volume=%d/100,apad[m%d]",
+                         L"adelay=%d|%d:all=1,volume=%d/100,apad[p%d]",
                          ai.in, effStart, effEnd,
                          s.reversed ? L"areverse," : L"",
                          delayMs, delayMs, volPct, ai.in);
             }
             fc += af;
+            // The track's chain, on the block's own stream. Below full amount it
+            // is a wet/dry mix, the same blend the preview mixer does.
+            std::wstring chain = ai.fxMix > 0.0001f ? AfxChain(ai.fx) : L"";
+            wchar_t fxl[256];
+            if (chain.empty()) {
+                swprintf(fxl, 256, L";[p%d]anull[m%d]", ai.in, ai.in);
+                fc += fxl;
+            } else if (ai.fxMix >= 0.999f) {
+                swprintf(fxl, 256, L";[p%d]", ai.in);
+                fc += fxl; fc += chain;
+                swprintf(fxl, 256, L"[m%d]", ai.in);
+                fc += fxl;
+            } else {
+                swprintf(fxl, 256, L";[p%d]asplit=2[d%d][w%d];[w%d]",
+                         ai.in, ai.in, ai.in, ai.in);
+                fc += fxl; fc += chain;
+                swprintf(fxl, 256,
+                         L"[x%d];[d%d][x%d]amix=inputs=2:weights=%.3f %.3f:"
+                         L"normalize=0[m%d]",
+                         ai.in, ai.in, ai.in, 1.0f - ai.fxMix, ai.fxMix, ai.in);
+                fc += fxl;
+            }
         }
         fc += L";";
         if (clipAudio) fc += L"[ac]";
@@ -6183,6 +6390,13 @@ static void DrawClipInspector() {
         }
         Prop("level");
         ImGui::SliderFloat("##alvl", &tr.volume, 0.0f, 2.0f, "%.2f");
+        Prop("chain");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::Combo("##afx", &tr.fx, kAfxNames, AFX_COUNT);
+        if (tr.fx > AFX_NONE) {
+            Prop("amount");
+            ImGui::SliderFloat("##afxmix", &tr.fxMix, 0.0f, 1.0f, "%.2f");
+        }
         Prop("track");
         ImGui::Checkbox("mute", &tr.mute);
         ImGui::SameLine();
@@ -6498,6 +6712,14 @@ static void DrawTracksPanel() {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-1);
         ImGui::SliderFloat("##level", &tr.volume, 0.0f, 2.0f, "%.2f");
+        Prop("chain");
+        ImGui::SetNextItemWidth(tr.fx > AFX_NONE ? ColW(2) : -1);
+        ImGui::Combo("##afx", &tr.fx, kAfxNames, AFX_COUNT);
+        if (tr.fx > AFX_NONE) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##afxmix", &tr.fxMix, 0.0f, 1.0f, "%.2f");
+        }
         Prop("");
         float third = ColW(3);
         ImGui::Checkbox("mute", &tr.mute);
@@ -6824,6 +7046,8 @@ static std::string ProjectToText(bool undoMode = false) {
             Put(o, "name", t->name);
             PutN(o, "volume", t->volume);
             PutI(o, "mute", t->mute);
+            PutI(o, "fx", t->fx);
+            PutN(o, "fxMix", t->fxMix);
             PutN(o, "height", t->height);
         }
         for (auto& c : q->clips) WriteClip(o, *c, -1, q->id);
@@ -7081,6 +7305,9 @@ static bool LoadProjectFromText(const std::string& text, bool syncAudio = false)
             t->name = kv.str("name", "Audio");
             t->volume = (float)kv.num("volume", 1.0);
             t->mute = kv.b("mute");
+            t->fx = kv.i("fx", AFX_NONE);
+            if (t->fx < 0 || t->fx >= AFX_COUNT) t->fx = AFX_NONE;
+            t->fxMix = (float)kv.num("fxMix", 1.0);
             t->height = (float)kv.num("height", 44.0);
             MixGuard lock;
             seqFor(kv.i("seq", 0))->atracks.push_back(std::move(t));

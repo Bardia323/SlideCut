@@ -498,6 +498,9 @@ static std::atomic<double> g_playhead(0.0);
 static std::atomic<bool>   g_playing(false);
 static ma_device           g_audioDevice;
 static bool                g_audioReady = false;
+// Preview hush: silence every clip's own audio while cutting, without touching
+// the clips themselves. Export and the project file never see it.
+static std::atomic<bool>   g_hushClips(false);
 
 // Where each shot sits on the film, once mutes and dissolves are taken into
 // account. Muted shots collapse onto the cut they sit on; a dissolve pulls the
@@ -552,6 +555,24 @@ static double TotalDuration() {
     for (size_t i = 0; i < lay.size(); i++) if (!g_clips[i]->skip && lay[i].end > t) t = lay[i].end;
     return t;
 }
+// How far the playhead may run. The base cut is only one layer: layer clips and
+// sound blocks parked past its last shot are still there to be watched, so the
+// preview reaches the last thing on any track, not the end of the base track.
+static double TimelineEnd() {
+    double t = TotalDuration();
+    for (auto& tr : g_over)
+        for (auto& c : tr->clips) {
+            if (c->skip) continue;
+            double e = c->start + c->duration;
+            if (e > t) t = e;
+        }
+    for (auto& tr : g_atracks)
+        for (auto& b : tr->blocks) {
+            double e = b->offset + (b->trimEnd - b->trimStart);
+            if (e > t) t = e;
+        }
+    return t;
+}
 static int ClipAt(double t, double* clipStart = nullptr) {
     std::vector<BaseSpan> lay;
     BaseLayout(lay);
@@ -561,7 +582,13 @@ static int ClipAt(double t, double* clipStart = nullptr) {
         last = i;
         if (t < lay[i].end) { if (clipStart) *clipStart = lay[i].start; return i; }
     }
-    if (last >= 0) { if (clipStart) *clipStart = lay[last].start; return last; }
+    // Past the last shot the base track is simply over: it holds no frame there,
+    // so anything parked further out on a layer plays over black. The last frame
+    // itself still stands, so parking on the end mark shows a picture.
+    if (last >= 0 && t <= lay[last].end + 1e-9) {
+        if (clipStart) *clipStart = lay[last].start;
+        return last;
+    }
     return -1;
 }
 
@@ -661,6 +688,7 @@ static void AudioCallback(ma_device*, void* out, const void*, ma_uint32 frames) 
             }
         }
     }
+    if (!g_hushClips.load(std::memory_order_relaxed))
     for (auto& c : g_videoAudio) {
         Song& s = *c.audio;
         float gain = c.volume;
@@ -1631,13 +1659,27 @@ static std::vector<std::unique_ptr<AudioTrack>>* ATracksOf(int seqId) {
 
 // A sequence is as long as its base cut. Nest clips carry a cached length so this
 // stays a plain sum; RefreshNestDurations is what keeps the cache honest.
+// A sequence lasts as long as the last thing in it on any track: folding two
+// layer clips with no base cut still has to hold their span open, or the nest
+// standing for them would collapse to nothing.
 static double SeqDurationOf(const Sequence& q) {
     double t = 0;
     for (auto& c : q.clips) t += TimeLen(*c);
+    for (auto& tr : q.over)
+        for (auto& c : tr->clips) {
+            if (c->skip) continue;
+            double e = c->start + c->duration;
+            if (e > t) t = e;
+        }
+    for (auto& tr : q.atracks)
+        for (auto& b : tr->blocks) {
+            double e = b->offset + (b->trimEnd - b->trimStart);
+            if (e > t) t = e;
+        }
     return t;
 }
 static double SeqDuration(int id) {
-    if (id == CurSeqId()) return TotalDuration();
+    if (id == CurSeqId()) return TimelineEnd();
     Sequence* q = FindSeq(id);
     return q ? SeqDurationOf(*q) : 0.0;
 }
@@ -4319,7 +4361,8 @@ static void DrawTimeline() {
                 g_tl.editValue = c.duration;
                 // A card is a card wherever it sits: double-click edits its words,
                 // the same as one on the base track.
-                if (c.kind == Clip::Text) g_tl.editOpenText = true;
+                if (c.kind == Clip::Nest) g_navEnter = c.nest;
+                else if (c.kind == Clip::Text) g_tl.editOpenText = true;
                 else ImGui::OpenPopup("edit_duration");
             }
         } else if (hotAudBlock >= 0) {
@@ -4765,7 +4808,8 @@ static void DrawTimeline() {
         case TimelineState::Scrub: {
             double t = XToSec(io.MousePos.x);
             if (t < 0) t = 0;
-            if (t > total) t = total;
+            double lim = TimelineEnd();
+            if (t > lim) t = lim;
             g_playhead.store(t);
             break;
         }
@@ -4877,8 +4921,13 @@ static void DrawTimeline() {
 
     // mute: the film runs straight past these shots without losing them
     if (g_tl.drag == TimelineState::None && !io.WantTextInput &&
-        ImGui::IsKeyPressed(ImGuiKey_M, false))
+        !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_M, false))
         g_muteToggle = true;
+
+    // hush: kill clip sound in the preview only, so the cut can be watched silent
+    if (g_tl.drag == TimelineState::None && !io.WantTextInput &&
+        io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_M, false))
+        g_hushClips.store(!g_hushClips.load());
 
     // trim the whole selection to the length of the shot the panel is on
     if (g_tl.drag == TimelineState::None && !io.WantTextInput &&
@@ -7928,6 +7977,16 @@ static void ClipToolBar(bool doAdd) {
             ImGui::SetTooltip("m — skip the selected shots without removing them");
         ImGui::EndDisabled();
     }
+    ImGui::SameLine(0, 3);
+    {   // hush: every clip's sound off in the preview, the edit itself untouched
+        bool hush = g_hushClips.load();
+        if (hush) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        if (ImGui::Button(hush ? "UNHUSH" : "HUSH", md)) g_hushClips.store(!hush);
+        if (hush) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(hush ? "shift+m — clip sound is off in the preview (music tracks still play)"
+                                   : "shift+m — silence every clip's own sound while editing (export unaffected)");
+    }
 
     // ---- where you are: the reel, then every sequence you stepped into. Each
     // one steps back to that level, so the depth is never a guess.
@@ -7978,7 +8037,7 @@ static void DrawApp() {
 
     // Two flat rows, nothing folded away: every control is on screen and one click
     // deep. The keyboard duplicates the common ones, it never replaces them.
-    double tot = TotalDuration();
+    double tot = TimelineEnd();
     bool songBusy = g_songLoading.load();
     ImGuiIO& kio = ImGui::GetIO();
     bool chord = kio.KeyCtrl && !kio.WantTextInput;

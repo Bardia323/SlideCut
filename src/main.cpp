@@ -6536,13 +6536,28 @@ static void DrawClipInspector() {
             ForEachOtherSelected(c, [&](Clip& o) { o.reversed = c.reversed; });
     }
     if (c.kind == Clip::Text) {
+        // The words live right here: type into the panel and the card follows,
+        // no trip through the popup. The buffer is refilled whenever the
+        // selection moves to a different card.
+        static char cbuf[1024];
+        static int  cbufFor = -1;
+        if (cbufFor != c.uid) {
+            snprintf(cbuf, sizeof(cbuf), "%s", c.text.c_str());
+            cbufFor = c.uid;
+        }
+        Prop("words");
+        if (ImGui::InputTextMultiline("##cardtxt", cbuf, sizeof(cbuf), ImVec2(-1, 76))) {
+            c.text = cbuf;
+            c.label = FirstLine(c.text);
+        }
         Prop("card size");
         ImGui::SliderFloat("##csz", &c.textScale, 0.03f, 0.30f, "%.3f");
         Prop("");
-        if (ImGui::Button("edit card text", ImVec2(-1, 0))) {
+        if (ImGui::Button("edit in a bigger box", ImVec2(-1, 0))) {
             g_tl.editIndex = g_sel;
             g_tl.editTrack = g_selTrack;
             g_tl.editOpenText = true;      // the root window owns the popup
+            cbufFor = -1;                  // popup may rewrite it: refill on the way back
         }
     }
 

@@ -12,6 +12,7 @@
 #include <shobjidl.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#include <shlobj.h>
 #include <dbghelp.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -2372,6 +2373,39 @@ static void NestResolve(Clip& c, double local, std::vector<NestHit>& out, int de
     }
 }
 
+// The same walk, one level deep: an inner nest comes back as a Nest clip rather
+// than being opened out. A sequence composites onto its own canvas and that canvas
+// is blended into its parent exactly once, so whoever renders it has to be able to
+// stop at the sequence boundary.
+static void NestChildren(Clip& c, double local, std::vector<NestHit>& out) {
+    if (c.kind != Clip::Nest) return;
+    if (c.reversed) local = c.duration - local;
+    const std::vector<std::unique_ptr<Clip>>* base = nullptr;
+    const std::vector<std::unique_ptr<VideoTrack>>* over = nullptr;
+    Sequence* q = FindSeq(c.nest);
+    if (c.nest == CurSeqId()) { base = &g_clips; over = &g_over; }
+    else if (q) { base = &q->clips; over = &q->over; }
+    if (!base) return;
+    double acc = 0;
+    for (auto& b : *base) {
+        if (b->skip) continue;
+        if (local < acc + b->duration) {
+            out.push_back({ b.get(), local - acc, 0, 1.0f });   // the cut, always normal
+            break;
+        }
+        acc += b->duration;
+    }
+    if (!over) return;
+    for (auto& t : *over) {
+        if (!t->visible) continue;
+        for (auto& o : t->clips) {
+            if (o->skip) continue;
+            if (local < o->start || local >= o->start + o->duration) continue;
+            out.push_back({ o.get(), local - o->start, o->lblend, o->lopacity });
+        }
+    }
+}
+
 static std::vector<std::unique_ptr<Clip>>* TrackClips(int track) {
     if (track == -1) return &g_clips;
     if (track >= 0 && track < (int)g_over.size()) return &g_over[track]->clips;
@@ -2430,6 +2464,12 @@ static void PumpPendingLoads() {          // main thread: turn decoded pixels in
     std::vector<Clip*> all;
     for (auto& c : g_clips) all.push_back(c.get());
     for (auto& t : g_over) for (auto& c : t->clips) all.push_back(c.get());
+    // Sequences are no longer opened out before the render, so their cards live in
+    // g_seqs rather than on the working copy.
+    for (auto& q : g_seqs) {
+        for (auto& c : q->clips) all.push_back(c.get());
+        for (auto& t : q->over) for (auto& c : t->clips) all.push_back(c.get());
+    }
     for (auto& q : g_seqs) {              // folded levels are previewed from outside
         for (auto& c : q->clips) all.push_back(c.get());
         for (auto& t : q->over) for (auto& c : t->clips) all.push_back(c.get());
@@ -2691,7 +2731,60 @@ struct ExportJob {
     int          stage = 1;               // 1 = ffmpeg encode, 2 = projector shader pass
     bool         wantProjector = false;   // run stage 2 when the encode succeeds
     std::wstring stageTmp;                // stage-2 output, moved over outPath at the end
+    bool         toClipboard = false;     // hand the finished file to the OS clipboard
+    std::wstring stageExt;                // container the encode was actually built for
 } g_export;
+
+// Temp films rendered for the Windows clipboard. They are ours to clean up, so the
+// paths are kept and the files deleted on the way out.
+static std::vector<std::wstring> g_clipTemps;
+
+static void SweepClipboardTemps() {
+    for (auto& p : g_clipTemps) DeleteFileW(p.c_str());
+    g_clipTemps.clear();
+}
+
+// A second Ctrl+Shift+C while the copy is still encoding calls it off.
+static void CancelClipboardRender() {
+    if (!g_export.active || !g_export.toClipboard) return;
+    if (g_export.process) {
+        TerminateProcess(g_export.process, 1);
+        WaitForSingleObject(g_export.process, 2000);
+        CloseHandle(g_export.process);
+        g_export.process = nullptr;
+    }
+    if (!g_export.stageTmp.empty()) DeleteFileW(g_export.stageTmp.c_str());
+    if (!g_clipTemps.empty()) {                // the half-written film is no use to anyone
+        DeleteFileW(g_clipTemps.back().c_str());
+        g_clipTemps.pop_back();
+    }
+    g_export.active = false;
+    g_export.toClipboard = false;
+    g_export.stage = 1;
+    g_export.progress = 0;
+    g_export.failed = false;
+    g_export.message = "Copy cancelled";
+}
+
+// ---- Windows clipboard: a file, the way Explorer puts one there (CF_HDROP), so
+// any app that takes a dropped file takes a paste from us too.
+static bool SetClipboardFile(const std::wstring& path) {
+    size_t chars = path.size() + 2;                      // list terminator is a second NUL
+    size_t bytes = sizeof(DROPFILES) + chars * sizeof(wchar_t);
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!h) return false;
+    auto* df = (DROPFILES*)GlobalLock(h);
+    ZeroMemory(df, bytes);
+    df->pFiles = sizeof(DROPFILES);
+    df->fWide = TRUE;
+    memcpy((char*)df + sizeof(DROPFILES), path.c_str(), path.size() * sizeof(wchar_t));
+    GlobalUnlock(h);
+    if (!OpenClipboard(nullptr)) { GlobalFree(h); return false; }
+    EmptyClipboard();
+    if (!SetClipboardData(CF_HDROP, h)) { CloseClipboard(); GlobalFree(h); return false; }
+    CloseClipboard();                                    // the clipboard owns h now
+    return true;
+}
 
 // Output presets. Social targets are fixed canvases; "Original" keeps the largest
 // source resolution, "Custom" takes whatever is typed in the settings dialog.
@@ -2889,50 +2982,53 @@ static bool FlattenNestsHere() {
         UnfoldNest(idx);
         did = true;
     }
-    // A nest sitting on an overlay track spreads across new tracks of its own, so
-    // its inner cut still plays in order and its blend carries down.
-    for (int guard = 0; guard < 256; guard++) {
-        int ti = -1, ci = -1;
-        for (int t = 0; t < (int)g_over.size() && ti < 0; t++)
-            for (int i = 0; i < (int)g_over[t]->clips.size(); i++)
-                if (g_over[t]->clips[i]->kind == Clip::Nest) { ti = t; ci = i; break; }
-        if (ti < 0) break;
-        std::unique_ptr<Clip> nc = std::move(g_over[ti]->clips[ci]);
-        g_over[ti]->clips.erase(g_over[ti]->clips.begin() + ci);
-        Sequence* q = FindSeq(nc->nest);
-        if (q) {
-            double at = nc->start;
-            int mode = nc->lblend;
-            float op = nc->lopacity;
-            bool rev = nc->reversed;
-            int dst = NewOverlayTrack();       // may reallocate g_over: index after
-            double acc = 0;
-            if (rev) std::reverse(q->clips.begin(), q->clips.end());
-            for (auto& c : q->clips) {
-                if (rev) c->reversed = !c->reversed;
-                c->start = at + acc;
-                acc += c->duration;
-                c->lblend = mode;
-                c->lopacity = op;
-                g_over[dst]->clips.push_back(std::move(c));
-            }
-            q->clips.clear();
-            for (size_t k = 0; k < q->over.size(); k++) {
-                int d2 = NewOverlayTrack();
-                for (auto& c : q->over[k]->clips) {
-                    c->start += at;
-                    g_over[d2]->clips.push_back(std::move(c));
+    // A nest on an overlay track is NOT opened out. A sequence is one picture: it
+    // composites onto a canvas of its own and is blended into the cut once, in its
+    // own mode. Opening it out means stamping that mode onto every clip inside it,
+    // which is why a folded sequence used to look different from the same sequence
+    // opened up. StartExport builds the canvas; all that has to happen here is
+    // lifting the sound out, because the audio graph is flat.
+    {
+        std::vector<int> lifted;
+        std::function<void(Clip&, double, bool)> liftAudio =
+            [&](Clip& n, double at, bool rev) {
+            Sequence* q = FindSeq(n.nest);
+            if (!q) return;
+            for (int u : lifted) if (u == n.uid) return;   // a sequence used twice
+            lifted.push_back(n.uid);
+            {
+                MixGuard lock;
+                for (auto& tr : q->atracks) {
+                    g_atracks.push_back(std::move(tr));
+                    for (auto& b : g_atracks.back()->blocks) {
+                        if (rev) {
+                            b->offset = n.duration - (b->offset + b->duration);
+                            b->reversed = !b->reversed;
+                        }
+                        b->offset += at;
+                    }
                 }
+                q->atracks.clear();
             }
-            q->over.clear();
-            MixGuard lock;
-            for (auto& tr : q->atracks) {
-                g_atracks.push_back(std::move(tr));
-                for (auto& b : g_atracks.back()->blocks) b->offset += at;
+            double acc = 0;
+            for (auto& b : q->clips) {         // sequences inside this one, in turn
+                double s = rev ? n.duration - (acc + b->duration) : acc;
+                acc += b->duration;
+                if (b->kind == Clip::Nest && !b->skip)
+                    liftAudio(*b, at + s, rev != b->reversed);
             }
-            q->atracks.clear();
-        }
-        did = true;
+            for (auto& t : q->over)
+                for (auto& c : t->clips) {
+                    if (c->kind != Clip::Nest || c->skip) continue;
+                    double s = rev ? n.duration - (c->start + c->duration) : c->start;
+                    liftAudio(*c, at + s, rev != c->reversed);
+                }
+            did = true;
+        };
+        for (auto& t : g_over)
+            for (auto& c : t->clips)
+                if (c->kind == Clip::Nest && !c->skip)
+                    liftAudio(*c, c->start, c->reversed);
     }
     return did;
 }
@@ -2981,12 +3077,67 @@ static void StartExport(const std::wstring& outPath) {
             if (c->duration > 0.001 && !c->skip) layers.push_back(c.get());
     }
 
+    // What one sequence holds, laid out on the parent's clock: its cut first (which
+    // always composites normally, the way it does when you are standing inside it),
+    // then its own layers with the modes they were given in there. An inner nest
+    // comes back as a Nest clip - it gets a canvas of its own in turn.
+    struct LayerItem { Clip* clip; double start, dur; int mode; float opacity; bool rev; };
+    auto nestItems = [](Clip& n, double at, bool rev, std::vector<LayerItem>& out) {
+        Sequence* q = FindSeq(n.nest);
+        if (!q) return;
+        double acc = 0;
+        for (auto& b : q->clips) {
+            double s = rev ? n.duration - (acc + b->duration) : acc;
+            acc += b->duration;
+            if (b->skip || b->duration <= 0.001) continue;
+            out.push_back({ b.get(), at + s, b->duration, 0, 1.0f, rev != b->reversed });
+        }
+        for (auto& t : q->over) {
+            if (!t->visible) continue;
+            for (auto& c : t->clips) {
+                if (c->skip || c->duration <= 0.001) continue;
+                double s = rev ? n.duration - (c->start + c->duration) : c->start;
+                out.push_back({ c.get(), at + s, c->duration, c->lblend, c->lopacity,
+                                rev != c->reversed });
+            }
+        }
+    };
+
+    // Everything inside the overlay nests still needs an ffmpeg input of its own, and
+    // every nest needs a transparent canvas to composite onto.
+    std::vector<Clip*> nested;             // clips living inside an overlay nest
+    std::vector<Clip*> nests;              // the nests themselves
+    {
+        std::vector<int> seen;
+        std::function<void(Clip&, bool)> walkNest = [&](Clip& n, bool rev) {
+            for (int u : seen) if (u == n.uid) return;
+            seen.push_back(n.uid);
+            nests.push_back(&n);
+            std::vector<LayerItem> items;
+            nestItems(n, 0.0, rev, items);
+            for (auto& it : items) {
+                if (it.clip->kind == Clip::Nest) walkNest(*it.clip, it.rev);
+                else {
+                    bool dup = false;
+                    for (Clip* q : nested) if (q == it.clip) dup = true;
+                    if (!dup) nested.push_back(it.clip);
+                }
+            }
+        };
+        for (Clip* c : layers)
+            if (c->kind == Clip::Nest) walkNest(*c, c->reversed);
+    }
+
     bool anyPending = false, anyProbing = false;
     for (auto& c : g_clips) {
         if (c->kind == Clip::Image && c->srcW == 0) anyPending = true;
         if (c->kind == Clip::Video && (!c->vid || !c->vid->probed.load())) anyProbing = true;
     }
     for (Clip* c : layers) {
+        if (c->kind == Clip::Image && c->srcW == 0) anyPending = true;
+        if (c->kind == Clip::Video && (!c->vid || !c->vid->probed.load())) anyProbing = true;
+    }
+    for (Clip* c : nested) {
         if (c->kind == Clip::Image && c->srcW == 0) anyPending = true;
         if (c->kind == Clip::Video && (!c->vid || !c->vid->probed.load())) anyProbing = true;
     }
@@ -3040,7 +3191,21 @@ static void StartExport(const std::wstring& outPath) {
         }
     };
     for (auto& c : g_clips) if (!c->skip) addClipInputs(*c);
-    for (Clip* c : layers)  addClipInputs(*c);
+    for (Clip* c : layers)  if (c->kind != Clip::Nest) addClipInputs(*c);
+    for (Clip* c : nested)  addClipInputs(*c);
+    // One transparent canvas per nest, the length of the film, so a sequence can be
+    // composited in the parent's own time and dropped on in one piece.
+    std::map<int, int> nestIn;
+    {
+        double filmLen = TotalDuration();
+        for (Clip* n : nests) {
+            wchar_t seg[160];
+            swprintf(seg, 160, L" -f lavfi -t %.4f -i color=c=black:s=%dx%d:r=%d",
+                     filmLen, W, H, FPS);
+            cmd += seg;
+            nestIn[n->uid] = nIn++;
+        }
+    }
 
     // audio blocks, in track order
     struct AudioIn { Song* s; int in; float vol; int fx; float fxMix; };
@@ -3101,9 +3266,69 @@ static void StartExport(const std::wstring& outPath) {
         fc += L"[" + out + L"];";
     };
 
+    // A layer is not a shot. The preview blends a layer only where it actually covers
+    // and leaves the picture underneath alone everywhere else, so a layer must never
+    // get the blur fill a base shot gets: blending a blurred full-frame copy of the
+    // layer over the whole cut is what made an export read hazy next to the preview.
+    // Fit it inside the canvas on a transparent bed, and let the alpha be the mask.
+    auto FitLayer = [&](int inIdx, const std::wstring& out) {
+        wchar_t seg[768];
+        if (fit == FIT_CROP) {             // crop to fill covers the frame anyway
+            swprintf(seg, 768,
+                     L"[%d:v]fps=%d,setpts=PTS-STARTPTS,"
+                     L"scale=%d:%d:force_original_aspect_ratio=increase:"
+                     L"flags=lanczos+accurate_rnd+full_chroma_int,"
+                     L"crop=%d:%d,format=rgba,setsar=1",
+                     inIdx, FPS, W, H, W, H);
+        } else {
+            swprintf(seg, 768,
+                     L"[%d:v]fps=%d,setpts=PTS-STARTPTS,"
+                     L"scale=%d:%d:force_original_aspect_ratio=decrease:"
+                     L"flags=lanczos+accurate_rnd+full_chroma_int,format=rgba,"
+                     L"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=0x00000000,setsar=1",
+                     inIdx, FPS, W, H, W, H);
+        }
+        fc += seg;
+        fc += L"[" + out + L"];";
+    };
+
+    // Mix [top] into [bottom] in `mode` at `opacity`, but only where [top] is opaque.
+    // The blend itself runs full frame, then the top's own alpha is put back on the
+    // result and an overlay drops that onto the untouched bottom - which is exactly
+    // the preview's lerp(B, blend(T, B), opacity * T.a). `enable`, when given, gates
+    // that last overlay to the stretch of timeline the layer occupies.
+    auto BlendMasked = [&](const std::wstring& top, const std::wstring& bottom,
+                           const wchar_t* mode, float opacity, int uid,
+                           const wchar_t* tag, const std::wstring& enable,
+                           bool keepAlpha, const std::wstring& out) {
+        wchar_t seg[768];
+        swprintf(seg, 768, L"[%ls]split=2[%lsba%d][%lsbb%d];",
+                 bottom.c_str(), tag, uid, tag, uid);
+        fc += seg;
+        swprintf(seg, 768, L"[%ls]split=2[%lsta%d][%lstb%d];[%lsta%d]alphaextract[%lsm%d];",
+                 top.c_str(), tag, uid, tag, uid, tag, uid, tag, uid);
+        fc += seg;
+        swprintf(seg, 768,
+                 L"[%lstb%d][%lsba%d]blend=all_mode=%ls:all_opacity=%.4f:"
+                 L"repeatlast=1:shortest=0,format=gbrp[%lsx%d];",
+                 tag, uid, tag, uid, mode, opacity, tag, uid);
+        fc += seg;
+        swprintf(seg, 768, L"[%lsx%d][%lsm%d]alphamerge[%lsy%d];",
+                 tag, uid, tag, uid, tag, uid);
+        fc += seg;
+        swprintf(seg, 768, L"[%lsbb%d][%lsy%d]overlay=eof_action=pass", tag, uid, tag, uid);
+        fc += seg;
+        fc += enable;
+        // A sequence canvas is itself a layer further up, and its alpha is the mask
+        // that keeps it off the frame where it holds nothing. overlay would happily
+        // negotiate that alpha away, so pin the format.
+        if (keepAlpha) fc += L",format=rgba";
+        fc += L",setsar=1[" + out + L"];";
+    };
+
     // One clip's picture: fit to canvas, blend its double exposure, burn its text.
     // Leaves the result in [v<uid>].
-    auto ClipChain = [&](Clip& c) {
+    auto ClipChain = [&](Clip& c, bool layer, bool reversed) {
         wchar_t seg[768];
         wchar_t cur[32];
         swprintf(cur, 32, L"p%d", c.uid);
@@ -3112,11 +3337,13 @@ static void StartExport(const std::wstring& outPath) {
         if (c.kind == Clip::Text) {        // the lavfi colour source is already canvas-size
             swprintf(seg, 768, L"[%d:v]fps=%d,setsar=1[%ls];", vIn[c.uid], FPS, stage.c_str());
             fc += seg;
+        } else if (layer) {
+            FitLayer(vIn[c.uid], stage);
         } else {
             FitTo(vIn[c.uid], stage);
         }
 
-        if (c.reversed && c.kind != Clip::Image) {
+        if (reversed && c.kind != Clip::Image) {
             // reverse buffers the whole segment, which is fine at shot length. It
             // goes on before the layer and the text so those stay the right way up.
             wchar_t rv[64];
@@ -3141,17 +3368,15 @@ static void StartExport(const std::wstring& outPath) {
         if (dit != dIn.end()) {            // double exposure
             wchar_t dl[32];
             swprintf(dl, 32, L"d%d", c.uid);
-            FitTo(dit->second, dl);
+            FitLayer(dit->second, dl);
             wchar_t out[32];
             swprintf(out, 32, L"x%d", c.uid);
             int bm = c.dxBlend;
             if (bm < 0 || bm >= (int)(sizeof(BLEND_MODES_W) / sizeof(*BLEND_MODES_W))) bm = 0;
             // ffmpeg's blend takes the TOP layer first: all_opacity mixes the result
             // back toward the second input, so the picture has to be second.
-            swprintf(seg, 768,
-                     L"[%ls][%ls]blend=all_mode=%ls:all_opacity=%.4f,format=gbrp,setsar=1[%ls];",
-                     dl, stage.c_str(), BLEND_MODES_W[bm], c.dxAmount, out);
-            fc += seg;
+            BlendMasked(dl, stage, BLEND_MODES_W[bm], c.dxAmount, c.uid, L"dx", L"",
+                        layer, out);
             stage = out;
         }
 
@@ -3181,8 +3406,8 @@ static void StartExport(const std::wstring& outPath) {
         }
     };
 
-    for (auto& c : g_clips) if (!c->skip) ClipChain(*c);
-    for (Clip* c : layers)  ClipChain(*c);
+    for (auto& c : g_clips) if (!c->skip) ClipChain(*c, false, c->reversed);
+    for (Clip* c : layers)  if (c->kind != Clip::Nest) ClipChain(*c, true, c->reversed);
 
     if (clipAudio) {                       // one audio block per clip, exact length
         for (size_t i = 0; i < g_clips.size(); i++) {
@@ -3224,37 +3449,88 @@ static void StartExport(const std::wstring& outPath) {
     // ---- overlay tracks: shift each layer to its start and composite it there.
     // tpad prepends black so the layer stream lines up with the timeline, and
     // `enable` keeps the blend switched off everywhere outside the clip.
+    // Put one element onto `canvas` in `mode` at `opacity`, live only between s and e.
+    // `placed` says the picture already sits on the film's clock and needs no lead-in,
+    // which is true of a nest canvas and of nothing else.
+    // The layer is the TOP input of blend, so the cut underneath is second and
+    // all_opacity fades toward it. `enable` cannot gate blend here — a disabled
+    // filter passes its FIRST input through, which would show the bare layer — so the
+    // window is applied by an overlay of the blended result instead.
+    auto CompositeOn = [&](const std::wstring& canvas, int uid, const std::wstring& pic,
+                           double s, double e, int mode, float opacity,
+                           bool placed, bool keepAlpha) -> std::wstring {
+        std::wstring top = pic;
+        if (!placed) {
+            // The lead-in is transparent, not black: a black pad is opaque, and an
+            // opaque pad would blend over the cut on every frame before the layer.
+            wchar_t seg[768];
+            swprintf(seg, 768,
+                     L"[%ls]tpad=start_duration=%.4f:start_mode=add:color=0x00000000[L%d];",
+                     pic.c_str(), s, uid);
+            fc += seg;
+            wchar_t lay[32];
+            swprintf(lay, 32, L"L%d", uid);
+            top = lay;
+        }
+        int m = mode;
+        if (m < 0 || m >= (int)(sizeof(LAYER_MODES_W) / sizeof(*LAYER_MODES_W))) m = 0;
+        wchar_t lab[32], en[96];
+        swprintf(lab, 32, L"o%d", uid);
+        swprintf(en, 96, L":enable='between(t,%.4f,%.4f)'", s, e);
+        BlendMasked(top, canvas, LAYER_MODES_W[m], opacity, uid, L"ly", en, keepAlpha, lab);
+        return lab;
+    };
+
+    // A sequence on a layer track: its own transparent canvas, everything inside it
+    // composited onto that in the modes it was given in there, and the finished
+    // canvas handed back as one picture for the parent to blend once.
+    std::function<std::wstring(Clip&, double, bool)> EmitNest =
+        [&](Clip& n, double at, bool rev) -> std::wstring {
+        wchar_t seg[256], cv[32];
+        swprintf(seg, 256, L"[%d:v]format=rgba,colorchannelmixer=aa=0,setsar=1[nc%d];",
+                 nestIn[n.uid], n.uid);
+        fc += seg;
+        swprintf(cv, 32, L"nc%d", n.uid);
+        std::wstring canvas = cv;
+        std::vector<LayerItem> items;
+        nestItems(n, at, rev, items);
+        for (auto& it : items) {
+            double s = it.start < 0 ? 0 : it.start;
+            double e = it.start + it.dur;
+            if (e <= 0.001 || s >= total) continue;
+            if (e > total) e = total;
+            std::wstring pic;
+            bool placed = it.clip->kind == Clip::Nest;
+            if (placed) {
+                pic = EmitNest(*it.clip, it.start, it.rev);
+            } else {
+                ClipChain(*it.clip, true, it.rev);
+                wchar_t v[32];
+                swprintf(v, 32, L"v%d", it.clip->uid);
+                pic = v;
+            }
+            canvas = CompositeOn(canvas, it.clip->uid, pic, s, e, it.mode, it.opacity,
+                                 placed, true);
+        }
+        return canvas;
+    };
+
     std::wstring vstage = L"vc";
     for (Clip* c : layers) {
         double s = c->start < 0 ? 0 : c->start;
         double e = s + c->duration;
         if (e <= 0.001 || s >= total) continue;          // outside the film entirely
         if (e > total) e = total;
-        int m = c->lblend;
-        if (m < 0 || m >= (int)(sizeof(LAYER_MODES_W) / sizeof(*LAYER_MODES_W))) m = 0;
-        // The layer is the TOP input of blend, so the cut underneath is second and
-        // all_opacity fades toward it. `enable` cannot gate blend here — a disabled
-        // filter passes its FIRST input through, which would show the bare layer —
-        // so the window is applied by an overlay of the blended result instead.
-        wchar_t seg[768];
-        swprintf(seg, 768, L"[%ls]split=2[sa%d][sb%d];", vstage.c_str(), c->uid, c->uid);
-        fc += seg;
-        swprintf(seg, 768, L"[v%d]tpad=start_duration=%.4f:start_mode=add:color=black[L%d];",
-                 c->uid, s, c->uid);
-        fc += seg;
-        swprintf(seg, 768,
-                 L"[L%d][sa%d]blend=all_mode=%ls:all_opacity=%.4f:repeatlast=1:shortest=0,"
-                 L"format=gbrp,setsar=1[bl%d];",
-                 c->uid, c->uid, LAYER_MODES_W[m], c->lopacity, c->uid);
-        fc += seg;
-        swprintf(seg, 768,
-                 L"[sb%d][bl%d]overlay=eof_action=pass:enable='between(t,%.4f,%.4f)'"
-                 L",setsar=1[o%d];",
-                 c->uid, c->uid, s, e, c->uid);
-        fc += seg;
-        wchar_t lab[32];
-        swprintf(lab, 32, L"o%d", c->uid);
-        vstage = lab;
+        std::wstring pic;
+        bool placed = c->kind == Clip::Nest;
+        if (placed) {
+            pic = EmitNest(*c, c->start, c->reversed);
+        } else {
+            wchar_t v[32];
+            swprintf(v, 32, L"v%d", c->uid);
+            pic = v;
+        }
+        vstage = CompositeOn(vstage, c->uid, pic, s, e, c->lblend, c->lopacity, placed, false);
     }
 
     {   // tag bt709 in the graph: output-side -color_primaries/-color_trc alone do not stick
@@ -3268,7 +3544,7 @@ static void StartExport(const std::wstring& outPath) {
         wchar_t vt[256];
         swprintf(vt, 256, L"[%ls]fps=%d,format=yuv420p,"
                           L"setparams=color_primaries=bt709:color_trc=bt709:"
-                          L"colorspace=bt709:range=tv", FPS);
+                          L"colorspace=bt709:range=tv", vstage.c_str(), FPS);
         fc += vt;
         if (g_fadeIn > 0.001f) {
             wchar_t fi[96];
@@ -3434,6 +3710,7 @@ static void StartExport(const std::wstring& outPath) {
 
     g_export.cmd = Narrow(cmd);
     g_export.outPath = outPath;
+    g_export.stageExt = ContainerExt(g_container);
     g_export.logFile = std::wstring(tmp) + L"slidecut_ffmpeg.log";
     SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
     HANDLE log = CreateFileW(g_export.logFile.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
@@ -3479,7 +3756,9 @@ static bool StartProjectorPass() {
     }
     int W, H;
     ResolveCanvas(&W, &H);
-    g_export.stageTmp = g_export.outPath + L".proj." + ContainerExt(g_container);
+    // The container that was live when the encode was built, not whatever the panel
+    // says now: a clipboard copy renders mp4 whatever the delivery setting is.
+    g_export.stageTmp = g_export.outPath + L".proj." + g_export.stageExt;
     DeleteFileW(g_export.stageTmp.c_str());
     std::wstring cmd = Widen(g_pythonExe) + L" \"" + script + L"\" \"" + g_export.outPath +
                        L"\" -o \"" + g_export.stageTmp + L"\"" + ProjectorArgs(W, H, false);
@@ -3547,11 +3826,20 @@ static void PumpExport() {
             g_export.progress = 1.0f;
             if (code == 0 && MoveFileExW(g_export.stageTmp.c_str(), g_export.outPath.c_str(),
                                          MOVEFILE_REPLACE_EXISTING)) {
-                g_lastExportDir = DirName(g_export.outPath);
                 g_export.failed = false;
+                if (g_export.toClipboard) {
+                    g_export.toClipboard = false;
+                    bool ok = SetClipboardFile(g_export.outPath);
+                    g_export.failed = !ok;
+                    g_export.message = ok ? "Copied to the clipboard — paste it anywhere"
+                                          : "Rendered, but the clipboard would not take it.";
+                    return;
+                }
+                g_lastExportDir = DirName(g_export.outPath);
                 g_export.message = "Done (projector) — " + Narrow(BaseName(g_export.outPath));
             } else {
                 DeleteFileW(g_export.stageTmp.c_str());
+                g_export.toClipboard = false;
                 g_export.failed = true;
                 g_export.message = "Encode is fine, projector pass failed — see the log.";
             }
@@ -3564,10 +3852,20 @@ static void PumpExport() {
             return;                        // message already explains what went wrong
         }
         if (code == 0) {
+            if (g_export.toClipboard) {
+                g_export.toClipboard = false;
+                bool ok = SetClipboardFile(g_export.outPath);
+                g_export.failed = !ok;
+                g_export.message = ok ? "Copied to the clipboard — paste it anywhere"
+                                      : "Rendered, but the clipboard would not take it.";
+                g_export.progress = 1.0f;
+                return;
+            }
             g_lastExportDir = DirName(g_export.outPath);
             g_export.message = "Done — " + Narrow(BaseName(g_export.outPath));
             g_export.progress = 1.0f;
         } else {
+            g_export.toClipboard = false;
             // ffmpeg's *first* error line is the useful one — the last is usually the
             // generic "Invalid argument" epilogue, which says nothing on its own.
             g_export.message = "ffmpeg failed — see the log for details";
@@ -6011,9 +6309,16 @@ float4 PSProjector(VSOut input) : SV_Target {
 )HLSL";
 
 // 0/1 ping-pong for the composite, 2 stages one layer, 3 holds the film pass.
-static ID3D11Texture2D*          g_projTex[4] = {};
-static ID3D11RenderTargetView*   g_projRTV[4] = {};
-static ID3D11ShaderResourceView* g_projSRV[4] = {};
+// A nested sequence needs a canvas of its own, so every depth below the root gets
+// its own pair and scratch from 4 up: TargetBase(d) + 0/1 are its ping-pong, +2 its
+// element stage.
+static const int PROJ_MAX_DEPTH = 3;                  // root plus three nest levels
+static const int PROJ_TARGETS = 4 + 3 * PROJ_MAX_DEPTH;
+static ID3D11Texture2D*          g_projTex[PROJ_TARGETS] = {};
+static ID3D11RenderTargetView*   g_projRTV[PROJ_TARGETS] = {};
+static ID3D11ShaderResourceView* g_projSRV[PROJ_TARGETS] = {};
+static int  g_projRtN = 0;                            // how many are actually allocated
+static int  TargetBase(int depth) { return depth == 0 ? 0 : 4 + 3 * (depth - 1); }
 static int  g_projRtW = 0, g_projRtH = 0;
 static bool g_gpuReady = false;
 static bool g_gpuFailed = false;
@@ -6091,9 +6396,26 @@ static bool InitProjectorGPU() {
     return g_gpuReady;
 }
 
-static bool EnsureProjectorTargets(int w, int h) {
-    if (w == g_projRtW && h == g_projRtH && g_projTex[0]) return true;
-    for (int i = 0; i < 4; i++) {
+static bool EnsureProjectorTargets(int w, int h, int count) {
+    if (count < 4) count = 4;
+    if (count > PROJ_TARGETS) count = PROJ_TARGETS;
+    if (w == g_projRtW && h == g_projRtH && count <= g_projRtN) return true;
+    if (w == g_projRtW && h == g_projRtH) {           // same canvas, just deeper
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        for (int i = g_projRtN; i < count; i++) {
+            if (FAILED(g_d3dDevice->CreateTexture2D(&td, nullptr, &g_projTex[i]))) return false;
+            g_d3dDevice->CreateRenderTargetView(g_projTex[i], nullptr, &g_projRTV[i]);
+            g_d3dDevice->CreateShaderResourceView(g_projTex[i], nullptr, &g_projSRV[i]);
+        }
+        g_projRtN = count;
+        return true;
+    }
+    for (int i = 0; i < PROJ_TARGETS; i++) {
         if (g_projSRV[i]) { g_projSRV[i]->Release(); g_projSRV[i] = nullptr; }
         if (g_projRTV[i]) { g_projRTV[i]->Release(); g_projRTV[i] = nullptr; }
         if (g_projTex[i]) { g_projTex[i]->Release(); g_projTex[i] = nullptr; }
@@ -6104,12 +6426,12 @@ static bool EnsureProjectorTargets(int w, int h) {
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < count; i++) {
         if (FAILED(g_d3dDevice->CreateTexture2D(&td, nullptr, &g_projTex[i]))) return false;
         g_d3dDevice->CreateRenderTargetView(g_projTex[i], nullptr, &g_projRTV[i]);
         g_d3dDevice->CreateShaderResourceView(g_projTex[i], nullptr, &g_projSRV[i]);
     }
-    g_projRtW = w; g_projRtH = h;
+    g_projRtW = w; g_projRtH = h; g_projRtN = count;
     return true;
 }
 
@@ -6165,7 +6487,35 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
     if (!InitProjectorGPU()) return nullptr;
     if (outW < 16) outW = 16;
     if (outH < 16) outH = 16;
-    if (!EnsureProjectorTargets(outW, outH)) return nullptr;
+    // Only pay for the canvases this frame needs: most films never nest at all.
+    std::function<int(Clip&, double)> nestDepth = [&](Clip& c, double local) -> int {
+        if (c.kind != Clip::Nest) return 0;
+        std::vector<NestHit> kids;
+        NestChildren(c, local, kids);
+        int deepest = 0;
+        for (auto& k : kids) {
+            int d = nestDepth(*k.clip, k.local);
+            if (d > deepest) deepest = d;
+        }
+        return 1 + deepest;
+    };
+    int wantDepth = 0;
+    {
+        double at = g_playhead.load();
+        double cs = 0;
+        int i = ClipAt(at, &cs);
+        if (i >= 0 && !g_baseOff) wantDepth = nestDepth(*g_clips[i], at - cs);
+        for (auto& tr : g_over) {
+            if (!tr->visible) continue;
+            for (auto& c : tr->clips) {
+                if (c->skip || at < c->start || at >= c->start + c->duration) continue;
+                int d = nestDepth(*c, at - c->start);
+                if (d > wantDepth) wantDepth = d;
+            }
+        }
+        if (wantDepth > PROJ_MAX_DEPTH) wantDepth = PROJ_MAX_DEPTH;
+    }
+    if (!EnsureProjectorTargets(outW, outH, 4 + 3 * wantDepth)) return nullptr;
 
     ID3D11RenderTargetView* oldRTV = nullptr;
     ID3D11DepthStencilView* oldDSV = nullptr;
@@ -6198,47 +6548,72 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
     // The canvas ping-pongs between targets 0 and 1: each element is drawn into
     // target 2 on its own, then a blend pass mixes it into the canvas with the
     // same maths ffmpeg's blend filter uses, so the preview matches the export.
-    int cur = 0;
-    auto blendElement = [&](ID3D11ShaderResourceView* srv, float ar, int mode, float opacity,
-                            const Grade* grade = nullptr) {
+    int curAt[PROJ_MAX_DEPTH + 1] = {};
+    auto blendElement = [&](int depth, ID3D11ShaderResourceView* srv, float ar, int mode,
+                            float opacity, const Grade* grade, bool fitCover) {
         if (!srv || opacity <= 0.001f) return;
+        const int T = TargetBase(depth);
+        const int stage = T + 2;
         // 1. the element alone, fitted, graded, alpha 1 where it covers
-        g_d3dContext->OMSetRenderTargets(1, &g_projRTV[2], nullptr);
-        g_d3dContext->ClearRenderTargetView(g_projRTV[2], clear);
+        g_d3dContext->OMSetRenderTargets(1, &g_projRTV[stage], nullptr);
+        g_d3dContext->ClearRenderTargetView(g_projRTV[stage], clear);
         g_d3dContext->OMSetBlendState(nullptr, blend, 0xffffffff);
         g_d3dContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-        CompositeQuad(srv, ar, cover, 1.0f, outW, outH, grade);
+        CompositeQuad(srv, ar, fitCover, 1.0f, outW, outH, grade);
 
         // 2. blend it over the canvas into the other target
-        int dst = cur ^ 1;
+        int dst = curAt[depth] ^ 1;
         ProjCB cb = {};
         cb.blendMode = (float)mode;
         cb.blendOpacity = opacity;
         SetCB(cb);
         ID3D11ShaderResourceView* none2[2] = { nullptr, nullptr };
         g_d3dContext->PSSetShaderResources(0, 2, none2);
-        g_d3dContext->OMSetRenderTargets(1, &g_projRTV[dst], nullptr);
-        ID3D11ShaderResourceView* srvs[2] = { g_projSRV[2], g_projSRV[cur] };
+        g_d3dContext->OMSetRenderTargets(1, &g_projRTV[T + dst], nullptr);
+        ID3D11ShaderResourceView* srvs[2] = { g_projSRV[stage], g_projSRV[T + curAt[depth]] };
         g_d3dContext->PSSetShaderResources(0, 2, srvs);
         g_d3dContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_d3dContext->VSSetShader(g_fsVS, nullptr, 0);
         g_d3dContext->PSSetShader(g_blendPS, nullptr, 0);
         g_d3dContext->Draw(3, 0);
         g_d3dContext->PSSetShaderResources(0, 2, none2);
-        cur = dst;
+        curAt[depth] = dst;
     };
 
     // A clip is its picture (mode/opacity of its track) followed by its double
     // exposure, blended in its own mode at its own amount.
-    std::function<void(Clip&, double, int, float)> compositeClip;
-    compositeClip = [&](Clip& c, double local, int mode, float opacity) {
+    std::function<void(Clip&, double, int, float, int)> compositeClip;
+    compositeClip = [&](Clip& c, double local, int mode, float opacity, int depth) {
         if (c.kind == Clip::Nest) {
-            // A nest shows what is inside it: its cut, then its own layers.
-            std::vector<NestHit> hits;
-            NestResolve(c, local, hits);
-            for (auto& h : hits)
-                compositeClip(*h.clip, h.local,
-                              h.mode ? h.mode : mode, opacity * h.opacity);
+            // A sequence is one picture, not a bag of clips. Its cut and its own
+            // layers composite onto a canvas of its own - each with the mode it was
+            // given inside the sequence - and that finished canvas is blended into
+            // the parent once, in the nest's mode. Stamping the nest's mode onto
+            // every clip inside it instead is what made a folded sequence look
+            // different from the same sequence opened up.
+            std::vector<NestHit> kids;
+            NestChildren(c, local, kids);
+            if (kids.empty()) return;
+            int d2 = depth + 1;
+            if (d2 > PROJ_MAX_DEPTH || 4 + 3 * d2 > g_projRtN) {
+                // Deeper than we have canvases for: fall back to the flat walk rather
+                // than drop the picture entirely.
+                std::vector<NestHit> flat;
+                NestResolve(c, local, flat);
+                for (auto& h : flat)
+                    compositeClip(*h.clip, h.local, h.mode ? h.mode : mode,
+                                  opacity * h.opacity, depth);
+                return;
+            }
+            const int T2 = TargetBase(d2);
+            curAt[d2] = 0;
+            g_d3dContext->ClearRenderTargetView(g_projRTV[T2], clear);
+            g_d3dContext->ClearRenderTargetView(g_projRTV[T2 + 1], clear);
+            for (auto& k : kids)
+                compositeClip(*k.clip, k.local, k.mode, k.opacity, d2);
+            // The canvas already matches the output frame, so it goes in 1:1.
+            blendElement(depth, g_projSRV[T2 + curAt[d2]], (float)outW / (float)outH,
+                         mode, opacity, nullptr, true);
             return;
         }
         ID3D11ShaderResourceView* srv = nullptr;
@@ -6251,7 +6626,7 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
             srv = c.tex;
             ar = c.texAspect;
         }
-        if (srv) blendElement(srv, ar, mode, opacity, &c.grade);
+        if (srv) blendElement(depth, srv, ar, mode, opacity, &c.grade, cover);
         if (c.dxOn) {
             ID3D11ShaderResourceView* lay = c.dxTex;
             float la = c.dxAspect;
@@ -6260,18 +6635,20 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
                 la = c.dxVid->aspect > 0 ? c.dxVid->aspect : 1.0f;
             }
             // the double-exposure list starts at "screen", the layer list at "normal"
-            if (lay) blendElement(lay, la, c.dxBlend + 1, opacity * c.dxAmount, &c.grade);
+            if (lay) blendElement(depth, lay, la, c.dxBlend + 1, opacity * c.dxAmount,
+                                  &c.grade, cover);
         }
     };
 
     g_d3dContext->ClearRenderTargetView(g_projRTV[1], clear);
-    if (ci >= 0 && !g_baseOff) compositeClip(*g_clips[ci], ph - clipStart, 0, 1.0f);
+    if (ci >= 0 && !g_baseOff) compositeClip(*g_clips[ci], ph - clipStart, 0, 1.0f, 0);
     for (auto& tr : g_over) {
         if (!tr->visible) continue;
         for (auto& c : tr->clips)
             if (!c->skip && ph >= c->start && ph < c->start + c->duration)
-                compositeClip(*c, ph - c->start, c->lblend, c->lopacity);
+                compositeClip(*c, ph - c->start, c->lblend, c->lopacity, 0);
     }
+    int cur = curAt[0];
 
     if (g_grade.On()) {
         // One more pass over the finished composite: the shot grades are already
@@ -6449,7 +6826,16 @@ static void DrawPreviewArea(ImVec2 size) {
     // The compositor runs whether or not the film look is on, so layer blend modes
     // and double exposures always look like what ffmpeg will produce.
     ID3D11ShaderResourceView* projSRV = nullptr;
-    if (!g_clips.empty() && fw > 4 && fh > 4) {
+    // Anything on any track is enough. A sequence folded out of layer clips alone has
+    // an empty base cut, and gating the compositor on the base cut meant standing
+    // inside such a sequence showed its layers flat, with no blend mode applied at
+    // all - while the same sequence seen from outside blended correctly.
+    bool anyPicture = !g_clips.empty();
+    for (auto& tr : g_over) {
+        if (!tr->visible) continue;
+        for (auto& c : tr->clips) if (!c->skip) { anyPicture = true; break; }
+    }
+    if (anyPicture && fw > 4 && fh > 4) {
         int rw = (int)fw, rh = (int)fh;
         if (rw > 1920) { rh = (int)(rh * 1920.0f / rw); rw = 1920; }
         rw += rw & 1; rh += rh & 1;
@@ -7758,7 +8144,10 @@ static void ExportFlattened(const std::wstring& outPath) {
     g_undoBusy = true;
     FlattenNestsHere();
     StartExport(outPath);
-    LoadProjectFromText(snap);
+    // Sync: an async song restore would still be pushing blocks into the project
+    // after this returns, and the caller may tear the whole thing down again. The
+    // blocks were on the timeline a moment ago, so the decode cache is warm.
+    LoadProjectFromText(snap, true);
     g_undoBusy = false;
 }
 
@@ -7869,6 +8258,44 @@ static void WriteCrashNote(const std::wstring& stem, EXCEPTION_POINTERS* ep,
             note += line;
         }
     }
+    // The frames that led there, as module+offset. addr2line over SlideCut.exe turns
+    // our own offsets back into file:line, which is the whole point of keeping them.
+    if (ep && ep->ContextRecord) {
+        note += "stack:\r\n";
+        HANDLE proc = GetCurrentProcess();
+        SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+        SymInitialize(proc, nullptr, TRUE);
+        CONTEXT ctx = *ep->ContextRecord;
+        STACKFRAME64 fr = {};
+        fr.AddrPC.Offset    = ctx.Rip; fr.AddrPC.Mode    = AddrModeFlat;
+        fr.AddrFrame.Offset = ctx.Rbp; fr.AddrFrame.Mode = AddrModeFlat;
+        fr.AddrStack.Offset = ctx.Rsp; fr.AddrStack.Mode = AddrModeFlat;
+        for (int i = 0; i < 40; i++) {
+            if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, GetCurrentThread(), &fr, &ctx,
+                             nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
+                break;
+            DWORD64 pc = fr.AddrPC.Offset;
+            if (!pc) break;
+            HMODULE m = nullptr;
+            wchar_t mp[MAX_PATH] = L"";
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCWSTR)(uintptr_t)pc, &m) && m)
+                GetModuleFileNameW(m, mp, MAX_PATH);
+            std::string base = mp[0] ? Narrow(BaseName(mp)) : "?";
+            unsigned char symbuf[sizeof(SYMBOL_INFO) + 256] = {};
+            auto* si = (SYMBOL_INFO*)symbuf;
+            si->SizeOfStruct = sizeof(SYMBOL_INFO);
+            si->MaxNameLen = 255;
+            DWORD64 disp = 0;
+            const char* nm = SymFromAddr(proc, pc, &disp, si) ? si->Name : "";
+            char fl[512];
+            snprintf(fl, sizeof(fl), "  %2d %s+0x%llX %s\r\n", i, base.c_str(),
+                     (unsigned long long)(m ? pc - (DWORD64)(uintptr_t)m : pc), nm);
+            note += fl;
+        }
+    }
+
     char line[128];
     snprintf(line, sizeof(line), "thread: %lu\r\n", (unsigned long)GetCurrentThreadId());
     note += line;
@@ -8316,6 +8743,139 @@ static void CopySelection() {
     char buf[64];
     snprintf(buf, sizeof(buf), "copied %d item%s", n, n == 1 ? "" : "s");
     g_projectStatus = buf;
+}
+
+// ---- handing a cut to the rest of Windows
+// Throw away everything that is not in `uids` and pull what is left back to zero, so
+// what gets rendered is the picked stretch on its own. The caller works on a project
+// snapshot and puts the real one back the moment the render has been spawned.
+static void TrimToSelection(const std::vector<int>& uids) {
+    auto keep = [&](int uid) {
+        for (int u : uids) if (u == uid) return true;
+        return false;
+    };
+
+    double t0 = 0;
+    bool   has = false;
+    double acc = 0;
+    for (auto& c : g_clips) {                      // the base track packs: walk it up
+        if (keep(c->uid) && !has) { t0 = acc; has = true; }
+        acc += c->duration;
+    }
+    for (auto& t : g_over)
+        for (auto& c : t->clips)
+            if (keep(c->uid) && (!has || c->start < t0)) { t0 = c->start; has = true; }
+    for (auto& t : g_atracks)
+        for (auto& b : t->blocks)
+            if (keep(b->uid) && (!has || b->offset < t0)) { t0 = b->offset; has = true; }
+    if (!has) return;
+
+    MixGuard lock;                                 // the mixer must not be in these lists
+    for (size_t i = 0; i < g_clips.size(); )
+        if (keep(g_clips[i]->uid)) i++; else g_clips.erase(g_clips.begin() + i);
+    for (auto& t : g_over)
+        for (size_t i = 0; i < t->clips.size(); ) {
+            if (keep(t->clips[i]->uid)) { t->clips[i]->start -= t0; i++; }
+            else t->clips.erase(t->clips.begin() + i);
+        }
+    for (auto& t : g_atracks)
+        for (size_t i = 0; i < t->blocks.size(); ) {
+            if (keep(t->blocks[i]->uid)) { t->blocks[i]->offset -= t0; i++; }
+            else t->blocks.erase(t->blocks.begin() + i);
+        }
+
+    // Nothing on the base cut: the pick was layers and sound only. Those still make a
+    // film, so lay a blank card under them long enough to hold the whole stretch.
+    if (g_clips.empty()) {
+        double end = 0;
+        for (auto& t : g_over)
+            for (auto& c : t->clips) end = fmax(end, c->start + c->duration);
+        for (auto& t : g_atracks)
+            for (auto& b : t->blocks) end = fmax(end, b->offset + (b->trimEnd - b->trimStart));
+        if (end <= 0.001) return;
+        auto blank = std::make_unique<Clip>();
+        blank->kind = Clip::Text;              // an empty card is a plain black frame
+        blank->label = "blank";
+        blank->duration = end;
+        g_clips.push_back(std::move(blank));
+    }
+}
+
+// Ctrl+Shift+C: put the picked shots on the Windows clipboard as a file, so anything
+// that takes a dropped file takes a paste from here. A single untouched still goes
+// over as its own source file; everything else is rendered to a temp film first and
+// the export progress bar runs until it lands.
+static void CopyToOSClipboard() {
+    if (g_export.active) {
+        if (g_export.toClipboard) { CancelClipboardRender(); return; }
+        g_projectStatus = "a render is already running";
+        return;
+    }
+
+    std::vector<int> uids;
+    for (auto& c : g_clips) if (SelHas(c->uid)) uids.push_back(c->uid);
+    for (auto& t : g_over) for (auto& c : t->clips) if (SelHas(c->uid)) uids.push_back(c->uid);
+    for (auto& t : g_atracks) for (auto& b : t->blocks) if (SelHas(b->uid)) uids.push_back(b->uid);
+    if (uids.empty()) {                            // nothing multi-picked: the primary
+        if (g_selTrack == -2) {
+            if (g_selAT >= 0 && g_selAT < (int)g_atracks.size() &&
+                g_sel >= 0 && g_sel < (int)g_atracks[g_selAT]->blocks.size())
+                uids.push_back(g_atracks[g_selAT]->blocks[g_sel]->uid);
+        } else if (Clip* c = SelectedClip()) uids.push_back(c->uid);
+    }
+    if (uids.empty()) { g_projectStatus = "pick the shots you want to copy first"; return; }
+
+    if (uids.size() == 1) {                        // a plain still needs no render at all
+        Clip* only = nullptr;
+        for (auto& c : g_clips) if (c->uid == uids[0]) only = c.get();
+        for (auto& t : g_over) for (auto& c : t->clips) if (c->uid == uids[0]) only = c.get();
+        if (only && only->kind == Clip::Image && !only->path.empty() &&
+            !only->grade.On() && !only->ovlOn && !only->dxOn) {
+            g_export.failed = !SetClipboardFile(only->path);
+            g_export.message = g_export.failed ? "The clipboard would not take that file."
+                                               : "Copied " + only->label + " to the clipboard";
+            return;
+        }
+    }
+
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    wchar_t name[80];
+    swprintf(name, 80, L"slidecut_clip_%u.mp4", (unsigned)GetTickCount());
+    std::wstring out = std::wstring(tmp) + name;
+
+    std::string snap = ProjectToText();
+    g_undoBusy = true;
+    TrimToSelection(uids);
+    bool empty = g_clips.empty();
+    if (!empty) {
+        // A copy is a hand-off, not a master: h264 at a sane CRF encodes in a fraction
+        // of the time an x265 delivery takes, and every app that eats a pasted file
+        // eats h264. The delivery settings come straight back from the snapshot.
+        // A copy is a hand-off, not a master: h264 at a sane CRF encodes in a fraction
+        // of the time an x265 delivery takes, every app that eats a pasted file eats
+        // h264, and the projector shader pass is a whole second render on top.
+        int oc = g_vcodec, os = g_speed, orm = g_rateMode, ocrf = g_crf, oct = g_container;
+        bool op = g_projOn;
+        g_projOn = false;                          // the shader pass is a whole second render
+        g_vcodec = VC_X264;
+        g_speed = 4;                               // "fast"
+        g_rateMode = RM_CRF;
+        g_crf = 20;
+        g_container = CT_MP4;
+        ExportFlattened(out);                      // spawns before it returns
+        g_vcodec = oc; g_speed = os; g_rateMode = orm; g_crf = ocrf; g_container = oct;
+        g_projOn = op;
+    }
+    LoadProjectFromText(snap, true);               // sync, for the same reason
+    g_undoBusy = false;
+
+    if (empty) { g_projectStatus = "nothing in that pick to render"; return; }
+    if (g_export.active) {
+        g_export.toClipboard = true;
+        g_export.message.clear();
+        g_clipTemps.push_back(out);
+    }
 }
 
 // Paste lands at the playhead: base clips go in at the cut under it, layer clips
@@ -8811,7 +9371,8 @@ static void DrawApp() {
             // Stage 2 has no progress feed, so run the bar as an indeterminate sweep.
             float p = g_export.progress < 0 ? -1.0f * (float)ImGui::GetTime() : g_export.progress;
             ImGui::ProgressBar(p, ImVec2(-1, 6),
-                               g_export.stage == 2 ? "projector shader pass" : "");
+                               g_export.stage == 2 ? "projector shader pass"
+                               : g_export.toClipboard ? "rendering for the clipboard" : "");
         } else if (!g_export.message.empty()) {
             ImGui::TextColored(g_export.failed ? ImVec4(0.95f, 0.42f, 0.35f, 1)
                                                : ImVec4(0.85f, 0.85f, 0.82f, 1),
@@ -8931,7 +9492,9 @@ static void DrawApp() {
     if (!kio.WantTextInput) {
         if (chord && ImGui::IsKeyPressed(ImGuiKey_Z, false)) UndoStep(kio.KeyShift);
         if (chord && ImGui::IsKeyPressed(ImGuiKey_Y, false)) UndoStep(true);
-        if (chord && ImGui::IsKeyPressed(ImGuiKey_C, false)) CopySelection();
+        if (chord && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+            if (kio.KeyShift) CopyToOSClipboard(); else CopySelection();
+        }
         if (chord && ImGui::IsKeyPressed(ImGuiKey_V, false)) PasteClipboard();
         if (chord && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
             g_selUids.clear();              // everything on every picture track
@@ -9293,6 +9856,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     }
 
     if (!crashLoop) Autosave(true);        // last word before the window goes away
+    SweepClipboardTemps();                 // the clipboard's temp films die with us
     StartupMarkClear();
     g_playing.store(false);
     if (g_audioReady) ma_device_uninit(&g_audioDevice);

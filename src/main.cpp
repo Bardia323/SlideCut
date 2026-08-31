@@ -27,6 +27,8 @@
 #include <future>
 #include <map>
 #include <mutex>
+#include <deque>
+#include <condition_variable>
 #include <memory>
 #include <string>
 #include <sstream>
@@ -158,6 +160,8 @@ struct VideoSource {
     std::atomic<bool> ready{ false };      // proxy extraction finished
     std::atomic<int>  framesOnDisk{ 0 };   // grows while extracting
     std::map<int, ID3D11ShaderResourceView*> cache;   // frame index -> texture
+    std::atomic<int> cacheGen{ 0 };        // bumped when the cache is dropped
+    int     lastIdx = 0;                   // last frame asked for, drawing thread only
     size_t  cacheBytes = 0;
     size_t  frameBytes = 0;                // uploaded size of one proxy frame
     std::atomic<bool> building{ false };
@@ -1244,10 +1248,7 @@ static int  PreviewH()    { return g_preview == PV_FAST ? 360 : g_preview == PV_
 static int  PreviewFps()  { return g_preview == PV_FAST ? 12  : g_preview == PV_GOOD ? 24  : 30; }
 static int  PreviewJpegQ(){ return g_preview == PV_FAST ? 6 : 3; }   // ffmpeg -q:v, lower = better
 
-static const size_t PROXY_CACHE_BYTES = 320u * 1024 * 1024;   // GPU budget per source
-// ...and a ceiling on all of them together: ten open sources each holding their
-// own 320 MB is video memory the card does not have.
-static const size_t PROXY_CACHE_TOTAL = 768u * 1024 * 1024;
+static const size_t PROXY_CACHE_BYTES = 1024u * 1024 * 1024;  // GPU budget per source
 
 // Project timebase. Auto-adopts the first video's rate so 60fps footage stays 60fps.
 static int  g_fps = 30;
@@ -1458,30 +1459,18 @@ static std::shared_ptr<VideoSource> GetVideoSource(const std::wstring& path) {
     return vs;
 }
 
-// Frame nearest to t seconds into the source; nullptr while it is not on disk yet.
-static ID3D11ShaderResourceView* ProxyFrame(VideoSource& vs, double t) {
-    if (t < 0) t = 0;
-    int have = vs.framesOnDisk.load();
-    // Variable-rate sources and wrong duration metadata make ffmpeg emit a frame
-    // count that is not duration * fps, so once the ladder is complete the real
-    // count is what maps time to a frame. Using the nominal rate instead is what
-    // made the preview drift away from the footage.
-    double rate = PreviewFps();
-    if (vs.ready.load() && have > 1 && vs.duration > 0.05) rate = (have - 1) / vs.duration;
-    int idx = (int)(t * rate + 0.5) + 1;                 // ffmpeg numbers from 1
-    if (idx < 1) idx = 1;
-    if (have > 0 && idx > have) idx = have;
-    auto it = vs.cache.find(idx);
-    if (it != vs.cache.end()) return it->second;
-
+// Read one proxy jpeg and hand back a texture. Runs on the drawing thread for the
+// frame that is needed now, and on the prefetch thread for the ones about to be.
+// D3D11 resource creation is free-threaded, so both are allowed to do this.
+static ID3D11ShaderResourceView* LoadProxyTexture(VideoSource& vs, int idx,
+                                                  int* outW, int* outH) {
     wchar_t name[32];
     swprintf(name, 32, L"%06d.jpg", idx);
     FILE* f = _wfopen((vs.proxyDir + name).c_str(), L"rb");
     if (!f) return nullptr;
-    // Whole file in one read, then decode from memory: during playback this runs
-    // once a frame on the drawing thread, and stdio's per-call locking is a real
-    // slice of that budget.
-    static std::vector<unsigned char> jpg;
+    // Whole file in one read, then decode from memory: per-call stdio locking is a
+    // real slice of the budget when this runs once a frame.
+    static thread_local std::vector<unsigned char> jpg;
     fseek(f, 0, SEEK_END);
     long jlen = ftell(f);
     unsigned char* px = nullptr;
@@ -1497,24 +1486,18 @@ static ID3D11ShaderResourceView* ProxyFrame(VideoSource& vs, double t) {
     if (!px) return nullptr;
     ID3D11ShaderResourceView* tex = CreateTextureRGBA(px, w, h);
     stbi_image_free(px);
+    *outW = w; *outH = h;
+    return tex;
+}
+
+// Put a decoded frame in the cache, making room around idx first. Drawing thread.
+static void ProxyInsert(VideoSource& vs, int idx, ID3D11ShaderResourceView* tex,
+                        int w, int h) {
+    if (vs.cache.count(idx)) { RetireTexture(tex); return; }
     if (vs.aspect <= 0 || vs.w == 0) vs.aspect = (float)w / (float)h;
     vs.frameBytes = (size_t)w * h * 4;
-
-    // Share the ceiling out between the sources that are actually holding frames,
-    // so opening a tenth video tightens everyone's cache instead of asking the card
-    // for ten times the memory.
-    size_t budget = PROXY_CACHE_BYTES;
-    {
-        size_t live = 0;
-        for (auto& v : g_videoSources) if (v->cacheBytes > 0 || v.get() == &vs) live++;
-        if (live > 1) {
-            size_t share = PROXY_CACHE_TOTAL / live;
-            if (share < budget) budget = share;
-            if (budget < 48u * 1024 * 1024) budget = 48u * 1024 * 1024;
-        }
-    }
-    if (vs.cacheBytes + vs.frameBytes > budget) {              // drop frames far from here
-        for (int span = 240; span >= 15 && vs.cacheBytes + vs.frameBytes > budget;
+    if (vs.cacheBytes + vs.frameBytes > PROXY_CACHE_BYTES) {   // drop frames far from here
+        for (int span = 240; span >= 15 && vs.cacheBytes + vs.frameBytes > PROXY_CACHE_BYTES;
              span /= 2) {
             for (auto i = vs.cache.begin(); i != vs.cache.end(); ) {
                 if (abs(i->first - idx) > span) {
@@ -1527,13 +1510,125 @@ static ID3D11ShaderResourceView* ProxyFrame(VideoSource& vs, double t) {
     }
     vs.cache[idx] = tex;
     vs.cacheBytes += vs.frameBytes;
+}
+
+// ---- prefetch: the frames playback is about to want, decoded off the drawing
+// thread. Without it every played frame pays for a jpeg decode before it draws.
+struct ProxyReq  { std::shared_ptr<VideoSource> vs; int idx; int gen; };
+struct ProxyDone { std::shared_ptr<VideoSource> vs; int idx; int gen;
+                   ID3D11ShaderResourceView* tex; int w, h; };
+static std::mutex              g_pfMx;
+static std::condition_variable g_pfCv;
+static std::deque<ProxyReq>    g_pfQueue;     // guarded by g_pfMx
+static std::vector<ProxyDone>  g_pfDone;      // guarded by g_pfMx
+static std::atomic<bool>       g_pfStop{ false };
+static std::thread             g_pfThread;
+static const int PREFETCH_AHEAD = 12;         // about half a second of playback
+
+static void ProxyPrefetchThread() {
+    for (;;) {
+        ProxyReq r;
+        {
+            std::unique_lock<std::mutex> lk(g_pfMx);
+            g_pfCv.wait(lk, [] { return g_pfStop.load() || !g_pfQueue.empty(); });
+            if (g_pfStop.load()) return;
+            if (g_pfDone.size() > 64) { g_pfQueue.clear(); continue; }  // drawing thread is behind
+            r = g_pfQueue.front();
+            g_pfQueue.pop_front();
+        }
+        if (r.vs->cacheGen.load() != r.gen) continue;
+        int w = 0, h = 0;
+        ID3D11ShaderResourceView* tex = LoadProxyTexture(*r.vs, r.idx, &w, &h);
+        if (!tex) continue;
+        std::lock_guard<std::mutex> lk(g_pfMx);
+        g_pfDone.push_back({ r.vs, r.idx, r.gen, tex, w, h });
+    }
+}
+
+static void StartProxyPrefetch() {
+    if (!g_pfThread.joinable()) g_pfThread = std::thread(ProxyPrefetchThread);
+}
+
+static void StopProxyPrefetch() {
+    if (!g_pfThread.joinable()) return;
+    g_pfStop.store(true);
+    g_pfCv.notify_all();
+    g_pfThread.join();
+    std::lock_guard<std::mutex> lk(g_pfMx);
+    for (auto& d : g_pfDone) if (d.tex) d.tex->Release();
+    g_pfDone.clear();
+    g_pfQueue.clear();
+}
+
+// Drawing thread: take whatever the prefetch thread finished since the last frame.
+static void PumpProxyPrefetch() {
+    std::vector<ProxyDone> done;
+    {
+        std::lock_guard<std::mutex> lk(g_pfMx);
+        if (g_pfDone.empty()) return;
+        done.swap(g_pfDone);
+    }
+    for (auto& d : done) {
+        if (d.vs->cacheGen.load() != d.gen) { d.tex->Release(); continue; }
+        ProxyInsert(*d.vs, d.idx, d.tex, d.w, d.h);
+    }
+}
+
+// Ask for the frames after idx, in the direction the playhead is travelling.
+static void RequestPrefetch(const std::shared_ptr<VideoSource>& vsp, int idx, int dir) {
+    VideoSource& vs = *vsp;
+    int have = vs.framesOnDisk.load();
+    int gen = vs.cacheGen.load();
+    std::lock_guard<std::mutex> lk(g_pfMx);
+    if (g_pfQueue.size() > 128) return;
+    for (int n = 1; n <= PREFETCH_AHEAD; n++) {
+        int want = idx + dir * n;
+        if (want < 1 || (have > 0 && want > have)) break;
+        if (vs.cache.count(want)) continue;
+        bool queued = false;
+        for (auto& q : g_pfQueue) if (q.vs.get() == &vs && q.idx == want) { queued = true; break; }
+        if (queued) continue;
+        g_pfQueue.push_back({ vsp, want, gen });
+    }
+    g_pfCv.notify_one();
+}
+
+// Frame nearest to t seconds into the source; nullptr while it is not on disk yet.
+static ID3D11ShaderResourceView* ProxyFrame(VideoSource& vs, double t) {
+    if (t < 0) t = 0;
+    int have = vs.framesOnDisk.load();
+    // Variable-rate sources and wrong duration metadata make ffmpeg emit a frame
+    // count that is not duration * fps, so once the ladder is complete the real
+    // count is what maps time to a frame. Using the nominal rate instead is what
+    // made the preview drift away from the footage.
+    double rate = PreviewFps();
+    if (vs.ready.load() && have > 1 && vs.duration > 0.05) rate = (have - 1) / vs.duration;
+    int idx = (int)(t * rate + 0.5) + 1;                 // ffmpeg numbers from 1
+    if (idx < 1) idx = 1;
+    if (have > 0 && idx > have) idx = have;
+    // Which way the playhead is travelling through this source, so a reversed shot
+    // reads ahead backwards.
+    int dir = idx >= vs.lastIdx ? 1 : -1;
+    vs.lastIdx = idx;
+    for (auto& v : g_videoSources)
+        if (v.get() == &vs) { RequestPrefetch(v, idx, dir); break; }
+
+    auto it = vs.cache.find(idx);
+    if (it != vs.cache.end()) return it->second;
+
+    int w = 0, h = 0;
+    ID3D11ShaderResourceView* tex = LoadProxyTexture(vs, idx, &w, &h);
+    if (!tex) return nullptr;
+    ProxyInsert(vs, idx, tex, w, h);
     return tex;
 }
 
 static void ReleaseProxyCache(VideoSource& vs) {
+    vs.cacheGen.fetch_add(1);              // frames in flight for the old cache are void
     for (auto& kv : vs.cache) RetireTexture(kv.second);
     vs.cache.clear();
     vs.cacheBytes = 0;
+    vs.lastIdx = 0;
 }
 
 static ImFont* g_titleFont = nullptr;      // Special Elite, loaded at TITLE_FONT_PX
@@ -9872,6 +9967,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     ImGui_ImplWin32_Init(hWnd);
     ImGui_ImplDX11_Init(g_d3dDevice, g_d3dContext);
     InitAudio();
+    StartProxyPrefetch();
 
     bool crashLoop = StartupMarkExists();   // the last run died before its first frame
     {   // pick the session back up where it stopped, crash or clean exit alike
@@ -9900,6 +9996,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         if (done) break;
 
         PumpPendingLoads();
+        PumpProxyPrefetch();               // frames the prefetch thread finished
         PumpSceneSplit();
         Autosave();
         PumpExport();
@@ -9926,6 +10023,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     SweepClipboardTemps();                 // the clipboard's temp films die with us
     StartupMarkClear();
     g_playing.store(false);
+    StopProxyPrefetch();                   // no decoding into a device about to die
     if (g_audioReady) ma_device_uninit(&g_audioDevice);
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

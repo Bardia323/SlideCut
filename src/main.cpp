@@ -162,9 +162,8 @@ struct VideoSource {
     size_t  frameBytes = 0;                // uploaded size of one proxy frame
     std::atomic<bool> building{ false };
     float   aspect = 1.0f;
-    // The clip's own audio, reduced to min/max pairs for the timeline strip. The
-    // pairs live in the decoded Song itself - a second copy of them is megabytes
-    // per hour of footage for nothing.
+    // The clip's own audio, reduced to min/max pairs for the timeline strip.
+    std::vector<float> apeaks;             // min,max per bucket
     std::atomic<bool>  apeaksReady{ false };
     double  apeakRate = 200.0;             // buckets per second
     std::shared_ptr<Song> audio;           // full audio for playback
@@ -955,27 +954,13 @@ static void AudioCallback(ma_device*, void* out, const void*, ma_uint32 frames) 
             long long hi = llround(s.trimEnd * SAMPLE_RATE);
             long long total = (long long)(s.pcm.size() / 2);
             if (hi > total) hi = total;
-            if (lo < 0) lo = 0;
-            // Which output samples land inside the block is a range, not a
-            // per-sample question: solve it once and the inner loop is a
-            // straight mix with no branch in it.
-            long long i0 = -start_base, i1 = hi - lo - start_base;
-            if (i0 < 0) i0 = 0;
-            if (i1 > (long long)frames) i1 = (long long)frames;
-            if (i1 <= i0) continue;
-            const float* pcm = s.pcm.data();
-            if (s.reversed) {
-                long long base = hi - 1 - start_base;
-                for (long long i = i0; i < i1; i++) {
-                    const float* q = pcm + (base - i) * 2;
-                    dst[i * 2 + 0] += q[0] * gain;
-                    dst[i * 2 + 1] += q[1] * gain;
-                }
-            } else {
-                const float* q = pcm + (lo + start_base + i0) * 2;
-                for (long long i = i0; i < i1; i++, q += 2) {
-                    dst[i * 2 + 0] += q[0] * gain;
-                    dst[i * 2 + 1] += q[1] * gain;
+            for (ma_uint32 i = 0; i < frames; i++) {
+                long long idx = s.reversed 
+                    ? hi - 1 - (start_base + i)
+                    : lo + (start_base + i);
+                if (idx >= lo && idx < hi) {
+                    dst[i * 2 + 0] += s.pcm[idx * 2 + 0] * gain;
+                    dst[i * 2 + 1] += s.pcm[idx * 2 + 1] * gain;
                 }
             }
         }
@@ -993,24 +978,13 @@ static void AudioCallback(ma_device*, void* out, const void*, ma_uint32 frames) 
         long long hi = llround((c.trimIn + c.duration) * SAMPLE_RATE);
         long long total = (long long)(s.pcm.size() / 2);
         if (hi > total) hi = total;
-        if (lo < 0) lo = 0;
-        long long i0 = -start_base, i1 = hi - lo - start_base;
-        if (i0 < 0) i0 = 0;
-        if (i1 > (long long)frames) i1 = (long long)frames;
-        if (i1 <= i0) continue;
-        const float* pcm = s.pcm.data();
-        if (c.reversed) {
-            long long base = hi - 1 - start_base;
-            for (long long i = i0; i < i1; i++) {
-                const float* q = pcm + (base - i) * 2;
-                o[i * 2 + 0] += q[0] * gain;
-                o[i * 2 + 1] += q[1] * gain;
-            }
-        } else {
-            const float* q = pcm + (lo + start_base + i0) * 2;
-            for (long long i = i0; i < i1; i++, q += 2) {
-                o[i * 2 + 0] += q[0] * gain;
-                o[i * 2 + 1] += q[1] * gain;
+        for (ma_uint32 i = 0; i < frames; i++) {
+            long long idx = c.reversed 
+                ? hi - 1 - (start_base + i)
+                : lo + (start_base + i);
+            if (idx >= lo && idx < hi) {
+                o[i * 2 + 0] += s.pcm[idx * 2 + 0] * gain;
+                o[i * 2 + 1] += s.pcm[idx * 2 + 1] * gain;
             }
         }
     }
@@ -1064,8 +1038,7 @@ static std::unique_ptr<Song> DecodeSongFileUncached(const std::wstring& path) {
 
     auto sp = std::make_unique<Song>();
     Song& s = *sp;
-    pcm.shrink_to_fit();                   // block reads overshoot; an hour of stereo
-    s.pcm = std::move(pcm);                // f32 wastes hundreds of MB in slack
+    s.pcm = std::move(pcm);
     s.duration = (double)(s.pcm.size() / 2) / SAMPLE_RATE;
     size_t nFrames = s.pcm.size() / 2;
     size_t nPeaks = nFrames / s.framesPerPeak + 1;
@@ -1245,9 +1218,6 @@ static int  PreviewFps()  { return g_preview == PV_FAST ? 12  : g_preview == PV_
 static int  PreviewJpegQ(){ return g_preview == PV_FAST ? 6 : 3; }   // ffmpeg -q:v, lower = better
 
 static const size_t PROXY_CACHE_BYTES = 320u * 1024 * 1024;   // GPU budget per source
-// ...and a ceiling on all of them together: ten open sources each holding their
-// own 320 MB is video memory the card does not have.
-static const size_t PROXY_CACHE_TOTAL = 768u * 1024 * 1024;
 
 // Project timebase. Auto-adopts the first video's rate so 60fps footage stays 60fps.
 static int  g_fps = 30;
@@ -1336,7 +1306,8 @@ static void BuildVideoPeaks(std::shared_ptr<VideoSource> vs) {
     vs->audio = std::move(DecodeSongFileUncached(wav));
     if (vs->audio) {
         vs->apeakRate = 48000.0 / vs->audio->framesPerPeak;
-        vs->apeaksReady.store(true);       // publishes ->audio to the drawing thread
+        vs->apeaks = vs->audio->peaks;
+        vs->apeaksReady.store(true);
     }
 }
 
@@ -1478,43 +1449,17 @@ static ID3D11ShaderResourceView* ProxyFrame(VideoSource& vs, double t) {
     swprintf(name, 32, L"%06d.jpg", idx);
     FILE* f = _wfopen((vs.proxyDir + name).c_str(), L"rb");
     if (!f) return nullptr;
-    // Whole file in one read, then decode from memory: during playback this runs
-    // once a frame on the drawing thread, and stdio's per-call locking is a real
-    // slice of that budget.
-    static std::vector<unsigned char> jpg;
-    fseek(f, 0, SEEK_END);
-    long jlen = ftell(f);
-    unsigned char* px = nullptr;
-    int w = 0, h = 0, comp = 0;
-    if (jlen > 0) {
-        rewind(f);
-        jpg.resize((size_t)jlen);
-        size_t got = fread(jpg.data(), 1, (size_t)jlen, f);
-        fclose(f);
-        if (got == (size_t)jlen)
-            px = stbi_load_from_memory(jpg.data(), (int)jlen, &w, &h, &comp, 4);
-    } else fclose(f);
+    int w, h, comp;
+    unsigned char* px = stbi_load_from_file(f, &w, &h, &comp, 4);
+    fclose(f);
     if (!px) return nullptr;
     ID3D11ShaderResourceView* tex = CreateTextureRGBA(px, w, h);
     stbi_image_free(px);
     if (vs.aspect <= 0 || vs.w == 0) vs.aspect = (float)w / (float)h;
     vs.frameBytes = (size_t)w * h * 4;
 
-    // Share the ceiling out between the sources that are actually holding frames,
-    // so opening a tenth video tightens everyone's cache instead of asking the card
-    // for ten times the memory.
-    size_t budget = PROXY_CACHE_BYTES;
-    {
-        size_t live = 0;
-        for (auto& v : g_videoSources) if (v->cacheBytes > 0 || v.get() == &vs) live++;
-        if (live > 1) {
-            size_t share = PROXY_CACHE_TOTAL / live;
-            if (share < budget) budget = share;
-            if (budget < 48u * 1024 * 1024) budget = 48u * 1024 * 1024;
-        }
-    }
-    if (vs.cacheBytes + vs.frameBytes > budget) {              // drop frames far from here
-        for (int span = 240; span >= 15 && vs.cacheBytes + vs.frameBytes > budget;
+    if (vs.cacheBytes + vs.frameBytes > PROXY_CACHE_BYTES) {   // drop frames far from here
+        for (int span = 240; span >= 15 && vs.cacheBytes + vs.frameBytes > PROXY_CACHE_BYTES;
              span /= 2) {
             for (auto i = vs.cache.begin(); i != vs.cache.end(); ) {
                 if (abs(i->first - idx) > span) {
@@ -3848,12 +3793,8 @@ static bool StartProjectorPass() {
 
 static void PumpExport() {
     if (!g_export.active) return;
-    // Progress: last out_time_us= line in the progress file. Reopening and reading
-    // it every frame fights ffmpeg for the same file for a bar that only needs to
-    // move a few times a second, so the read is on its own clock.
-    static ULONGLONG lastProgRead = 0;
-    ULONGLONG nowMs = GetTickCount64();
-    HANDLE f = (nowMs - lastProgRead < 100) ? INVALID_HANDLE_VALUE : CreateFileW(g_export.progressFile.c_str(), GENERIC_READ,
+    // Progress: last out_time_us= line in the progress file.
+    HANDLE f = CreateFileW(g_export.progressFile.c_str(), GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                            OPEN_EXISTING, 0, nullptr);
     if (f != INVALID_HANDLE_VALUE) {
@@ -3872,7 +3813,6 @@ static void PumpExport() {
             }
         }
         CloseHandle(f);
-        lastProgRead = nowMs;
     }
     if (WaitForSingleObject(g_export.process, 0) == WAIT_OBJECT_0) {
         DWORD code = 1;
@@ -4659,20 +4599,17 @@ static void DrawTimeline() {
     auto drawClipWave = [&](const Clip& c, float x0, float x1, float y0, float y1,
                             double localStart) {
         if (c.kind != Clip::Video || !c.useAudio || !c.vid) return;
-        if (!c.vid->apeaksReady.load() || !c.vid->audio) return;
-        const std::vector<float>& pk = c.vid->audio->peaks;
+        if (!c.vid->apeaksReady.load()) return;
+        const std::vector<float>& pk = c.vid->apeaks;
         size_t n = pk.size() / 2;
         if (!n || x1 - x0 < 6) return;
         float h = (y1 - y0) * 0.30f;
         float base = y1 - 1;
-        const float* pkp = pk.data();
-        const double rate = c.vid->apeakRate;
         for (float x = x0; x < x1; x += 1.0f) {
             double tIn = localStart + (XToSec(x) - XToSec(x0));
-            size_t i = (size_t)(tIn * rate);
+            size_t i = (size_t)(tIn * c.vid->apeakRate);
             if (i >= n) break;
-            float amp = pkp[i * 2 + 1] - pkp[i * 2];     // peak to peak, 0..2
-            if (amp <= 0.0f) continue;                   // silence: nothing to draw
+            float amp = pk[i * 2 + 1] - pk[i * 2];       // peak to peak, 0..2
             if (amp > 2.0f) amp = 2.0f;
             dl->AddLine(ImVec2(x, base), ImVec2(x, base - amp * 0.5f * h),
                         IM_COL32(255, 255, 255, 90));
@@ -4992,17 +4929,13 @@ static void DrawTimeline() {
             float px0 = ax0 > trackX ? ax0 : trackX;
             float px1 = ax1 < origin.x + avail.x ? ax1 : origin.x + avail.x;
             size_t nPeaks = s.peaks.size() / 2;
-            const float* pk = s.peaks.data();
-            const double peakRate = (double)SAMPLE_RATE / s.framesPerPeak;
-            const ImU32 wcol = tr.mute ? IM_COL32(105, 105, 105, 160)
-                                       : IM_COL32(205, 205, 205, 210);
             for (float x = px0; x < px1; x += 1.0f) {
                 double tIn = XToSec(x) - s.offset + s.trimStart;
-                size_t p = (size_t)(tIn * peakRate);
+                size_t p = (size_t)(tIn * SAMPLE_RATE / s.framesPerPeak);
                 if (p >= nPeaks) break;
-                float lo = pk[p * 2], hi = pk[p * 2 + 1];
-                if (hi <= lo) continue;                  // silence: nothing to draw
-                dl->AddLine(ImVec2(x, cy - hi * amp), ImVec2(x, cy - lo * amp), wcol);
+                float lo = s.peaks[p * 2], hi = s.peaks[p * 2 + 1];
+                dl->AddLine(ImVec2(x, cy - hi * amp), ImVec2(x, cy - lo * amp),
+                            tr.mute ? IM_COL32(105, 105, 105, 160) : IM_COL32(205, 205, 205, 210));
             }
             dl->AddRect(ImVec2(ax0 < trackX ? trackX : ax0, r.y0 + 2), ImVec2(ax1, r.y1 - 2),
                         selected ? IM_COL32(255, 255, 255, 255) : IM_COL32(255, 255, 255, 40),

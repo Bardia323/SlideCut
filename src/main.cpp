@@ -556,7 +556,9 @@ struct HcPart {
 static std::vector<HcPart> g_hcParts;
 static bool        g_hcLive = false;       // a preview is sitting on the timeline
 static std::string g_hcSnap;               // the project text from before it
-static float       g_hcSlice = 0.25f;      // seconds per slice
+static float       g_hcSlice = 0.25f;      // seconds per slice, when beating in time
+static bool        g_hcByFrames = false;   // beat in frames of the export rate instead
+static int         g_hcFrames = 4;         // frames per slice, when beating in frames
 static int         g_hcFirst = 0;          // which participant opens the run
 static double      g_hcA = 0.0, g_hcB = 0.0;   // the shared stretch
 static int         g_hcSlices = 0;
@@ -3812,11 +3814,18 @@ static void HcRemoveRanges(std::vector<std::unique_ptr<Clip>>& v, int i,
 
 // Chop the shared stretch into slices and delete, on every overlay participant,
 // the slices that are not its turn.
+// The beat, in seconds. Counting in frames is the same beat measured against the
+// export rate, so changing the project fps re-times a frame-counted hypercut.
+static double HcSlice() {
+    double s = g_hcByFrames ? (g_hcFrames < 1 ? 1 : g_hcFrames) / (double)(g_fps < 1 ? 1 : g_fps)
+                            : (double)g_hcSlice;
+    return s < MinClipDur() ? MinClipDur() : s;
+}
+
 static void HcChop() {
     int n = (int)g_hcParts.size();
     if (n < 2) return;
-    double slice = (double)g_hcSlice;
-    if (slice < MinClipDur()) slice = MinClipDur();
+    double slice = HcSlice();
     int slots = (int)ceil((g_hcB - g_hcA) / slice - 1e-9);
     if (slots < 2) slots = 2;
     if (slots > HC_MAX_SLICES) slots = HC_MAX_SLICES;
@@ -3885,12 +3894,28 @@ static void HyperCutPanel() {
     Prop("hypercut");
     ImGui::TextDisabled(g_hcLive ? "previewing - commit or drop it"
                                  : "alternate two overlapping shots on two tracks");
+    Prop("beat in");
+    if (ImGui::RadioButton("seconds", !g_hcByFrames)) {
+        if (g_hcByFrames) { g_hcByFrames = false; if (g_hcLive) g_hcReq = 2; }
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("frames", g_hcByFrames)) {
+        if (!g_hcByFrames) { g_hcByFrames = true; if (g_hcLive) g_hcReq = 2; }
+    }
     Prop("beat");
     float half = ColW(2);
     ImGui::SetNextItemWidth(half);
-    ImGui::DragFloat("##hcbeat", &g_hcSlice, 0.005f, (float)MinClipDur(), 5.0f, "%.3f s",
-                     ImGuiSliderFlags_AlwaysClamp);
-    bool beatDone = ImGui::IsItemDeactivatedAfterEdit();
+    bool beatDone = false;
+    if (g_hcByFrames) {
+        char fmt[48];
+        snprintf(fmt, sizeof(fmt), "%%d fr  (%.3f s)", HcSlice());
+        ImGui::DragInt("##hcbeatf", &g_hcFrames, 0.1f, 1, 240, fmt, ImGuiSliderFlags_AlwaysClamp);
+        beatDone = ImGui::IsItemDeactivatedAfterEdit();
+    } else {
+        ImGui::DragFloat("##hcbeat", &g_hcSlice, 0.005f, (float)MinClipDur(), 5.0f, "%.3f s",
+                         ImGuiSliderFlags_AlwaysClamp);
+        beatDone = ImGui::IsItemDeactivatedAfterEdit();
+    }
     ImGui::SameLine();
     if (!g_hcLive) {
         if (ImGui::Button("preview hypercut", ImVec2(-1, 0))) g_hcReq = 1;
@@ -8221,7 +8246,10 @@ static void HyperCutTick() {
         HcChop();
     } else if (req == 3 && g_hcLive) {
         char buf[96];
-        snprintf(buf, sizeof(buf), "hypercut kept - %.3f s beat, %d slices", g_hcSlice, g_hcSlices);
+        if (g_hcByFrames)
+            snprintf(buf, sizeof(buf), "hypercut kept - %d frame beat, %d slices", g_hcFrames, g_hcSlices);
+        else
+            snprintf(buf, sizeof(buf), "hypercut kept - %.3f s beat, %d slices", g_hcSlice, g_hcSlices);
         g_intakeStatus = buf;
         g_hcLive = false;
         g_hcSnap.clear();
@@ -8239,7 +8267,7 @@ static void HyperCutTick() {
     }
     if (g_hcLive) {
         char buf[96];
-        snprintf(buf, sizeof(buf), "%d slices over %.2f s", g_hcSlices, g_hcB - g_hcA);
+        snprintf(buf, sizeof(buf), "%d slices of %.3f s over %.2f s", g_hcSlices, HcSlice(), g_hcB - g_hcA);
         g_hcMsg = buf;
     }
 }

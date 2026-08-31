@@ -612,6 +612,11 @@ def main(argv: list[str] | None = None) -> int:
     # ---- render loop ------------------------------------------------------ #
     still_buf: bytes | None = None
     written = 0
+    # One readback buffer for the whole run. fbo.read() hands back a fresh bytes
+    # object every frame - at 1080p that is 6 MB of allocation and free per frame,
+    # for pixels that go straight down the pipe.
+    out_buf = bytearray(out_w * out_h * 3)
+    out_view = memoryview(out_buf)
     try:
         while True:
             if n_frames and written >= n_frames:
@@ -643,7 +648,8 @@ def main(argv: list[str] | None = None) -> int:
             prog_gate["u_time"] = t
             vao_gate.render(moderngl.TRIANGLES)
 
-            enc.stdin.write(fbo_out.read(components=3))         # type: ignore[union-attr]
+            fbo_out.read_into(out_view, components=3)
+            enc.stdin.write(out_view)                          # type: ignore[union-attr]
             written += 1
 
             if not args.no_progress and written % 24 == 0:

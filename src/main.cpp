@@ -3812,8 +3812,6 @@ static void HcRemoveRanges(std::vector<std::unique_ptr<Clip>>& v, int i,
     }
 }
 
-// Chop the shared stretch into slices and delete, on every overlay participant,
-// the slices that are not its turn.
 // The beat, in seconds. Counting in frames is the same beat measured against the
 // export rate, so changing the project fps re-times a frame-counted hypercut.
 static double HcSlice() {
@@ -3822,13 +3820,24 @@ static double HcSlice() {
     return s < MinClipDur() ? MinClipDur() : s;
 }
 
+// Chop the shared stretch into slices and delete, on every overlay participant,
+// the slices that are not its turn. The cuts land on whole frames of the export
+// rate: the beat is rounded to a frame count and the slots are counted off the
+// first whole frame inside the stretch, so no slice ends mid-frame. The ragged
+// sub-frame ends of the stretch itself go to the slices that reach them, which
+// keeps the alternation covering every last bit of the overlap.
 static void HcChop() {
     int n = (int)g_hcParts.size();
     if (n < 2) return;
-    double slice = HcSlice();
-    int slots = (int)ceil((g_hcB - g_hcA) / slice - 1e-9);
+    const double fps = g_fps < 1 ? 1.0 : (double)g_fps;
+    long long fA = (long long)ceil (g_hcA * fps - 1e-6);   // first whole frame inside
+    long long fB = (long long)floor(g_hcB * fps + 1e-6);   // last one still inside
+    long long sf = (long long)llround(HcSlice() * fps);    // beat, in frames
+    if (sf < 1) sf = 1;
+    if (fB - fA < 2) { g_hcSlices = 0; return; }           // no room for two slices
+    long long slotsLL = (fB - fA + sf - 1) / sf;
+    int slots = slotsLL > HC_MAX_SLICES ? HC_MAX_SLICES : (int)slotsLL;
     if (slots < 2) slots = 2;
-    if (slots > HC_MAX_SLICES) slots = HC_MAX_SLICES;
     g_hcSlices = slots;
 
     for (int p = 0; p < n; p++) {
@@ -3837,8 +3846,8 @@ static void HcChop() {
         std::vector<std::pair<double, double>> rem;
         for (int k = 0; k < slots; k++) {
             if ((g_hcFirst + k) % n == p) continue;        // its own turn, leave it
-            double t0 = g_hcA + k * slice;
-            double t1 = t0 + slice;
+            double t0 = k == 0 ? g_hcA : (fA + k * sf) / fps;
+            double t1 = k == slots - 1 ? g_hcB : (fA + (k + 1) * sf) / fps;
             if (t1 > g_hcB) t1 = g_hcB;
             if (t1 - t0 < 1e-9) continue;
             if (!rem.empty() && t0 - rem.back().second < 1e-9) rem.back().second = t1;

@@ -542,6 +542,27 @@ static int SelCount() {
     return n;
 }
 
+// ---- hypercut: two or more overlapping shots on different tracks, chopped so
+// the stretch they share alternates between them on a fixed beat. Only overlay
+// shots are cut; the base picture is never touched, it simply shows through the
+// holes, so a base shot can take part without the film re-packing. The preview
+// is a real edit made against a snapshot of the project text: changing the beat
+// puts the snapshot back and chops again, so undo only ever sees the commit.
+struct HcPart {
+    int         track = -1;                // -1 base picture, else overlay index
+    int         index = 0;                 // position in that track
+    std::string label;
+};
+static std::vector<HcPart> g_hcParts;
+static bool        g_hcLive = false;       // a preview is sitting on the timeline
+static std::string g_hcSnap;               // the project text from before it
+static float       g_hcSlice = 0.25f;      // seconds per slice
+static int         g_hcFirst = 0;          // which participant opens the run
+static double      g_hcA = 0.0, g_hcB = 0.0;   // the shared stretch
+static int         g_hcSlices = 0;
+static std::string g_hcMsg;
+static int         g_hcReq = 0;            // 1 arm, 2 re-chop, 3 commit, 4 drop
+
 // A point on the aspect track. It is a point, not a span: the plate aspect it
 // names holds from its offset until the next point. Nothing before the first
 // point, which leaves the plate on the projector panel's own value.
@@ -3694,6 +3715,145 @@ static int TrimSelectionTo(double len) {
     return n;
 }
 
+// ---- hypercut
+
+static const int HC_MAX_SLICES = 2000;     // a beat of a frame over a long stretch
+
+// Where a shot sits on the timeline. The base track packs, so its span comes out
+// of the layout; an overlay shot carries its own start.
+static bool HcSpan(int track, int index, double& s, double& e) {
+    if (track < 0) {
+        if (index < 0 || index >= (int)g_clips.size()) return false;
+        std::vector<BaseSpan> lay;
+        BaseLayout(lay);
+        s = lay[index].start; e = lay[index].end;
+        return e > s;
+    }
+    if (track < 0 || track >= (int)g_over.size()) return false;
+    auto& v = g_over[track]->clips;
+    if (index < 0 || index >= (int)v.size()) return false;
+    s = v[index]->start; e = s + v[index]->duration;
+    return e > s;
+}
+
+// Read the selection as an ordered list of participants plus the stretch all of
+// them cover. One shot per track: two picks on the same track have no
+// alternation to describe.
+static bool HcGather(std::string& err) {
+    std::vector<HcPart> parts;
+    double a = -1e18, b = 1e18;
+    auto take = [&](int track, Clip& c, int index) -> bool {
+        if (!SelHas(c.uid)) return true;
+        for (auto& p : parts)
+            if (p.track == track) { err = "two shots on one track - pick one per track"; return false; }
+        if (c.skip) { err = "a muted shot has no length to alternate"; return false; }
+        if (track >= 0 && c.kind == Clip::Nest) { err = "unfold the sequence before hypercutting it"; return false; }
+        double s, e;
+        if (!HcSpan(track, index, s, e)) { err = "that shot has no length"; return false; }
+        if (s > a) a = s;
+        if (e < b) b = e;
+        HcPart p;
+        p.track = track;
+        p.index = index;
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s  (%s)", c.label.empty() ? "shot" : c.label.c_str(),
+                 track < 0 ? "picture" : g_over[track]->name.c_str());
+        p.label = buf;
+        parts.push_back(p);
+        return true;
+    };
+    for (int i = 0; i < (int)g_clips.size(); i++)
+        if (!take(-1, *g_clips[i], i)) return false;
+    for (int t = 0; t < (int)g_over.size(); t++)
+        for (int i = 0; i < (int)g_over[t]->clips.size(); i++)
+            if (!take(t, *g_over[t]->clips[i], i)) return false;
+
+    if ((int)parts.size() < 2) { err = "pick two shots on two different tracks"; return false; }
+    if (b - a < 2 * MinClipDur()) { err = "those shots do not overlap"; return false; }
+    std::sort(parts.begin(), parts.end(),
+              [](const HcPart& x, const HcPart& y) { return x.track < y.track; });
+    g_hcParts = parts;
+    g_hcA = a; g_hcB = b;
+    if (g_hcFirst < 0 || g_hcFirst >= (int)parts.size()) g_hcFirst = 0;
+    err.clear();
+    return true;
+}
+
+static void HcDrop(std::vector<std::unique_ptr<Clip>>& v, int i) {
+    if (v[i]->kind != Clip::Video) RetireTexture(v[i]->tex);
+    v.erase(v.begin() + i);
+}
+
+// Cut `rem` out of one overlay shot. The ranges are timeline seconds and sorted;
+// working backwards through them keeps the shot's own index and start fixed.
+static void HcRemoveRanges(std::vector<std::unique_ptr<Clip>>& v, int i,
+                           const std::vector<std::pair<double, double>>& rem) {
+    const double MIN = MinClipDur();
+    for (int k = (int)rem.size() - 1; k >= 0; k--) {
+        if (i < 0 || i >= (int)v.size()) return;
+        double s = v[i]->start, e = s + v[i]->duration;
+        double r0 = rem[k].first  < s ? s : rem[k].first;
+        double r1 = rem[k].second > e ? e : rem[k].second;
+        if (r1 - r0 < 1e-9) continue;
+        bool headGone = r0 - s < MIN;
+        bool tailGone = e - r1 < MIN;
+        if (headGone && tailGone) { HcDrop(v, i); return; }   // nothing of it survives
+        if (tailGone) { v[i]->duration = r0 - s; continue; }  // shorten from the back
+        if (headGone) {                                       // shorten from the front
+            SplitClipIn(v, i, r1 - s);
+            HcDrop(v, i);
+            continue;
+        }
+        SplitClipIn(v, i, r1 - s);            // i = [s,r1)  i+1 = [r1,e)
+        SplitClipIn(v, i, r0 - s);            // i = [s,r0)  i+1 = [r0,r1)
+        HcDrop(v, i + 1);
+    }
+}
+
+// Chop the shared stretch into slices and delete, on every overlay participant,
+// the slices that are not its turn.
+static void HcChop() {
+    int n = (int)g_hcParts.size();
+    if (n < 2) return;
+    double slice = (double)g_hcSlice;
+    if (slice < MinClipDur()) slice = MinClipDur();
+    int slots = (int)ceil((g_hcB - g_hcA) / slice - 1e-9);
+    if (slots < 2) slots = 2;
+    if (slots > HC_MAX_SLICES) slots = HC_MAX_SLICES;
+    g_hcSlices = slots;
+
+    for (int p = 0; p < n; p++) {
+        if (g_hcParts[p].track < 0) continue;              // the picture is never cut
+        if (g_hcParts[p].track >= (int)g_over.size()) continue;
+        std::vector<std::pair<double, double>> rem;
+        for (int k = 0; k < slots; k++) {
+            if ((g_hcFirst + k) % n == p) continue;        // its own turn, leave it
+            double t0 = g_hcA + k * slice;
+            double t1 = t0 + slice;
+            if (t1 > g_hcB) t1 = g_hcB;
+            if (t1 - t0 < 1e-9) continue;
+            if (!rem.empty() && t0 - rem.back().second < 1e-9) rem.back().second = t1;
+            else rem.push_back(std::make_pair(t0, t1));
+        }
+        HcRemoveRanges(g_over[g_hcParts[p].track]->clips, g_hcParts[p].index, rem);
+    }
+
+    // whatever came out of the chop is what you now have hold of
+    g_selUids.clear();
+    for (auto& p : g_hcParts) {
+        if (p.track < 0) {
+            if (p.index >= 0 && p.index < (int)g_clips.size()) g_selUids.push_back(g_clips[p.index]->uid);
+            continue;
+        }
+        if (p.track >= (int)g_over.size()) continue;
+        for (auto& c : g_over[p.track]->clips) {
+            double s = c->start, e = s + c->duration;
+            if (e > g_hcA + 1e-9 && s < g_hcB - 1e-9) g_selUids.push_back(c->uid);
+        }
+    }
+    SelSync();
+}
+
 // ---- property layout
 //
 // Every row in the side panel is the same shape: a label in a fixed left column,
@@ -3717,6 +3877,44 @@ static void Prop(const char* label) {
     ImGui::SetCursorPosX(x + LabelW());
     ImGui::SetNextItemWidth(-1);
 }
+
+// The hypercut block in the shot panel. It only ever sets a request: the chop
+// reloads the project, which would pull the ground out from under the panel, so
+// the work happens at the end of the frame.
+static void HyperCutPanel() {
+    Prop("hypercut");
+    ImGui::TextDisabled(g_hcLive ? "previewing - commit or drop it"
+                                 : "alternate two overlapping shots on two tracks");
+    Prop("beat");
+    float half = ColW(2);
+    ImGui::SetNextItemWidth(half);
+    ImGui::DragFloat("##hcbeat", &g_hcSlice, 0.005f, (float)MinClipDur(), 5.0f, "%.3f s",
+                     ImGuiSliderFlags_AlwaysClamp);
+    bool beatDone = ImGui::IsItemDeactivatedAfterEdit();
+    ImGui::SameLine();
+    if (!g_hcLive) {
+        if (ImGui::Button("preview hypercut", ImVec2(-1, 0))) g_hcReq = 1;
+    } else if (ImGui::Button("commit", ImVec2(-1, 0))) {
+        g_hcReq = 3;
+    }
+    if (g_hcLive) {
+        if (beatDone) g_hcReq = 2;
+        Prop("starts with");
+        std::string items;
+        for (auto& p : g_hcParts) { items += p.label; items.push_back('\0'); }
+        items.push_back('\0');
+        if (ImGui::Combo("##hcfirst", &g_hcFirst, items.c_str())) g_hcReq = 2;
+        Prop("");
+        if (ImGui::Button("flip the order", ImVec2(half, 0))) {
+            g_hcFirst = (g_hcFirst + 1) % (int)g_hcParts.size();
+            g_hcReq = 2;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("drop it", ImVec2(-1, 0))) g_hcReq = 4;
+    }
+    if (!g_hcMsg.empty()) ImGui::TextDisabled("%s", g_hcMsg.c_str());
+}
+
 
 // A row of buttons in place of a combo: every choice on screen, one click away.
 // The cells are all one width and the row fills the column, so the grid reads as
@@ -6556,6 +6754,7 @@ static void DrawClipInspector() {
         c.duration = d < MinClipDur() ? MinClipDur() : (d > mx ? mx : d);
         if (nSel > 1) TrimSelectionTo(d);             // the rest of the run follows
     }
+    if (g_hcLive && nSel <= 1) HyperCutPanel();   // a live preview keeps its controls
     if (nSel > 1) {                     // one length over the whole selection
         Prop("even length");
         static float evenLen = 2.0f;
@@ -6578,6 +6777,7 @@ static void DrawClipInspector() {
             snprintf(buf, sizeof(buf), "%d shots trimmed to %.2f s", n, c.duration);
             g_intakeStatus = buf;
         }
+        HyperCutPanel();
         ImGui::TextDisabled("shift+wheel over a shot slips the picture inside it");
     }
     if (c.kind == Clip::Video && c.vid) {
@@ -7967,7 +8167,8 @@ static std::string g_undoBase;             // the state the stack was built from
 static const size_t UNDO_MAX = 120;
 
 static void UndoCapture() {
-    if (g_undoBusy || g_projectLoading.load() || g_playing.load(std::memory_order_relaxed)) return;
+    if (g_undoBusy || g_hcLive) return;                // a preview is not a step
+    if (g_projectLoading.load() || g_playing.load(std::memory_order_relaxed)) return;
     if (g_tl.drag != TimelineState::None) return;      // mid-gesture, wait for the drop
     std::string now = ProjectToText(true);
     if (g_undoBase.empty()) { g_undoBase = now; return; }
@@ -7991,6 +8192,58 @@ static void UndoStep(bool redo) {
     g_selUids.clear();
     g_projectStatus = redo ? "redo" : "undo";
 }
+
+// ---- hypercut preview
+//
+// The chop is a real edit, so previewing one means keeping the project text and
+// putting it back before every re-chop. Undo stays out of the way until commit,
+// which leaves exactly one step between the film before and the film after.
+
+static void HcRestore() {
+    if (g_hcSnap.empty()) return;
+    g_undoBusy = true;
+    LoadProjectFromText(g_hcSnap, true);
+    g_undoBusy = false;
+}
+
+static void HyperCutTick() {
+    int req = g_hcReq;
+    g_hcReq = 0;
+    if (!req) return;
+    if (req == 1) {
+        std::string err;
+        if (!HcGather(err)) { g_hcMsg = err; g_intakeStatus = err; return; }
+        g_hcSnap = ProjectToText(true);
+        g_hcLive = true;
+        HcChop();
+    } else if (req == 2 && g_hcLive) {
+        HcRestore();
+        HcChop();
+    } else if (req == 3 && g_hcLive) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "hypercut kept - %.3f s beat, %d slices", g_hcSlice, g_hcSlices);
+        g_intakeStatus = buf;
+        g_hcLive = false;
+        g_hcSnap.clear();
+        g_hcParts.clear();
+        g_hcMsg.clear();
+        return;
+    } else if (req == 4 && g_hcLive) {
+        HcRestore();
+        g_hcLive = false;
+        g_hcSnap.clear();
+        g_hcParts.clear();
+        g_hcMsg.clear();
+        g_intakeStatus = "hypercut dropped";
+        return;
+    }
+    if (g_hcLive) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "%d slices over %.2f s", g_hcSlices, g_hcB - g_hcA);
+        g_hcMsg = buf;
+    }
+}
+
 
 // ---- clipboard: the same [clip] sections the project file uses
 static std::string g_clipboard;
@@ -8717,6 +8970,7 @@ static void DrawApp() {
     }
 
     ApplyNavRequests();                     // stepping levels rebuilds the clip lists
+    HyperCutTick();                         // arm, re-chop or settle a hypercut
     RefreshNestDurations();
     UndoCapture();                          // one snapshot per frame, once idle
 

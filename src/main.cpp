@@ -552,6 +552,10 @@ struct AspectPoint {
 };
 static std::vector<std::unique_ptr<AspectPoint>> g_aspects;
 static bool  g_aspectsVisible = true;
+// Monitor-only cut of the base track: the picture row is parked so overlay tracks
+// can be worked on without the film underneath bleeding through between their
+// clips. Preview and preview sound only — the export still holds the whole film.
+static bool  g_baseOff = false;
 static const float ASPECT_ROW_H = 22.0f;
 
 // Last frame's timeline layout, so a shell drop can tell which track it landed on.
@@ -621,6 +625,75 @@ static Song* SongByUid(int uid) {
     for (auto& t : g_atracks)
         for (auto& s : t->blocks) if (s->uid == uid) return s.get();
     return nullptr;
+}
+
+// ---- one selection, one highlight
+// g_sel / g_selTrack / g_selAT name the primary pick, the one the SHOT panel edits;
+// g_selUids is what a drag, a delete or a panel edit lands on. Anything drawn with
+// a bright border is a member of g_selUids and nothing else, so the two can never
+// name different shots. SelSync runs once a frame and reconciles them: dead uids
+// go, a primary that was moved by code alone (a fold, a drag onto another track,
+// "to picture") pulls the selection onto itself, and a selection with no live
+// primary hands the primary to its first member.
+static int SelPrimaryUid() {
+    if (g_selTrack == -1) {
+        if (g_sel >= 0 && g_sel < (int)g_clips.size()) return g_clips[g_sel]->uid;
+    } else if (g_selTrack >= 0) {
+        if (g_selTrack < (int)g_over.size()) {
+            auto& v = g_over[g_selTrack]->clips;
+            if (g_sel >= 0 && g_sel < (int)v.size()) return v[g_sel]->uid;
+        }
+    } else if (g_selTrack == -2) {
+        if (g_selAT >= 0 && g_selAT < (int)g_atracks.size()) {
+            auto& b = g_atracks[g_selAT]->blocks;
+            if (g_sel >= 0 && g_sel < (int)b.size()) return b[g_sel]->uid;
+        }
+    } else if (g_selTrack == -3) {
+        if (g_sel >= 0 && g_sel < (int)g_aspects.size()) return g_aspects[g_sel]->uid;
+    }
+    return -1;
+}
+
+// Point the primary at whatever track and index a uid currently sits at.
+static bool SelPrimaryTo(int uid) {
+    for (int i = 0; i < (int)g_clips.size(); i++)
+        if (g_clips[i]->uid == uid) { g_sel = i; g_selTrack = -1; return true; }
+    for (int t = 0; t < (int)g_over.size(); t++) {
+        auto& v = g_over[t]->clips;
+        for (int i = 0; i < (int)v.size(); i++)
+            if (v[i]->uid == uid) { g_sel = i; g_selTrack = t; return true; }
+    }
+    for (int t = 0; t < (int)g_atracks.size(); t++) {
+        auto& b = g_atracks[t]->blocks;
+        for (int i = 0; i < (int)b.size(); i++)
+            if (b[i]->uid == uid) { g_sel = i; g_selTrack = -2; g_selAT = t; return true; }
+    }
+    for (int i = 0; i < (int)g_aspects.size(); i++)
+        if (g_aspects[i]->uid == uid) { g_sel = i; g_selTrack = -3; return true; }
+    return false;
+}
+
+static void SelSync() {
+    for (size_t i = 0; i < g_selUids.size();) {
+        int u = g_selUids[i];
+        bool alive = ClipByUid(u) || SongByUid(u);
+        if (!alive)
+            for (auto& a : g_aspects) if (a->uid == u) { alive = true; break; }
+        if (alive) i++;
+        else g_selUids.erase(g_selUids.begin() + i);
+    }
+    int pu = SelPrimaryUid();
+    if (pu >= 0) {
+        if (!SelHas(pu)) {                       // primary moved on its own: it wins
+            SelSet(pu);
+            if (Clip* c = ClipByUid(pu))      SelAddGroupOf(*c);
+            else if (Song* s = SongByUid(pu)) SelAddGroupOf(*s);
+        }
+    } else if (!g_selUids.empty()) {
+        if (!SelPrimaryTo(g_selUids.front())) { g_sel = -1; g_selTrack = -1; g_selAT = -1; }
+    } else {
+        g_sel = -1; g_selTrack = -1; g_selAT = -1;
+    }
 }
 
 // ImGui asserts (font_size > 0) rather than clamping, so a pane squeezed to zero
@@ -3953,19 +4026,24 @@ static void DrawTimeline() {
                                        : "";
         bool on = r.kind == 1 ? g_over[r.idx]->visible
                 : r.kind == 2 ? !g_atracks[r.idx]->mute
+                : r.kind == 0 ? !g_baseOff
                 : r.kind != 5;
         dl->AddText(ImVec2(origin.x + 8, r.y0 + 6),
                     on ? IM_COL32(220, 220, 220, 255) : IM_COL32(110, 110, 110, 255), name);
-        if (r.kind == 1 || r.kind == 2) {   // a mute / hide toggle under the name
+        if (r.kind == 0 || r.kind == 1 || r.kind == 2) {   // a mute / hide toggle under the name
             ImVec2 b0(origin.x + 8, r.y1 - 22), b1(origin.x + 34, r.y1 - 6);
             bool overBtn = io.MousePos.x >= b0.x && io.MousePos.x <= b1.x &&
                            io.MousePos.y >= b0.y && io.MousePos.y <= b1.y && hovered;
             dl->AddRectFilled(b0, b1, on ? IM_COL32(72, 72, 72, 255) : IM_COL32(34, 34, 34, 255), 4.0f);
             dl->AddText(ImVec2(b0.x + 7, b0.y + 1), IM_COL32(235, 235, 235, 255),
                         r.kind == 1 ? (on ? "vis" : "off") : (on ? "on" : "mute"));
+            if (overBtn) ImGui::SetTooltip(r.kind == 0
+                ? "park the picture track — preview only, the export keeps it"
+                : (r.kind == 1 ? "hide this layer" : "mute this sound track"));
             if (overBtn && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                if (r.kind == 1) g_over[r.idx]->visible = !g_over[r.idx]->visible;
-                else             g_atracks[r.idx]->mute = !g_atracks[r.idx]->mute;
+                if      (r.kind == 0) g_baseOff = !g_baseOff;
+                else if (r.kind == 1) g_over[r.idx]->visible = !g_over[r.idx]->visible;
+                else                  g_atracks[r.idx]->mute = !g_atracks[r.idx]->mute;
             }
         }
     }
@@ -4054,7 +4132,7 @@ static void DrawTimeline() {
 
             if (c.kind == Clip::Video && c.vid) c.tex = ProxyFrame(*c.vid, c.trimIn);
             bool isDragged = g_tl.drag == TimelineState::Move && g_tl.dragIndex == i;
-            bool selected = (g_selTrack == -1 && g_sel == i) || SelHas(c.uid);
+            bool selected = SelHas(c.uid);
             ImU32 fill = c.kind == Clip::Text
                        ? (isDragged ? IM_COL32(34, 34, 34, 255) : IM_COL32(12, 12, 12, 255))
                        : (isDragged ? IM_COL32(78, 78, 78, 255) : IM_COL32(48, 48, 48, 255));
@@ -4215,7 +4293,7 @@ static void DrawTimeline() {
                 float x1 = x0 + w;
                 prevEnd = x1 + 2.0f;
                 if (x1 < trackX || x0 > origin.x + avail.x) continue;
-                bool selected = (g_selTrack == -1 && g_sel == t.idx) || SelHas(c.uid);
+                bool selected = SelHas(c.uid);
                 ImVec2 a(x0 + 1, muteY + 2), b(x1 - 1, muteY + muteH - 2);
                 dl->AddRectFilled(a, b, IM_COL32(30, 26, 26, 255), 4.0f);
                 for (float hx = 4; hx < (b.x - a.x) + (b.y - a.y); hx += 7.0f) {  // hatch
@@ -4263,7 +4341,7 @@ static void DrawTimeline() {
             if (x1 < trackX || x0 > origin.x + avail.x) continue;
             float vx0 = x0 < trackX ? trackX : x0;
             if (c.kind == Clip::Video && c.vid) c.tex = ProxyFrame(*c.vid, c.trimIn);
-            bool selected = (g_selTrack == r.idx && g_sel == i) || SelHas(c.uid);
+            bool selected = SelHas(c.uid);
             ImU32 fill = tr.visible ? IM_COL32(58, 58, 58, 255) : IM_COL32(32, 32, 32, 255);
             dl->AddRectFilled(ImVec2(vx0 + 1, r.y0 + 2), ImVec2(x1 - 1, r.y1 - 2), fill, 5.0f);
             if (c.tex && x1 - vx0 > 10) {
@@ -4312,7 +4390,7 @@ static void DrawTimeline() {
             double blockLen = s.trimEnd - s.trimStart;
             float ax0 = SecToX(s.offset), ax1 = SecToX(s.offset + blockLen);
             if (ax1 < trackX || ax0 > origin.x + avail.x) continue;
-            bool selected = g_selTrack == -2 && g_selAT == r.idx && g_sel == b;
+            bool selected = SelHas(s.uid);
             dl->AddRectFilled(ImVec2(ax0 < trackX ? trackX : ax0, r.y0 + 2),
                               ImVec2(ax1, r.y1 - 2),
                               tr.mute ? IM_COL32(26, 26, 26, 255) : IM_COL32(42, 42, 42, 255), 5.0f);
@@ -4356,7 +4434,7 @@ static void DrawTimeline() {
             AspectPoint& a = *g_aspects[b];
             float ax0 = SecToX(a.offset), ax1 = SecToX(AspectSpanEnd(b));
             if (ax1 < trackX || ax0 > origin.x + avail.x) continue;
-            bool selected = g_selTrack == -3 && g_sel == b;
+            bool selected = SelHas(a.uid);
             float dx0 = ax0 < trackX ? trackX : ax0;
             dl->AddRectFilled(ImVec2(dx0, r.y0 + 2), ImVec2(ax1 - 1, r.y1 - 2),
                               IM_COL32(50, 60, 70, 255), 4.0f);
@@ -5955,7 +6033,7 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
     };
 
     g_d3dContext->ClearRenderTargetView(g_projRTV[1], clear);
-    if (ci >= 0) compositeClip(*g_clips[ci], ph - clipStart, 0, 1.0f);
+    if (ci >= 0 && !g_baseOff) compositeClip(*g_clips[ci], ph - clipStart, 0, 1.0f);
     for (auto& tr : g_over) {
         if (!tr->visible) continue;
         for (auto& c : tr->clips)
@@ -6222,8 +6300,8 @@ static void DrawPreviewArea(ImVec2 size) {
 
     if (projFrame) {                        // the shader already composited the picture
         dl->AddImage((ImTextureID)projSRV, f0, f1);
-        if (ci >= 0) drawText(*g_clips[ci], g_selTrack, g_sel, -1, ci);
-    } else if (ci >= 0) {
+        if (ci >= 0 && !g_baseOff) drawText(*g_clips[ci], g_selTrack, g_sel, -1, ci);
+    } else if (ci >= 0 && !g_baseOff) {
         Clip& c = *g_clips[ci];
         drawPicture(c, ph - clipStart, 1.0f);
         drawText(c, g_selTrack, g_sel, -1, ci);
@@ -7140,6 +7218,7 @@ static void ClearProject() {
     g_over.clear();
     g_aspects.clear();
     { MixGuard lock; g_atracks.clear(); g_seqs.clear(); }
+    g_baseOff = false;                      // monitor state, never part of a project
     g_nav.assign(1, 0);
     g_seqNext = 1;
     EnsureRootSeq();
@@ -8270,6 +8349,7 @@ static void ClipToolBar(bool doAdd) {
 
 static void DrawApp() {
     PruneEmptyTracks();
+    SelSync();
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
@@ -8645,7 +8725,7 @@ static void DrawApp() {
         g_videoAudio.clear();
         double acc = 0;
         for (auto& c : g_clips) {
-            if (!c->skip && c->useAudio && c->kind == Clip::Video && c->volume > 0.0f && c->vid && c->vid->audio && c->vid->audio->loaded) {
+            if (!g_baseOff && !c->skip && c->useAudio && c->kind == Clip::Video && c->volume > 0.0f && c->vid && c->vid->audio && c->vid->audio->loaded) {
                 g_videoAudio.push_back(VideoAudioBlock{ c->vid->audio, acc, c->trimIn, c->duration, c->volume, c->reversed });
             }
             acc += c->duration;

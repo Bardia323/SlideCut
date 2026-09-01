@@ -191,6 +191,10 @@ struct Grade {
     }
 };
 
+// How a clip fills a canvas its own aspect does not match. Per clip, base or layer.
+enum { LFIT_INSIDE = 0, LFIT_FILL, LFIT_BLUR, LFIT_BLACK };
+static const char* LFIT_ITEMS = "Inside\0" "Fill\0" "Blur bed\0" "Black bed\0";
+
 struct Clip {
     int          uid = g_uidNext++;
     enum Kind { Image, Text, Video, Nest } kind = Image;
@@ -220,6 +224,13 @@ struct Clip {
     double       start = 0.0;              // timeline seconds where this clip begins
     int          lblend = 0;               // index into LAYER_MODES
     float        lopacity = 1.0f;
+    // How this clip meets a canvas its own aspect does not match - a base cut and an
+    // overlay layer both use it. "Inside" leaves the gaps clear, so on a layer the cut
+    // underneath shows through them and on a base cut the projector wall does. The
+    // other three fill the gaps: by cropping the picture, or by putting an opaque bed
+    // - blurred or black - behind it, which hides whatever is under without cropping
+    // anything. Fill is the default: it covers, and nothing peeks out at the sides.
+    int          lfit = LFIT_FILL;
 
     // ---- text overlay (any clip kind; Text cards use it for placement too)
     bool         ovlOn = false;
@@ -1847,6 +1858,7 @@ static void SplitClipIn(std::vector<std::unique_ptr<Clip>>& v, int i, double off
     t->duration = c.duration - off;
     t->lblend = c.lblend;
     t->lopacity = c.lopacity;
+    t->lfit = c.lfit;
     t->start = c.start + off;              // only meaningful on an overlay track
     c.duration = off;
     v.insert(v.begin() + i + 1, std::move(t));
@@ -1957,6 +1969,7 @@ static bool SplitNest(int index, double off) {
     nc->grade = n.grade;
     nc->lblend = n.lblend;
     nc->lopacity = n.lopacity;
+    nc->lfit = n.lfit;
     nc->start = n.start + off;
     g_clips[index]->duration = off;
     g_clips.insert(g_clips.begin() + index + 1, std::move(nc));
@@ -2391,6 +2404,7 @@ static void UnfoldNestOnTrack(int track, int index) {
     double dur = v[index]->duration;
     int blend = v[index]->lblend;
     float opacity = v[index]->lopacity;
+    int lfit = v[index]->lfit;
     bool rev = v[index]->reversed;
 
     v.erase(v.begin() + index);
@@ -2401,6 +2415,7 @@ static void UnfoldNestOnTrack(int track, int index) {
         c->start = run;
         c->lblend = blend;
         c->lopacity = opacity;
+        c->lfit = lfit;
         run += c->duration;
         v.push_back(std::move(c));
     }
@@ -2953,7 +2968,10 @@ static const char* PRESET_ITEMS =
     "Custom…\0";
 
 // How a source that does not match the canvas aspect is made to fit it.
-enum FitMode { FIT_BLUR = 0, FIT_BARS, FIT_CROP };
+enum FitMode { FIT_BLUR = 0, FIT_BARS, FIT_CROP };   // the pre-per-clip global
+static int LfitFromOldFit(int f) {
+    return f == FIT_CROP ? LFIT_FILL : f == FIT_BARS ? LFIT_BLACK : LFIT_BLUR;
+}
 // Video encoder. NVENC entries need an NVIDIA GPU; they fall back to nothing, so
 // the export just fails with ffmpeg's own message if the encoder is missing.
 enum VCodec { VC_X264 = 0, VC_X265, VC_NVENC_H264, VC_NVENC_HEVC };
@@ -2962,7 +2980,9 @@ enum Container { CT_MP4 = 0, CT_MOV, CT_MKV };
 
 static int   g_preset = PRESET_YT_1080;
 static int   g_customW = 1080, g_customH = 1920;
-static int   g_fit = FIT_BLUR;
+// The export panel's row: not a setting of its own any more, but the fill it stamps
+// onto every clip, and what a project saved before clips carried their own is read as.
+static int   g_fit = LFIT_FILL;
 static int   g_vcodec = VC_X265;
 static int   g_speed = 2;                 // index into SPEED_NAMES
 static int   g_rateMode = RM_BITRATE;
@@ -3217,8 +3237,6 @@ static void StartExport(const std::wstring& outPath) {
     int W = 0, H = 0;
     ResolveCanvas(&W, &H);
     const int FPS = g_fps;
-    const bool fitCanvas = g_preset != PRESET_ORIGINAL;
-    const int fit = fitCanvas ? g_fit : FIT_BARS;   // "Original" never needs a fill
 
     std::vector<Clip*> layers;             // overlay-track clips, bottom track first
     for (auto& t : g_over) {
@@ -3381,49 +3399,33 @@ static void StartExport(const std::wstring& outPath) {
 
     std::wstring fc;
     int scratch = 0;                       // unique suffix for intermediate labels
-    // Scale one input onto the canvas with the chosen fit and name the result.
-    auto FitTo = [&](int inIdx, const std::wstring& out) {
+    // Scale one input onto the canvas the way its own lfit asks, and name the result.
+    // Everything lands on an rgba bed: where the clip does not reach and asks for no
+    // bed of its own, the alpha is the mask, so a layer shows the cut underneath and a
+    // base cut shows the wall - the same as the preview's transparent canvas.
+    auto FitOne = [&](int inIdx, const std::wstring& out, int lfit) {
         wchar_t seg[768];
         int u = scratch++;
-        if (fit == FIT_BLUR) {
+        if (lfit == LFIT_BLUR) {           // opaque blurred bed, the layer whole on top
             swprintf(seg, 768,
-                     L"[%d:v]fps=%d,setpts=PTS-STARTPTS,split=2[b%d][f%d];"
-                     L"[b%d]scale=%d:%d:force_original_aspect_ratio=increase,"
-                     L"crop=%d:%d,gblur=sigma=%d[bb%d];"
-                     L"[f%d]scale=%d:%d:force_original_aspect_ratio=decrease:"
-                     L"flags=lanczos+accurate_rnd+full_chroma_int[ff%d];"
-                     L"[bb%d][ff%d]overlay=(W-w)/2:(H-h)/2,setsar=1",
+                     L"[%d:v]fps=%d,setpts=PTS-STARTPTS,split=2[lb%d][lf%d];"
+                     L"[lb%d]scale=%d:%d:force_original_aspect_ratio=increase,"
+                     L"crop=%d:%d,gblur=sigma=%d[lbb%d];"
+                     L"[lf%d]scale=%d:%d:force_original_aspect_ratio=decrease:"
+                     L"flags=lanczos+accurate_rnd+full_chroma_int[lff%d];"
+                     L"[lbb%d][lff%d]overlay=(W-w)/2:(H-h)/2,format=rgba,setsar=1",
                      inIdx, FPS, u, u,
                      u, W, H, W, H, H / 48, u,
                      u, W, H, u,
                      u, u);
-        } else if (fit == FIT_CROP) {
-            swprintf(seg, 768,
-                     L"[%d:v]fps=%d,setpts=PTS-STARTPTS,"
-                     L"scale=%d:%d:force_original_aspect_ratio=increase:"
-                     L"flags=lanczos+accurate_rnd+full_chroma_int,"
-                     L"crop=%d:%d,setsar=1",
-                     inIdx, FPS, W, H, W, H);
-        } else {
+        } else if (lfit == LFIT_BLACK) {   // opaque black bed
             swprintf(seg, 768,
                      L"[%d:v]fps=%d,setpts=PTS-STARTPTS,"
                      L"scale=%d:%d:force_original_aspect_ratio=decrease:"
                      L"flags=lanczos+accurate_rnd+full_chroma_int,"
-                     L"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black,setsar=1",
+                     L"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,format=rgba,setsar=1",
                      inIdx, FPS, W, H, W, H);
-        }
-        fc += seg;
-        fc += L"[" + out + L"];";
-    };
-
-    // A layer is not a shot. The preview blends a layer only where it actually covers
-    // and leaves the picture underneath alone everywhere else, so a layer must never
-    // get the blur fill a base shot gets: blending a blurred full-frame copy of the
-    // layer over the whole cut is what made an export read hazy next to the preview.
-    // Fit it inside the canvas on a transparent bed, and let the alpha be the mask.
-    auto FitLayer = [&](int inIdx, const std::wstring& out) {
-        wchar_t seg[768];
-        if (fit == FIT_CROP) {             // crop to fill covers the frame anyway
+        } else if (lfit == LFIT_FILL) {    // crop until it covers the frame
             swprintf(seg, 768,
                      L"[%d:v]fps=%d,setpts=PTS-STARTPTS,"
                      L"scale=%d:%d:force_original_aspect_ratio=increase:"
@@ -3487,10 +3489,8 @@ static void StartExport(const std::wstring& outPath) {
         if (c.kind == Clip::Text) {        // the lavfi colour source is already canvas-size
             swprintf(seg, 768, L"[%d:v]fps=%d,setsar=1[%ls];", vIn[c.uid], FPS, stage.c_str());
             fc += seg;
-        } else if (layer) {
-            FitLayer(vIn[c.uid], stage);
         } else {
-            FitTo(vIn[c.uid], stage);
+            FitOne(vIn[c.uid], stage, c.lfit);
         }
 
         if (reversed && c.kind != Clip::Image) {
@@ -3518,7 +3518,7 @@ static void StartExport(const std::wstring& outPath) {
         if (dit != dIn.end()) {            // double exposure
             wchar_t dl[32];
             swprintf(dl, 32, L"d%d", c.uid);
-            FitLayer(dit->second, dl);
+            FitOne(dit->second, dl, c.lfit);
             wchar_t out[32];
             swprintf(out, 32, L"x%d", c.uid);
             int bm = c.dxBlend;
@@ -6136,7 +6136,19 @@ static void DrawOutputPanel() {
         g_customH = g_customH < 16 ? 16 : (g_customH > 7680 ? 7680 : g_customH);
     }
     ImGui::BeginDisabled(g_preset == PRESET_ORIGINAL);
-    SegRow("off-aspect", &g_fit, "Blur fill\0" "Black bars\0" "Crop to fill\0");
+    // Each clip carries its own off-canvas fill; this row stamps one onto the lot,
+    // which is what the old global setting effectively did.
+    if (SegRow("off-canvas", &g_fit, LFIT_ITEMS)) {
+        auto stamp = [](std::vector<std::unique_ptr<Clip>>& v, int f) {
+            for (auto& c : v) c->lfit = f;
+        };
+        stamp(g_clips, g_fit);
+        for (auto& t : g_over) stamp(t->clips, g_fit);
+        for (auto& q : g_seqs) {
+            stamp(q->clips, g_fit);
+            for (auto& t : q->over) stamp(t->clips, g_fit);
+        }
+    }
     ImGui::EndDisabled();
 
     static const int FPS_CHOICES[] = { 24, 25, 30, 50, 60 };
@@ -6699,10 +6711,6 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
     g_d3dContext->PSSetSamplers(0, 1, &g_sampLinear);
     g_d3dContext->GSSetShader(nullptr, nullptr, 0);
 
-    // Only "Crop to fill" cuts the picture. Blur fill scales the shot down inside
-    // the canvas and puts a blurred copy behind it, and "Original" needs no fill at
-    // all, so both of those fit the whole frame in - the same as the export.
-    bool cover = (g_preset != PRESET_ORIGINAL ? g_fit : FIT_BARS) == FIT_CROP;
     double ph = g_playhead.load();
     double clipStart = 0;
     int ci = ClipAt(ph, &clipStart);
@@ -6712,15 +6720,22 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
     // same maths ffmpeg's blend filter uses, so the preview matches the export.
     int curAt[PROJ_MAX_DEPTH + 1] = {};
     auto blendElement = [&](int depth, ID3D11ShaderResourceView* srv, float ar, int mode,
-                            float opacity, const Grade* grade, bool fitCover) {
+                            float opacity, const Grade* grade, bool fitCover,
+                            int bed = LFIT_INSIDE) {
         if (!srv || opacity <= 0.001f) return;
         const int T = TargetBase(depth);
         const int stage = T + 2;
         // 1. the element alone, fitted, graded, alpha 1 where it covers
         g_d3dContext->OMSetRenderTargets(1, &g_projRTV[stage], nullptr);
-        g_d3dContext->ClearRenderTargetView(g_projRTV[stage], clear);
+        const float bedCol[4] = { 0, 0, 0, 1 };
+        g_d3dContext->ClearRenderTargetView(g_projRTV[stage],
+                                            bed == LFIT_BLACK ? bedCol : clear);
         g_d3dContext->OMSetBlendState(nullptr, blend, 0xffffffff);
         g_d3dContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        // The blurred bed is a cover-fitted copy of the layer under the whole frame.
+        // The preview does not blur it - the export's gblur is the real thing - but it
+        // is opaque and the right colours, so the cut underneath stays hidden here too.
+        if (bed == LFIT_BLUR) CompositeQuad(srv, ar, true, 1.0f, outW, outH, grade);
         CompositeQuad(srv, ar, fitCover, 1.0f, outW, outH, grade);
 
         // 2. blend it over the canvas into the other target
@@ -6788,7 +6803,8 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
             srv = c.tex;
             ar = c.texAspect;
         }
-        if (srv) blendElement(depth, srv, ar, mode, opacity, &c.grade, cover);
+        if (srv) blendElement(depth, srv, ar, mode, opacity, &c.grade,
+                              c.lfit == LFIT_FILL, c.lfit);
         if (c.dxOn) {
             ID3D11ShaderResourceView* lay = c.dxTex;
             float la = c.dxAspect;
@@ -6798,7 +6814,7 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
             }
             // the double-exposure list starts at "screen", the layer list at "normal"
             if (lay) blendElement(depth, lay, la, c.dxBlend + 1, opacity * c.dxAmount,
-                                  &c.grade, cover);
+                                  &c.grade, c.lfit == LFIT_FILL, c.lfit);
         }
     };
 
@@ -6979,10 +6995,6 @@ static void DrawPreviewArea(ImVec2 size) {
     double tot = TotalDuration();
     double clipStart = 0;
     int ci = ClipAt(ph, &clipStart);
-    // Only "Crop to fill" cuts the picture. Blur fill scales the shot down inside
-    // the canvas and puts a blurred copy behind it, and "Original" needs no fill at
-    // all, so both of those fit the whole frame in - the same as the export.
-    bool cover = (g_preset != PRESET_ORIGINAL ? g_fit : FIT_BARS) == FIT_CROP;
     // Live film look: composite this frame offscreen and run the projector shader
     // over it, at the pixel size it will be shown at so the grain stays crisp.
     // The compositor runs whether or not the film look is on, so layer blend modes
@@ -7015,7 +7027,7 @@ static void DrawPreviewArea(ImVec2 size) {
             double at = c.reversed ? c.duration - local : local;
             ID3D11ShaderResourceView* fr = ProxyFrame(*c.vid, c.trimIn + at);
             if (fr) DrawFitted(dl, (ImTextureID)fr, c.vid->aspect > 0 ? c.vid->aspect : 1.0f,
-                               f0, f1, cover, tint);
+                               f0, f1, c.lfit == LFIT_FILL, tint);
             else {
                 const char* msg = c.vid->probed.load() ? "building preview…" : "reading video…";
                 ImVec2 ts = ImGui::CalcTextSize(msg);
@@ -7023,7 +7035,7 @@ static void DrawPreviewArea(ImVec2 size) {
                             IM_COL32(130, 130, 130, 255), msg);
             }
         } else if (c.kind == Clip::Image && c.tex) {
-            DrawFitted(dl, (ImTextureID)c.tex, c.texAspect, f0, f1, cover, tint);
+            DrawFitted(dl, (ImTextureID)c.tex, c.texAspect, f0, f1, c.lfit == LFIT_FILL, tint);
         } else if (c.kind == Clip::Text) {
             dl->AddRectFilled(f0, f1, IM_COL32(0, 0, 0, a));
         }
@@ -7036,7 +7048,7 @@ static void DrawPreviewArea(ImVec2 size) {
             }
             if (lay) {
                 int da = (int)(c.dxAmount * alphaMul * 255.0f);
-                DrawFitted(dl, (ImTextureID)lay, la, f0, f1, cover,
+                DrawFitted(dl, (ImTextureID)lay, la, f0, f1, c.lfit == LFIT_FILL,
                            IM_COL32(255, 255, 255, da < 0 ? 0 : da > 255 ? 255 : da));
             }
         }
@@ -7421,6 +7433,19 @@ static void DrawClipInspector() {
         }
     }
 
+    if (c.kind != Clip::Text) {             // how this clip meets an off-aspect canvas
+        ImGui::SeparatorText("frame");
+        if (SegRow("off-canvas", &c.lfit, LFIT_ITEMS))
+            ForEachOtherSelected(c, [&](Clip& o) { o.lfit = c.lfit; });
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("What fills the canvas where this clip does not reach.\n"
+                              "Inside: nothing - a layer shows the cut underneath,\n"
+                              "  a base cut shows the projector wall.\n"
+                              "Fill: crop this clip until it covers.\n"
+                              "Blur bed / Black bed: keep this clip whole and hide\n"
+                              "  what is behind it, cropping neither.");
+    }
+
     if (isLayer) {                          // how this layer sits over the cut
         ImGui::SeparatorText("layer");
         Prop("start");
@@ -7753,6 +7778,7 @@ struct KV {
         const std::string* p = find(k); return p ? atoi(p->c_str()) : d;
     }
     bool b(const char* k, bool d = false) const { return i(k, d ? 1 : 0) != 0; }
+    bool has(const char* k) const { return find(k) != nullptr; }
 };
 
 static void Put(std::string& out, const char* k, const std::string& v) {
@@ -7811,6 +7837,7 @@ static void WriteClip(std::string& o, const Clip& c, int track, int seq = 0) {
     PutN(o, "start", c.start);
     PutI(o, "lblend", c.lblend);
     PutN(o, "lopacity", c.lopacity);
+    PutI(o, "lfit", c.lfit);
     PutI(o, "ovlOn", c.ovlOn);
     Put(o, "ovlText", c.ovlText);
     PutN(o, "ovlScale", c.ovlScale);
@@ -7838,7 +7865,7 @@ static std::string ProjectToText(bool undoMode = false) {
     PutI(o, "preset", g_preset);
     PutI(o, "customW", g_customW);
     PutI(o, "customH", g_customH);
-    PutI(o, "fit", g_fit);
+    PutI(o, "lfitAll", g_fit);
     PutI(o, "vcodec", g_vcodec);
     PutI(o, "speed", g_speed);
     PutI(o, "rateMode", g_rateMode);
@@ -8047,6 +8074,7 @@ static Clip* MakeClipFromKV(const KV& kv) {
     c->start = kv.num("start");
     c->lblend = kv.i("lblend");
     c->lopacity = (float)kv.num("lopacity", 1.0);
+    c->lfit = kv.i("lfit", kv.b("lfill") ? LFIT_FILL : -1);   // -1: fill in from g_fit
     c->ovlOn = kv.b("ovlOn");
     c->ovlText = kv.str("ovlText");
     c->ovlScale = (float)kv.num("ovlScale", 0.07);
@@ -8077,7 +8105,8 @@ static void ApplySettings(const KV& kv, double savedPh, float savedPps, float sa
     g_preset = kv.i("preset", g_preset);
     g_customW = kv.i("customW", g_customW);
     g_customH = kv.i("customH", g_customH);
-    g_fit = kv.i("fit", g_fit);
+    // "fit" is the old global, in FitMode terms; "lfitAll" is this one, in LFIT terms.
+    g_fit = kv.i("lfitAll", kv.has("fit") ? LfitFromOldFit(kv.i("fit")) : g_fit);
     g_vcodec = kv.i("vcodec", g_vcodec);
     g_speed = kv.i("speed", g_speed);
     g_rateMode = kv.i("rateMode", g_rateMode);
@@ -8243,6 +8272,20 @@ static bool LoadProjectFromText(const std::string& text, bool syncAudio = false)
     LoadLevel(g_nav.back());
     RefreshNestDurations();
     SortAspects();
+
+    // Clips saved before each one carried its own off-canvas fill get the project's
+    // old global, which is what they were exported with.
+    {
+        auto fill = [](std::vector<std::unique_ptr<Clip>>& v) {
+            for (auto& c : v) if (c->lfit < 0) c->lfit = g_fit;
+        };
+        fill(g_clips);
+        for (auto& t : g_over) fill(t->clips);
+        for (auto& q : g_seqs) {
+            fill(q->clips);
+            for (auto& t : q->over) fill(t->clips);
+        }
+    }
 
     // Rebuild the sound blocks. A block whose track index runs past the list grows
     // the list rather than being dropped, which is how a restore used to lose audio.

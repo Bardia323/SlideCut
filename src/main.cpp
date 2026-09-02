@@ -294,7 +294,8 @@ static const int SAMPLE_RATE = 48000;
 // ------------------------------------------------------------------ audio fx
 // A chain a track can be run through: a cinematic dialogue polish (shape, a
 // squeeze, a touch of room), a telephone futz (band-limited, mono, driven) and
-// an AM radio (wider band than the phone, broadcast-squashed, drifting).
+// an AM radio (wider band than the phone, hissing, broadcast-squashed,
+// drifting).
 // The preview mixer runs it sample by sample and the export asks ffmpeg for the
 // same shape, so what you hear is what lands in the file.
 enum { AFX_NONE = 0, AFX_CINE, AFX_PHONE, AFX_PHONE_CINE, AFX_AM, AFX_AM_CINE,
@@ -354,6 +355,7 @@ struct Biquad {
 // Everything the chain remembers between callbacks. Fixed size: the audio thread
 // never allocates.
 static const int AFX_DELAY = 4800;         // 100 ms of room, per channel
+static const float AM_HISS = 0.004f;       // am noise floor, pre-band, pre-squeeze
 struct AudioFxState {
     Biquad hp1, hp2, lp1, lp2, mid, bass, mud, air;
     Biquad ahp1, ahp2, alp1, alp2, apk;    // am radio band
@@ -361,6 +363,13 @@ struct AudioFxState {
     float dl[2][AFX_DELAY] = {};
     int   dw = 0;
     double lfo = 0;                        // am wobble phase, in samples
+    unsigned rng = 0x2545F491u;            // am hiss, xorshift on the audio thread
+
+    // White, uniform, +-1. Cheap enough to call once a frame.
+    inline float Noise() {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        return (float)(rng >> 8) * (1.0f / 8388608.0f) - 1.0f;
+    }
     int   built = -1;                      // which preset the state was built for
 
     void Build(int preset) {
@@ -382,6 +391,7 @@ struct AudioFxState {
         mid.Reset(); bass.Reset(); mud.Reset(); air.Reset();
         ahp1.Reset(); ahp2.Reset(); alp1.Reset(); alp2.Reset(); apk.Reset();
         lfo = 0;
+        rng = 0x2545F491u;
         env[0] = env[1] = 0;
         memset(dl, 0, sizeof(dl));
         dw = 0;
@@ -418,6 +428,7 @@ struct AudioFxState {
                 lfo += 1.0;
                 if (lfo >= (double)SAMPLE_RATE) lfo -= (double)SAMPLE_RATE;
             }
+            float hiss = am ? Noise() * AM_HISS : 0.0f;   // ahead of the band
             for (int ch = 0; ch < 2; ch++) {
                 float x = w[ch];
                 if (cine) {
@@ -434,6 +445,7 @@ struct AudioFxState {
                     x = tanhf(x * 1.8f) * 0.7f;     // the line itself, driven
                 }
                 if (am) {
+                    x += hiss;             // the carrier's own floor
                     x = ahp1.Run(ch, x); x = ahp2.Run(ch, x);
                     x = alp1.Run(ch, x); x = alp2.Run(ch, x);
                     x = apk.Run(ch, x);
@@ -488,6 +500,9 @@ static std::wstring AfxChain(int preset) {
              L"aformat=channel_layouts=stereo,";
     if (am)
         f += L"aformat=channel_layouts=mono,"
+             // one expression, so no c=same: ffmpeg 8.1 crashes on a c=same
+             // aeval followed by a channel-layout change
+             L"aeval=val(0)+0.004*(random(1)*2-1),"
              L"highpass=f=200:poles=2,lowpass=f=4500:poles=2,"
              L"equalizer=f=1500:t=q:w=1:g=5,"
              L"acompressor=threshold=0.04:ratio=8:attack=3:release=120:makeup=2.2,"

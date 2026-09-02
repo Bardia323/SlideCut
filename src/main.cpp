@@ -293,12 +293,15 @@ static const int SAMPLE_RATE = 48000;
 
 // ------------------------------------------------------------------ audio fx
 // A chain a track can be run through: a cinematic dialogue polish (shape, a
-// squeeze, a touch of room) and a telephone futz (band-limited, mono, driven).
+// squeeze, a touch of room), a telephone futz (band-limited, mono, driven) and
+// an AM radio (wider band than the phone, broadcast-squashed, drifting).
 // The preview mixer runs it sample by sample and the export asks ffmpeg for the
 // same shape, so what you hear is what lands in the file.
-enum { AFX_NONE = 0, AFX_CINE, AFX_PHONE, AFX_PHONE_CINE, AFX_COUNT };
+enum { AFX_NONE = 0, AFX_CINE, AFX_PHONE, AFX_PHONE_CINE, AFX_AM, AFX_AM_CINE,
+       AFX_COUNT };
 static const char* kAfxNames[AFX_COUNT] = { "none", "cinematic", "telephone",
-                                            "cinematic + telephone" };
+                                            "cinematic + telephone", "am radio",
+                                            "cinematic + am radio" };
 
 // RBJ biquad, transposed direct form II, two channels of state.
 struct Biquad {
@@ -353,9 +356,11 @@ struct Biquad {
 static const int AFX_DELAY = 4800;         // 100 ms of room, per channel
 struct AudioFxState {
     Biquad hp1, hp2, lp1, lp2, mid, bass, mud, air;
+    Biquad ahp1, ahp2, alp1, alp2, apk;    // am radio band
     float env[2] = { 0, 0 };               // compressor followers, linear
     float dl[2][AFX_DELAY] = {};
     int   dw = 0;
+    double lfo = 0;                        // am wobble phase, in samples
     int   built = -1;                      // which preset the state was built for
 
     void Build(int preset) {
@@ -369,8 +374,14 @@ struct AudioFxState {
         bass.Shelf(110.0f, 2.5f, false);
         mud.Peak(400.0f, 1.2f, -3.0f);
         air.Shelf(8000.0f, 3.0f, true);
+        // am radio: a wider band than the handset, honking in the middle
+        ahp1.HighPass(200.0f, 0.707f); ahp2.HighPass(200.0f, 0.707f);
+        alp1.LowPass(4500.0f, 0.707f); alp2.LowPass(4500.0f, 0.707f);
+        apk.Peak(1500.0f, 1.0f, 5.0f);
         hp1.Reset(); hp2.Reset(); lp1.Reset(); lp2.Reset();
         mid.Reset(); bass.Reset(); mud.Reset(); air.Reset();
+        ahp1.Reset(); ahp2.Reset(); alp1.Reset(); alp2.Reset(); apk.Reset();
+        lfo = 0;
         env[0] = env[1] = 0;
         memset(dl, 0, sizeof(dl));
         dw = 0;
@@ -392,12 +403,21 @@ struct AudioFxState {
     void Process(float* buf, ma_uint32 frames, int preset, float mix) {
         if (preset <= AFX_NONE || preset >= AFX_COUNT || mix <= 0.0001f) return;
         Build(preset);
-        bool cine  = preset == AFX_CINE  || preset == AFX_PHONE_CINE;
+        bool cine  = preset == AFX_CINE  || preset == AFX_PHONE_CINE ||
+                     preset == AFX_AM_CINE;
         bool phone = preset == AFX_PHONE || preset == AFX_PHONE_CINE;
+        bool am    = preset == AFX_AM    || preset == AFX_AM_CINE;
         for (ma_uint32 i = 0; i < frames; i++) {
             float dry[2] = { buf[i * 2], buf[i * 2 + 1] };
             float w[2] = { dry[0], dry[1] };
-            if (phone) w[0] = w[1] = 0.5f * (dry[0] + dry[1]);   // one capsule
+            if (phone || am) w[0] = w[1] = 0.5f * (dry[0] + dry[1]);   // one capsule
+            float amGain = 1.0f;
+            if (am) {                      // matches ffmpeg tremolo's cosine
+                float ph = 6.2831853f * 0.7f * (float)(lfo / SAMPLE_RATE);
+                amGain = 1.0f - 0.12f + 0.12f * 0.5f * (cosf(ph) + 1.0f);
+                lfo += 1.0;
+                if (lfo >= (double)SAMPLE_RATE) lfo -= (double)SAMPLE_RATE;
+            }
             for (int ch = 0; ch < 2; ch++) {
                 float x = w[ch];
                 if (cine) {
@@ -412,6 +432,14 @@ struct AudioFxState {
                     x = mid.Run(ch, x);
                     x = Squeeze(ch, x, 0.05f, 6.0f, 5.0f, 80.0f) * 2.0f;
                     x = tanhf(x * 1.8f) * 0.7f;     // the line itself, driven
+                }
+                if (am) {
+                    x = ahp1.Run(ch, x); x = ahp2.Run(ch, x);
+                    x = alp1.Run(ch, x); x = alp2.Run(ch, x);
+                    x = apk.Run(ch, x);
+                    x = Squeeze(ch, x, 0.04f, 8.0f, 3.0f, 120.0f) * 2.2f;
+                    x = tanhf(x * 2.2f) * 0.65f;    // the transmitter, pushed
+                    x *= amGain;                    // the carrier, drifting
                 }
                 w[ch] = x;
             }
@@ -442,8 +470,10 @@ struct AudioFxState {
 // Empty when the track is dry.
 static std::wstring AfxChain(int preset) {
     if (preset <= AFX_NONE || preset >= AFX_COUNT) return L"";
-    bool cine  = preset == AFX_CINE  || preset == AFX_PHONE_CINE;
+    bool cine  = preset == AFX_CINE  || preset == AFX_PHONE_CINE ||
+                 preset == AFX_AM_CINE;
     bool phone = preset == AFX_PHONE || preset == AFX_PHONE_CINE;
+    bool am    = preset == AFX_AM    || preset == AFX_AM_CINE;
     std::wstring f;
     if (cine)
         f += L"bass=g=2.5:f=110,equalizer=f=400:t=q:w=1.2:g=-3,treble=g=3:f=8000,"
@@ -455,6 +485,14 @@ static std::wstring AfxChain(int preset) {
              L"equalizer=f=1800:t=q:w=1.2:g=6,"
              L"acompressor=threshold=0.05:ratio=6:attack=5:release=80:makeup=2,"
              L"volume=1.8,asoftclip=type=tanh,volume=0.7,"
+             L"aformat=channel_layouts=stereo,";
+    if (am)
+        f += L"aformat=channel_layouts=mono,"
+             L"highpass=f=200:poles=2,lowpass=f=4500:poles=2,"
+             L"equalizer=f=1500:t=q:w=1:g=5,"
+             L"acompressor=threshold=0.04:ratio=8:attack=3:release=120:makeup=2.2,"
+             L"volume=2.2,asoftclip=type=tanh,volume=0.65,"
+             L"tremolo=f=0.7:d=0.12,"
              L"aformat=channel_layouts=stereo,";
     if (!f.empty()) f.pop_back();
     return f;

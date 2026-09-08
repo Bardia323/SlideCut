@@ -542,6 +542,7 @@ static float g_baseH = 58.0f;              // height of the base picture row
 // Height of the whole timeline pane. 0 = size it to the tracks; dragging the bar
 // above the toolbar pins it, double-clicking the bar hands it back to the tracks.
 static float g_tlHeightUser = 0.0f;
+static float g_panelWUser = 0.0f;   // side panel width, once dragged
 static const float ROW_H_MIN = 30.0f, ROW_H_MAX = 260.0f;
 // Muted shots get their own row under the picture, at their real length, so a
 // mute reads as "parked off the cut" instead of shrinking to nothing.
@@ -966,6 +967,7 @@ static Sequence* FindSeq(int id) {
     return nullptr;
 }
 static int CurSeqId() { return g_nav.empty() ? 0 : g_nav.back(); }
+#include "edit_workspace_state.h"
 static Sequence* CurSeq() { return FindSeq(CurSeqId()); }
 static int NestDepth() { return (int)g_nav.size() - 1; }
 
@@ -2056,6 +2058,9 @@ static int SplitPoint(double t) {
 
 static void RippleOthers(double fromTime, double shift) {
     if (fabs(shift) < 1e-9) return;
+    for (auto& m : g_editMarkers)
+        if (m.seq == CurSeqId() && m.time >= fromTime - 1e-9)
+            m.time = fmax(0.0, m.time + shift);
     for (auto& t : g_over)
         for (auto& c : t->clips)
             if (c->start >= fromTime - 1e-9) {
@@ -2685,10 +2690,6 @@ static void PumpPendingLoads() {          // main thread: turn decoded pixels in
     // Sequences are no longer opened out before the render, so their cards live in
     // g_seqs rather than on the working copy.
     for (auto& q : g_seqs) {
-        for (auto& c : q->clips) all.push_back(c.get());
-        for (auto& t : q->over) for (auto& c : t->clips) all.push_back(c.get());
-    }
-    for (auto& q : g_seqs) {              // folded levels are previewed from outside
         for (auto& c : q->clips) all.push_back(c.get());
         for (auto& t : q->over) for (auto& c : t->clips) all.push_back(c.get());
     }
@@ -4221,6 +4222,174 @@ static int TrimSelectionTo(double len) {
     run(g_clips);
     for (auto& t : g_over) run(t->clips);
     return n;
+}
+
+// ---- quantize to the beat
+//
+// Cuts land on the music by moving them, never by re-timing the picture: a shot
+// edge inside the window of an onset is pulled onto it, everything further away
+// is left alone. The onsets come from the sound tracks themselves - an energy
+// flux over the decoded samples, picked against a local average - so no tempo is
+// assumed and a rubato take quantizes as well as a metronomic one.
+
+static float g_quantWin = 0.10f;           // seconds an edge may travel to reach a beat
+// Cutting exactly on the transient often reads as late: the eye needs a frame or
+// two to catch a cut that the ear catches instantly. This offset moves the target
+// off the beat - negative lands the cut ahead of it, positive behind - and the
+// window is measured from that shifted target, not from the beat itself.
+static float g_quantOff = 0.0f;            // seconds, - = ahead of the beat
+
+// Onsets of one decoded song, in source seconds. Cached per block: the decode is
+// the expensive part and the samples never change once loaded.
+static const std::vector<double>& SongOnsets(const Song& s) {
+    struct Entry { size_t n = 0; std::vector<double> on; };
+    static std::map<int, Entry> cache;
+    Entry& e = cache[s.uid];
+    if (e.n == s.pcm.size() && e.n) return e.on;
+    e.n = s.pcm.size();
+    e.on.clear();
+    const size_t frames = s.pcm.size() / 2;
+    const int HOP = 512;                                  // ~10.7 ms at 48k
+    if (frames < (size_t)HOP * 4) return e.on;
+    // Loudness envelope, one value per hop.
+    std::vector<float> env(frames / HOP);
+    for (size_t h = 0; h < env.size(); h++) {
+        const float* p = s.pcm.data() + h * HOP * 2;
+        double sum = 0;
+        for (int i = 0; i < HOP; i++) {
+            float m = 0.5f * (p[i * 2] + p[i * 2 + 1]);
+            sum += (double)m * m;
+        }
+        env[h] = (float)log10(1e-9 + sqrt(sum / HOP));    // dB-ish: beats read the same loud or quiet
+    }
+    // Rising edges only, measured against the local average of the flux so a
+    // dense passage does not fire on every hop.
+    std::vector<float> flux(env.size(), 0.0f);
+    for (size_t h = 1; h < env.size(); h++) {
+        float d = env[h] - env[h - 1];
+        flux[h] = d > 0 ? d : 0.0f;
+    }
+    const int W = 12;                                     // ~130 ms either side
+    const double minGap = 0.08;                           // no two beats closer than this
+    const double hopSec = (double)HOP / SAMPLE_RATE;
+    double last = -1e9;
+    for (size_t h = 1; h + 1 < flux.size(); h++) {
+        if (flux[h] < flux[h - 1] || flux[h] < flux[h + 1]) continue;   // local peak only
+        size_t a = h > (size_t)W ? h - W : 0, b = h + W < flux.size() ? h + W : flux.size() - 1;
+        double mean = 0;
+        for (size_t i = a; i <= b; i++) mean += flux[i];
+        mean /= (double)(b - a + 1);
+        if (flux[h] < mean * 1.6 + 0.012) continue;
+        double t = h * hopSec;
+        if (t - last < minGap) continue;
+        last = t;
+        e.on.push_back(t);
+    }
+    return e.on;
+}
+
+// Every onset under the film, in timeline seconds. Muted tracks are not part of
+// what you are cutting to, so they are skipped.
+static void BeatGrid(std::vector<double>& out) {
+    out.clear();
+    for (auto& tr : g_atracks) {
+        if (tr->mute) continue;
+        for (auto& bp : tr->blocks) {
+            Song& s = *bp;
+            if (!s.loaded || s.pcm.empty()) continue;
+            const std::vector<double>& on = SongOnsets(s);
+            for (double t : on) {
+                if (t < s.trimStart || t > s.trimEnd) continue;
+                double tl = s.reversed ? s.offset + (s.trimEnd - t)
+                                       : s.offset + (t - s.trimStart);
+                if (tl >= 0) out.push_back(tl);
+            }
+        }
+    }
+    std::sort(out.begin(), out.end());
+}
+
+// The nearest beat to t, if one sits inside the window. Returns the move, 0 for
+// "leave it where it is".
+static double BeatPull(const std::vector<double>& grid, double t, double win) {
+    size_t i = (size_t)(std::lower_bound(grid.begin(), grid.end(), t) - grid.begin());
+    double best = 0.0, bestAbs = win;
+    for (int k = -1; k <= 0; k++) {
+        size_t j = i + k;
+        if (i == 0 && k < 0) continue;
+        if (j >= grid.size()) continue;
+        double d = grid[j] - t;
+        if (fabs(d) <= bestAbs) { bestAbs = fabs(d); best = d; }
+    }
+    return best;
+}
+
+// Pull the edges of the selected shots onto the beat. The base track packs, so a
+// shot's start is moved by lengthening or shortening the shot before it and the
+// rest of the film rides along; an overlay shot carries its own start and simply
+// slides. Nothing moves further than the window.
+static int QuantizeSelectionToBeats(double win, double off, std::string& err) {
+    std::vector<double> grid;
+    BeatGrid(grid);
+    if (grid.empty()) { err = "no beats found - load a sound track first"; return 0; }
+    const double MIN = MinClipDur();
+    int moved = 0;
+
+    // ---- base track, in order, carrying the ripple forward
+    {
+        std::vector<BaseSpan> lay;
+        BaseLayout(lay);
+        double shift = 0;                                 // what the earlier edits already moved
+        int prev = -1;                                    // last visible shot: it absorbs a start move
+        for (int i = 0; i < (int)g_clips.size(); i++) {
+            Clip& c = *g_clips[i];
+            if (c.skip) continue;
+            double start = lay[i].start + shift;
+            if (SelHas(c.uid)) {
+                if (prev >= 0) {                          // snap the cut into this shot
+                    double d = BeatPull(grid, start - off, win);
+                    if (d != 0.0) {
+                        Clip& p = *g_clips[prev];
+                        double nd = p.duration + d;
+                        double mx = MaxDuration(p);
+                        if (nd < MIN) nd = MIN;
+                        if (nd > mx) nd = mx;
+                        d = nd - p.duration;
+                        if (d != 0.0) { p.duration = nd; shift += d; start += d; moved++; }
+                    }
+                }
+                double d2 = BeatPull(grid, start + c.duration - off, win);   // snap the cut out of it
+                if (d2 != 0.0) {
+                    double nd = c.duration + d2;
+                    double mx = MaxDuration(c);
+                    if (nd < MIN) nd = MIN;
+                    if (nd > mx) nd = mx;
+                    d2 = nd - c.duration;
+                    if (d2 != 0.0) { c.duration = nd; shift += d2; moved++; }
+                }
+            }
+            prev = i;
+        }
+    }
+
+    // ---- overlay shots: free-standing, so both edges move on their own
+    for (auto& tr : g_over) {
+        for (auto& up : tr->clips) {
+            Clip& c = *up;
+            if (!SelHas(c.uid) || c.skip) continue;
+            double d = BeatPull(grid, c.start - off, win);
+            if (d != 0.0) { c.start += d; if (c.start < 0) c.start = 0; moved++; }
+            double d2 = BeatPull(grid, c.start + c.duration - off, win);
+            if (d2 != 0.0) {
+                double nd = c.duration + d2, mx = MaxDuration(c);
+                if (nd < MIN) nd = MIN;
+                if (nd > mx) nd = mx;
+                if (nd != c.duration) { c.duration = nd; moved++; }
+            }
+        }
+    }
+    if (!moved) err = "no shot edge was within reach of a beat";
+    return moved;
 }
 
 // ---- hypercut
@@ -7881,6 +8050,7 @@ static void WriteClip(std::string& o, const Clip& c, int track, int seq = 0) {
     PutI(o, "srcW", c.srcW);
     PutI(o, "srcH", c.srcH);
     PutN(o, "trimIn", c.trimIn);
+    PutN(o, "xfade", c.xfade);
     PutI(o, "reversed", c.reversed);
     PutI(o, "group", c.group);
     PutI(o, "useAudio", c.useAudio);
@@ -7908,7 +8078,10 @@ static void WriteClip(std::string& o, const Clip& c, int track, int seq = 0) {
     PutN(o, "dxTrimIn", c.dxTrimIn);
 }
 
-static std::string ProjectToText(bool undoMode = false) {
+#include "edit_workspace_storage.h"
+
+static std::string ProjectToText(bool undoMode = false, bool includeBranches = true) {
+    SyncLibrary();
     CommitLevel();                          // put the working copy back first
     std::string navPath;
     std::string o = "slidecut 1\r\n";
@@ -8019,6 +8192,7 @@ static std::string ProjectToText(bool undoMode = false) {
         PutN(o, "offset", a->offset);
         PutN(o, "aspect", a->aspect);
     }
+    WriteWorkspace(o, includeBranches);
     LoadLevel(CurSeqId(), false);
     return o;
 }
@@ -8057,6 +8231,12 @@ static bool SaveProjectTo(const std::wstring& path) {
 // ---- loading
 
 static void ClearProject() {
+    ClearWorkspacePreviews();
+    g_library.clear();
+    g_editMarkers.clear();
+    g_branches.clear();
+    g_activeBranch = -1;
+    g_audition = false;
     bool wasPlaying = g_playing.exchange(false);
     if (g_songLoadFut.valid()) g_songLoadFut.wait();    // let the last restore land
     Sleep(20);
@@ -8110,6 +8290,7 @@ static Clip* MakeClipFromKV(const KV& kv) {
     c->srcW = kv.i("srcW");
     c->srcH = kv.i("srcH");
     c->trimIn = kv.num("trimIn");
+    c->xfade = fmax(0.0, kv.num("xfade"));
     c->reversed = kv.b("reversed");
     c->group = kv.i("group", 0);
     c->nest = kv.i("nest", 0);
@@ -8225,7 +8406,7 @@ static bool LoadProjectFromText(const std::string& text, bool syncAudio = false)
     ClearProject();
 
     struct SongReq { std::wstring path; std::string label; int track; int seq;
-                     double offset, trimStart, trimEnd; bool reversed; };
+                     double offset, trimStart, trimEnd; bool reversed; int group; };
     std::vector<SongReq> songs;
 
     std::string section;
@@ -8247,7 +8428,8 @@ static bool LoadProjectFromText(const std::string& text, bool syncAudio = false)
         return q;
     };
     auto commit = [&]() {
-        if (section == "settings") { ApplySettings(kv, savedPh, savedPps, savedScroll); navPath = kv.str("nav"); }
+        if (ReadWorkspaceSection(section, kv)) {}
+        else if (section == "settings") { ApplySettings(kv, savedPh, savedPps, savedScroll); navPath = kv.str("nav"); }
         else if (section == "seq") {
             Sequence* q = seqFor(kv.i("id", 0));
             q->name = kv.str("name", q->name.c_str());
@@ -8284,7 +8466,8 @@ static bool LoadProjectFromText(const std::string& text, bool syncAudio = false)
         } else if (section == "song") {
             songs.push_back({ Widen(kv.str("path")), kv.str("label"), kv.i("track", 0),
                               kv.i("seq", 0),
-                              kv.num("offset"), kv.num("trimStart"), kv.num("trimEnd"), kv.b("reversed") });
+                              kv.num("offset"), kv.num("trimStart"), kv.num("trimEnd"), kv.b("reversed"), kv.i("group") });
+            g_groupNext = std::max(g_groupNext, kv.i("group") + 1);
         }
         kv.v.clear();
     };
@@ -8351,6 +8534,7 @@ static bool LoadProjectFromText(const std::string& text, bool syncAudio = false)
             sp->trimStart = r.trimStart;
             sp->trimEnd = r.trimEnd > r.trimStart ? r.trimEnd : sp->duration;
             sp->reversed = r.reversed;
+            sp->group = r.group;
             if (!r.label.empty()) sp->label = r.label;
             MixGuard lock;
             auto* tracks = ATracksOf(r.seq);
@@ -8810,6 +8994,66 @@ static void DrawColorPanel() {
         g_grade = Grade();
         g_intakeStatus = "grade pushed onto every shot";
     }
+}
+
+// The beat section: what the cuts are being pulled onto, how far they may travel
+// and where they land relative to the transient.
+static void DrawBeatPanel() {
+    std::vector<double> grid;
+    BeatGrid(grid);
+    ImGui::TextDisabled("%d beat%s under the film, from %d unmuted sound track%s",
+                        (int)grid.size(), grid.size() == 1 ? "" : "s",
+                        (int)std::count_if(g_atracks.begin(), g_atracks.end(),
+                                           [](const std::unique_ptr<AudioTrack>& t){ return !t->mute; }),
+                        g_atracks.size() == 1 ? "" : "s");
+    Prop("window");
+    ImGui::DragFloat("##qwin", &g_quantWin, 0.005f, 0.01f, 2.0f, "%.3f s",
+                     ImGuiSliderFlags_AlwaysClamp);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("an edge further than this from a beat is left where it is");
+
+    Prop("offset");
+    ImGui::DragFloat("##qoff", &g_quantOff, 0.002f, -0.5f, 0.5f, "%+.3f s",
+                     ImGuiSliderFlags_AlwaysClamp);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("where the cut lands against the beat: negative is ahead of it, positive behind");
+    Prop("");
+    {
+        float f = (float)MinClipDur();                 // one frame at the export rate
+        float w = ColW(5);
+        if (ImGui::Button("-2f", ImVec2(w, 0))) g_quantOff -= 2 * f;
+        ImGui::SameLine();
+        if (ImGui::Button("-1f", ImVec2(w, 0))) g_quantOff -= f;
+        ImGui::SameLine();
+        if (ImGui::Button("on", ImVec2(w, 0)))  g_quantOff = 0.0f;
+        ImGui::SameLine();
+        if (ImGui::Button("+1f", ImVec2(w, 0))) g_quantOff += f;
+        ImGui::SameLine();
+        if (ImGui::Button("+2f", ImVec2(-1, 0))) g_quantOff += 2 * f;
+        if (g_quantOff < -0.5f) g_quantOff = -0.5f;
+        if (g_quantOff >  0.5f) g_quantOff =  0.5f;
+    }
+    ImGui::TextDisabled(fabsf(g_quantOff) < 1e-4f ? "cuts land on the beat"
+                        : (g_quantOff < 0 ? "cuts land %.0f ms ahead of the beat"
+                                          : "cuts land %.0f ms behind the beat"),
+                        fabsf(g_quantOff) * 1000.0f);
+
+    Prop("");
+    int nSel = SelCount();
+    ImGui::BeginDisabled(nSel == 0 || grid.empty());
+    if (ImGui::Button(nSel > 1 ? "quantize the selected shots" : "quantize this shot", ImVec2(-1, 0))) {
+        std::string err;
+        int n = QuantizeSelectionToBeats(g_quantWin, g_quantOff, err);
+        char buf[80];
+        if (n) snprintf(buf, sizeof(buf), "%d edge%s pulled onto the beat", n, n == 1 ? "" : "s");
+        else   snprintf(buf, sizeof(buf), "%s", err.c_str());
+        g_intakeStatus = buf;
+    }
+    ImGui::EndDisabled();
+    if (nSel == 0) ImGui::TextDisabled("pick a shot on the timeline first");
+    else if (grid.empty()) ImGui::TextDisabled("no beats: load a sound track, unmute it, let it decode");
+    ImGui::TextDisabled("both edges of every selected shot move; the base track ripples, "
+                        "a layer shot just slides");
 }
 
 static void DrawVaultPanel() {
@@ -9325,6 +9569,10 @@ static void PruneEmptyTracks() {
 // The tools that act on the cut sit against the timeline, not up in the title bar.
 static void ClipToolBar(bool doAdd) {
     ImVec2 md(ImGui::CalcTextSize("ADD MEDIA").x + ImGui::GetStyle().FramePadding.x * 2, 0);
+    auto nextTool = [&] {
+        float right = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+        if (ImGui::GetItemRectMax().x + 3 + md.x <= right) ImGui::SameLine(0, 3);
+    };
     if (ImGui::Button("ADD MEDIA", md) || doAdd) {
         auto files = PickFiles(true, L"Media",
             L"*.jpg;*.jpeg;*.png;*.bmp;*.tif;*.tiff;*.webp;*.gif;"
@@ -9334,7 +9582,7 @@ static void ClipToolBar(bool doAdd) {
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("ctrl+i");
-    ImGui::SameLine(0, 3);
+    nextTool();
     if (ImGui::Button("TITLE CARD", md)) {
         g_textBuf[0] = 0;
         g_textScale = 0.13f;
@@ -9345,12 +9593,12 @@ static void ClipToolBar(bool doAdd) {
         // root window to open it rather than calling OpenPopup from in here.
         g_textOpenNew = true;
     }
-    ImGui::SameLine(0, 3);
+    nextTool();
     ImGui::BeginDisabled(g_clips.empty());
     if (ImGui::Button("SPLICE", md)) SplitPoint(g_playhead.load());
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("s");
     ImGui::EndDisabled();
-    ImGui::SameLine(0, 3);
+    nextTool();
     {   // fold a run of shots away into a sequence you can open and work inside
         bool any = !g_selUids.empty() || (g_selTrack == -1 && g_sel >= 0);
         ImGui::BeginDisabled(!any);
@@ -9359,7 +9607,7 @@ static void ClipToolBar(bool doAdd) {
             ImGui::SetTooltip("ctrl+f — the selected shots become one sequence");
         ImGui::EndDisabled();
     }
-    ImGui::SameLine(0, 3);
+    nextTool();
     {   // a sequence with nothing in it yet, opened straight away
         bool nestSel = g_selTrack == -1 && g_sel >= 0 && g_sel < (int)g_clips.size() &&
                        g_clips[g_sel]->kind == Clip::Nest;
@@ -9372,7 +9620,7 @@ static void ClipToolBar(bool doAdd) {
                 ImGui::SetTooltip("start an empty sequence at the playhead and work inside it");
         }
     }
-    ImGui::SameLine(0, 3);
+    nextTool();
     {   // flips the selected shots so they play backwards; nothing moves
         bool any = SelectedClip() != nullptr || !g_selUids.empty();
         ImGui::BeginDisabled(!any);
@@ -9397,7 +9645,7 @@ static void ClipToolBar(bool doAdd) {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("play the selected shots backwards");
         ImGui::EndDisabled();
     }
-    ImGui::SameLine(0, 3);
+    nextTool();
     {   // mute: the shot stays where it is, the film runs past it
         bool any = SelectedClip() != nullptr || !g_selUids.empty();
         ImGui::BeginDisabled(!any);
@@ -9406,7 +9654,7 @@ static void ClipToolBar(bool doAdd) {
             ImGui::SetTooltip("m — skip the selected shots without removing them");
         ImGui::EndDisabled();
     }
-    ImGui::SameLine(0, 3);
+    nextTool();
     {   // hush: every clip's sound off in the preview, the edit itself untouched
         bool hush = g_hushClips.load();
         if (hush) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
@@ -9433,7 +9681,8 @@ static void ClipToolBar(bool doAdd) {
         if (crumbs.size() > 1) need += ImGui::CalcTextSize("OUT").x +
                                       ImGui::GetStyle().FramePadding.x * 2 + 8.0f;
         float x = ImGui::GetWindowContentRegionMax().x - need - 4;
-        if (x > ImGui::GetCursorPosX() + 10) ImGui::SameLine(x); else ImGui::SameLine();
+        float used = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + 8;
+        if (x >= used) ImGui::SameLine(x);
 
         if (crumbs.size() > 1) {
             if (ImGui::Button("OUT")) g_navDepth = (int)g_nav.size() - 2;
@@ -9455,7 +9704,10 @@ static void ClipToolBar(bool doAdd) {
     }
 }
 
+#include "edit_workspace_ui.h"
+
 static void DrawApp() {
+    SyncLibrary();
     PruneEmptyTracks();
     SelSync();
     ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -9516,7 +9768,8 @@ static void DrawApp() {
                                                       : Narrow(BaseName(g_projectPath)).c_str(),
                         g_projectDirty ? " *" : "");
 
-    ImGui::SameLine(0, 16);
+    if (ImGui::GetItemRectMax().x + 510 < ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x)
+        ImGui::SameLine(0, 16);
     static char ytUrl[512] = "";
     ImGui::BeginDisabled(songBusy);
     ImGui::SetNextItemWidth(220);
@@ -9660,8 +9913,9 @@ static void DrawApp() {
 
     // ---- stage: preview + timeline on the left, inspector on the right
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    float panelW = ImGui::GetFontSize() * 25.0f;
-    if (panelW > avail.x * 0.38f) panelW = avail.x * 0.38f;
+    float panelW = g_panelWUser > 0 ? g_panelWUser : ImGui::GetFontSize() * 25.0f;
+    if (g_panelWUser <= 0 && panelW > avail.x * 0.38f) panelW = avail.x * 0.38f;
+    panelW = std::clamp(panelW, 180.0f, fmaxf(200.0f, avail.x - 320.0f));
 
     // Tracks grow downward, so give the timeline what it needs up to half the
     // stage — unless the splitter above the toolbar has been dragged, in which
@@ -9669,9 +9923,9 @@ static void DrawApp() {
     float tlAuto = 34.0f + 42.0f + g_baseH + 3.0f + 6.0f;
     for (auto& t : g_over)    tlAuto += t->height + 3.0f;
     for (auto& t : g_atracks) tlAuto += t->height + 3.0f;
-    const float SPLIT_H = 7.0f;
+    const float SPLIT_H = 10.0f;
     float tlHeight = g_tlHeightUser > 0 ? g_tlHeightUser : tlAuto;
-    float maxTl = g_tlHeightUser > 0 ? avail.y - 140.0f : avail.y * 0.55f;
+    float maxTl = g_tlHeightUser > 0 ? avail.y - 260.0f : avail.y * 0.43f;
     if (maxTl < 120.0f) maxTl = 120.0f;
     if (tlHeight > maxTl) tlHeight = maxTl;
     if (tlHeight < 120.0f) tlHeight = 120.0f;
@@ -9679,8 +9933,15 @@ static void DrawApp() {
     ImGui::BeginChild("##stage", ImVec2(avail.x - panelW - 8, 0), false);
     {
         ImVec2 inner = ImGui::GetContentRegionAvail();
-        DrawPreviewArea(ImVec2(inner.x, inner.y - tlHeight - 36 - SPLIT_H -
-                                        ImGui::GetStyle().ItemSpacing.y));
+        WorkspaceTransport();
+        float toolsWidth = (ImGui::CalcTextSize("ADD MEDIA").x + ImGui::GetStyle().FramePadding.x * 2 + 3) * 8 + 65;
+        float extraTools = (ceilf(toolsWidth / fmaxf(1, inner.x)) - 1) * ImGui::GetFrameHeightWithSpacing();
+        float previewH = fmaxf(70, inner.y - tlHeight - 174 - SPLIT_H - extraTools);
+        bool edgePreview = g_tl.drag == TimelineState::LeftEdge || g_tl.drag == TimelineState::RightEdge;
+        if (g_cutView || edgePreview) DrawCutViewer(ImVec2(inner.x, previewH));
+        else DrawPreviewArea(ImVec2(inner.x, previewH));
+        ImGui::TextDisabled("RHYTHM   shots / quiet / markers / scenes");
+        DrawRhythm();
         {   // the grab bar: drag to set the timeline height, double-click for auto
             ImVec2 sp = ImGui::GetCursorScreenPos();
             ImGui::InvisibleButton("##tlsplit", ImVec2(inner.x, SPLIT_H));
@@ -9708,24 +9969,102 @@ static void DrawApp() {
     }
     ImGui::EndChild();
 
-    ImGui::SameLine();
-    ImGui::BeginChild("##panel", ImVec2(0, 0), true);
+    ImGui::SameLine(0, 0);
+    {   // drag to set the side panel width, double-click to go back to auto
+        ImVec2 sp = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##panelsplit", ImVec2(8, fmaxf(1, avail.y)));
+        bool hot = ImGui::IsItemHovered() || ImGui::IsItemActive();
+        if (hot) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        if (ImGui::IsItemActive())            // left = a wider panel
+            g_panelWUser = panelW - ImGui::GetIO().MouseDelta.x;
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+            g_panelWUser = 0.0f;
+        ImDrawList* sdl = ImGui::GetWindowDrawList();
+        float cx = sp.x + 4, cy = sp.y + avail.y * 0.5f;
+        ImU32 col = hot ? IM_COL32(220, 220, 220, 220) : IM_COL32(110, 110, 110, 130);
+        for (int i = -2; i <= 2; i++)
+            sdl->AddRectFilled(ImVec2(cx - 1, cy + i * 9 - 3), ImVec2(cx + 1, cy + i * 9 + 3), col);
+        if (hot) ImGui::SetTooltip("drag to resize the panel · double-click for auto");
+    }
+    ImGui::SameLine(0, 0);
+    // The tabs live outside the panel: a rail of book tabs hanging off its left
+    // edge. Each rests tucked in; the live one slides out, runs under the panel
+    // border and takes its colour, so tab and page read as one sheet.
+    // One panel at a time, so the sidebar never becomes a long scroll. The rail
+    // carries short codes to stay narrow; hovering one names it in full.
+    struct PanelTab { const char* code; const char* name; };
+    static const PanelTab kPanels[] = {
+        {"SHT", "Shot"},   {"BEA", "Beat"},   {"TRK", "Tracks"},
+        {"COL", "Colour"}, {"PRJ", "Projector"}, {"OUT", "Output"},
+        {"BAK", "Backups"}, {"MED", "Media"}, {"CUT", "Cut"}, {"VER", "Versions"},
+    };
+    const int kPanelCount = (int)(sizeof(kPanels) / sizeof(kPanels[0]));
+    static int panelTab = 0;
+    static float slid[16] = {0};
+    // The existing requests name the old tabs: inspect, media, cut, versions.
+    const int kRequested[] = {0, 7, 8, 9};
+    if (g_workspaceTabRequest >= 0 && g_workspaceTabRequest < 4)
+        panelTab = kRequested[g_workspaceTabRequest];
+    g_workspaceTabRequest = -1;
+    float codeW = ImGui::CalcTextSize("PRJ").x;
+    const float slide = 9, railW = codeW + 12 + slide, tabH = ImGui::GetFontSize() + 12;
+    ImU32 pageCol = ImGui::GetColorU32(ImGuiCol_ChildBg);
+    if ((pageCol >> IM_COL32_A_SHIFT) < 8) pageCol = ImGui::GetColorU32(ImGuiCol_WindowBg);
+    ImVec2 railP = ImGui::GetCursorScreenPos();
+    ImDrawList* rdl = ImGui::GetWindowDrawList();
+    for (int i = 0; i < kPanelCount; i++) {
+        ImGui::PushID(i);
+        ImVec2 p(railP.x, railP.y + i * (tabH + 3));
+        ImGui::SetCursorScreenPos(p);
+        bool on = panelTab == i;
+        if (ImGui::InvisibleButton("##tab", ImVec2(railW, tabH))) panelTab = i;
+        bool hot = ImGui::IsItemHovered();
+        if (hot) ImGui::SetTooltip("%s", kPanels[i].name);
+        float want = on ? 1.f : hot ? .5f : 0.f;
+        slid[i] += (want - slid[i]) * std::clamp(ImGui::GetIO().DeltaTime * 16.f, 0.f, 1.f);
+        float x0 = p.x + slide * (1 - slid[i]);
+        ImVec2 q(p.x + railW + (on ? 8.f : 0.f), p.y + tabH);
+        rdl->AddRectFilled(ImVec2(x0, p.y), q,
+            on ? pageCol : IM_COL32(26, 30, 38, (int)(120 + 90 * slid[i])),
+            7, ImDrawFlags_RoundCornersLeft);
+        rdl->AddText(ImVec2(x0 + (railW - codeW) * .5f, p.y + (tabH - ImGui::GetFontSize()) * .5f),
+            on ? IM_COL32(236, 244, 255, 255) :
+            hot ? IM_COL32(200, 214, 230, 255) : IM_COL32(126, 140, 156, 255), kPanels[i].code);
+        ImGui::PopID();
+    }
+    ImGui::SetCursorScreenPos(ImVec2(railP.x + railW, railP.y));
+    // A borderless child drops its horizontal padding unless asked, and the page
+    // needs that margin to breathe against the tabs.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14, 10));
+    ImGui::BeginChild("##panel", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
     {
-        // One scrolling column in pipeline order: what a frame passes through on its
-        // way out of the app. Shot first, the encoder last. Click a header to fold.
-        static bool oShot = true, oTracks = true, oProj = true, oOut = false, oVault = false;
-        static bool oColor = false;
         ImGui::PushTextWrapPos(0.0f);
-        if (Reel("SHOT", &oShot))        DrawClipInspector();
-        if (Reel("TRACKS", &oTracks))    DrawTracksPanel();
-        if (Reel("COLOUR", &oColor))     DrawColorPanel();
-        if (Reel("PROJECTOR", &oProj))   DrawProjectorPanel();
-        if (Reel("OUTPUT", &oOut))       DrawOutputPanel();
-        if (Reel("BACKUPS", &oVault))    DrawVaultPanel();
+        bool edgePreview = g_tl.drag == TimelineState::LeftEdge || g_tl.drag == TimelineState::RightEdge;
+        if (edgePreview)
+            DrawConsequences(g_tl.rippleAt, -g_tl.holdShift, g_tl.dragIndex + 1, g_tl.holdFrom >= 0);
+        ImGui::SeparatorText(kPanels[panelTab].name);
+        switch (panelTab) {
+        case 0: DrawClipInspector();  break;
+        case 1: DrawBeatPanel();      break;
+        case 2: DrawTracksPanel();    break;
+        case 3: DrawColorPanel();     break;
+        case 4: DrawProjectorPanel(); break;
+        case 5: DrawOutputPanel();    break;
+        case 6: DrawVaultPanel();     break;
+        case 7: DrawLibrary();        break;
+        case 8:
+            g_cutView = true;
+            DrawCutControls();
+            ImGui::SeparatorText("Markers & scenes");
+            DrawMarkerPanel();
+            break;
+        case 9: DrawBranches();       break;
+        }
         ImGui::PopTextWrapPos();
         ImGui::Dummy(ImVec2(1, 12));
     }
     ImGui::EndChild();
+    ImGui::PopStyleVar();
 
     if (g_textOpenNew) {                    // asked for by the bar over the timeline
         g_textOpenNew = false;
@@ -9822,6 +10161,13 @@ static void DrawApp() {
         if (!g_playing.load() && g_playhead.load() >= tot - 1e-6) g_playhead.store(0.0);
         g_playing.store(!g_playing.load());
     }
+    if (g_playing.load() && !g_audioReady)
+        g_playhead.store(g_playhead.load() + ImGui::GetIO().DeltaTime);
+    if (g_audition && g_playing.load() && g_playhead.load() >= g_auditionOut) {
+        MixGuard lock;
+        if (g_auditionLoop) g_playhead.store(g_auditionIn);
+        else { g_playhead.store(g_auditionOut); g_playing.store(false); g_audition = false; }
+    }
     if (g_playing.load() && g_playhead.load() >= tot) {
         g_playing.store(false);
         g_playhead.store(tot);
@@ -9835,17 +10181,18 @@ static void DrawApp() {
     {
         MixGuard lock;
         g_videoAudio.clear();
-        double acc = 0;
-        for (auto& c : g_clips) {
-            if (!g_baseOff && !c->skip && c->useAudio && c->kind == Clip::Video && c->volume > 0.0f && c->vid && c->vid->audio && c->vid->audio->loaded) {
-                g_videoAudio.push_back(VideoAudioBlock{ c->vid->audio, acc, c->trimIn, c->duration, c->volume, c->reversed });
+        std::vector<BaseSpan> audioLayout;
+        BaseLayout(audioLayout);
+        for (size_t i = 0; i < g_clips.size(); ++i) {
+            auto& c = g_clips[i];
+            if (!g_baseOff && !c->skip && c->useAudio && c->kind == Clip::Video && c->volume > 0.0f && c->vid && c->vid->apeaksReady.load() && c->vid->audio && c->vid->audio->loaded) {
+                g_videoAudio.push_back(VideoAudioBlock{ c->vid->audio, audioLayout[i].start, c->trimIn, c->duration, c->volume, c->reversed });
             }
-            acc += c->duration;
         }
         for (auto& t : g_over) {
             if (!t->visible) continue;
             for (auto& c : t->clips) {
-                if (!c->skip && c->useAudio && c->kind == Clip::Video && c->volume > 0.0f && c->vid && c->vid->audio && c->vid->audio->loaded) {
+                if (!c->skip && c->useAudio && c->kind == Clip::Video && c->volume > 0.0f && c->vid && c->vid->apeaksReady.load() && c->vid->audio && c->vid->audio->loaded) {
                     g_videoAudio.push_back(VideoAudioBlock{ c->vid->audio, c->start, c->trimIn, c->duration, c->volume, c->reversed });
                 }
             }
@@ -9861,17 +10208,17 @@ static void ApplyStyle() {
     ImGuiStyle& s = ImGui::GetStyle();
     ImGui::StyleColorsDark();
     s.WindowRounding = 0;
-    s.ChildRounding = 4;
-    s.FrameRounding = 3;
+    s.ChildRounding = 8;
+    s.FrameRounding = 5;
     s.GrabRounding = 2;
     s.PopupRounding = 4;
     s.TabRounding = 3;
     s.ScrollbarRounding = 2;
-    s.ScrollbarSize = 9;
-    s.GrabMinSize = 9;
+    s.ScrollbarSize = 15;
+    s.GrabMinSize = 16;
     s.WindowPadding = ImVec2(10, 8);
-    s.FramePadding = ImVec2(9, 4);
-    s.ItemSpacing = ImVec2(6, 5);
+    s.FramePadding = ImVec2(10, 6);
+    s.ItemSpacing = ImVec2(8, 7);
     s.ItemInnerSpacing = ImVec2(6, 4);
     s.WindowBorderSize = 0;
     s.ChildBorderSize = 1;
@@ -9882,9 +10229,9 @@ static void ApplyStyle() {
     auto g = [](float v, float a = 1.0f) { return ImVec4(v, v, v, a); };
     ImVec4* c = s.Colors;
     c[ImGuiCol_Text]             = ImVec4(0.895f, 0.885f, 0.860f, 1);   // bone, not paper
-    c[ImGuiCol_TextDisabled]     = ImVec4(0.455f, 0.445f, 0.425f, 1);
-    c[ImGuiCol_WindowBg]         = ImVec4(0.040f, 0.039f, 0.037f, 1);   // film black
-    c[ImGuiCol_ChildBg]          = ImVec4(0.070f, 0.068f, 0.064f, 1);
+    c[ImGuiCol_TextDisabled]     = ImVec4(0.64f, 0.68f, 0.73f, 1);
+    c[ImGuiCol_WindowBg]         = ImVec4(0.045f, 0.058f, 0.077f, 1);
+    c[ImGuiCol_ChildBg]          = ImVec4(0.067f, 0.083f, 0.105f, 1);
     c[ImGuiCol_PopupBg]          = ImVec4(0.075f, 0.075f, 0.075f, 0.98f);
     c[ImGuiCol_Border]           = g(1.0f, 0.09f);
     c[ImGuiCol_FrameBg]          = g(0.145f);
@@ -9917,7 +10264,9 @@ static void ApplyStyle() {
     c[ImGuiCol_PlotHistogram]    = g(0.78f);
     c[ImGuiCol_PlotHistogramHovered] = g(0.92f);
     c[ImGuiCol_PlotLines]        = g(0.70f);
-    c[ImGuiCol_NavHighlight]     = g(1.0f, 0.35f);
+    c[ImGuiCol_NavHighlight]     = ImVec4(0.49f, 0.86f, 0.79f, 1);
+    c[ImGuiCol_CheckMark]        = ImVec4(0.49f, 0.86f, 0.79f, 1);
+    c[ImGuiCol_SliderGrab]       = ImVec4(0.38f, 0.72f, 0.67f, 1);
     c[ImGuiCol_DragDropTarget]   = g(1.0f, 0.70f);
 }
 
@@ -10018,7 +10367,40 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
+// TEMP SELFTEST
+static void RunUndoTest() {
+    std::string log;
+    auto count = []{ size_t n = 0; for (auto& t : g_atracks) n += t->blocks.size(); return n; };
+    std::string text = ReadTextFile(L"O:\\Data\\Temp\\claude\\undotest.slidecut");
+    log += "text bytes " + std::to_string(text.size()) + "\n";
+    bool ok = LoadProjectFromText(text, true);
+    log += "load " + std::to_string(ok) + " tracks " + std::to_string(g_atracks.size()) +
+           " blocks " + std::to_string(count()) + "\n";
+    UndoCapture();
+    log += "base bytes " + std::to_string(g_undoBase.size()) + " stack " + std::to_string(g_undo.size()) + "\n";
+    if (!g_atracks.empty() && !g_atracks[0]->blocks.empty()) {
+        MixGuard lock; g_atracks[0]->blocks.erase(g_atracks[0]->blocks.begin());
+    }
+    PruneEmptyTracks();
+    log += "after delete tracks " + std::to_string(g_atracks.size()) +
+           " blocks " + std::to_string(count()) + "\n";
+    UndoCapture();
+    log += "stack after capture " + std::to_string(g_undo.size()) + "\n";
+    UndoStep(false);
+    log += "after undo tracks " + std::to_string(g_atracks.size()) +
+           " blocks " + std::to_string(count()) + " stack " + std::to_string(g_undo.size()) + "\n";
+    std::string now = ProjectToText(true);
+    log += "roundtrip identical " + std::to_string(now == g_undoBase) + "\n";
+    WriteWholeFile(L"O:\\Data\\Temp\\claude\\undotest.log", log);
+}
+
+#include "edit_workspace_tests.h"
+
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
+    if (wcsstr(GetCommandLineW(), L"--workspace-test")) return RunWorkspaceTests();
+    if (wcsstr(GetCommandLineW(), L"--workspace-ui")) return RunWorkspaceUITests(hInst);
+    if (wcsstr(GetCommandLineW(), L"--workspace-media")) return RunWorkspaceUITests(hInst, true);
+    if (wcsstr(GetCommandLineW(), L"--undotest")) { RunUndoTest(); return 0; }
     InstallCrashHandler();          // before anything that can fault
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     ImGui_ImplWin32_EnableDpiAwareness();
@@ -10049,6 +10431,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     float dpi = ImGui_ImplWin32_GetDpiScaleForHwnd(hWnd);
     ImFont* font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 17.0f * dpi);
     if (!font) io.Fonts->AddFontDefault();

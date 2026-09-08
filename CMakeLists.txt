@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(SlideCut CXX)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,6 +22,15 @@ target_include_directories(SlideCut PRIVATE ${IMGUI} ${IMGUI}/backends third_par
 target_compile_definitions(SlideCut PRIVATE UNICODE _UNICODE)
 target_link_libraries(SlideCut PRIVATE d3d11 dxgi d3dcompiler ole32 uuid dwmapi winmm
                                        shell32 shlwapi dbghelp)
+if(BUILD_TESTING)
+    add_test(NAME workspace_compatibility COMMAND SlideCut --workspace-test)
+    add_test(NAME workspace_interface COMMAND SlideCut --workspace-ui)
+    find_program(SLIDECUT_FFMPEG ffmpeg)
+    if(SLIDECUT_FFMPEG)
+        add_test(NAME workspace_media COMMAND SlideCut --workspace-media)
+        set_tests_properties(workspace_media PROPERTIES TIMEOUT 45)
+    endif()
+endif()
 
 add_custom_command(TARGET SlideCut POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory

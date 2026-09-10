@@ -30,6 +30,13 @@ if(BUILD_TESTING)
         add_test(NAME workspace_media COMMAND SlideCut --workspace-media)
         set_tests_properties(workspace_media PROPERTIES TIMEOUT 45)
     endif()
+    # The projector HLSL is compiled at run time, so a clean build says nothing about
+    # whether it works. Compile it here instead of finding out in the preview.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME shader_compilation COMMAND ${Python3_EXECUTABLE}
+                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_shaders.py)
+    endif()
 endif()
 
 add_custom_command(TARGET SlideCut POST_BUILD

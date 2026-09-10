@@ -193,7 +193,28 @@ struct Grade {
 
 // How a clip fills a canvas its own aspect does not match. Per clip, base or layer.
 enum { LFIT_INSIDE = 0, LFIT_FILL, LFIT_BLUR, LFIT_BLACK };
+
+// Filling the canvas throws away whatever does not fit. This is which part of the
+// clip is kept: a 3x3 grid read left to right, top row first, so 0 is the top-left
+// corner and 4 is the middle.
+enum { LANCHOR_CENTER = 4 };
+static const char* LANCHOR_ITEMS[9] = {
+    "top left", "top", "top right",
+    "left", "centre", "right",
+    "bottom left", "bottom", "bottom right" };
+// 0 keeps the left/top edge, 0.5 the middle, 1 the right/bottom edge.
+static void AnchorFrac(int a, float* ax, float* ay) {
+    if (a < 0 || a > 8) a = LANCHOR_CENTER;
+    *ax = (float)(a % 3) * 0.5f;
+    *ay = (float)(a / 3) * 0.5f;
+}
 static const char* LFIT_ITEMS = "Inside\0" "Fill\0" "Blur bed\0" "Black bed\0";
+
+// A clip can swap the projector for a screen of its own. LOOK_PROJECTOR keeps the
+// film treatment; the tube looks bypass the plate entirely, since a television set
+// has no gate to sit in.
+enum { LOOK_PROJECTOR, LOOK_CRT, LOOK_CCTV, LOOK_CCTV_CRT };
+static const char* LOOK_ITEMS = "Projector\0CRT\0CCTV\0CCTV + CRT\0";
 
 struct Clip {
     int          uid = g_uidNext++;
@@ -215,6 +236,8 @@ struct Clip {
     int          group = 0;                // 0 = loose, else a group id
     int          nest = 0;                 // kind == Nest: the sequence it stands for
     bool         skip = false;             // muted: the film runs straight past it
+    int          look = LOOK_PROJECTOR;    // which screen this shot plays on
+    bool         look43 = false;           // crop that screen to real 4:3 glass
     Grade        grade;                    // this shot's own colour
     double       xfade = 0.0;              // dissolve into the next shot, seconds
     bool         useAudio = true;          // mix this clip's own audio into the export
@@ -231,6 +254,7 @@ struct Clip {
     // - blurred or black - behind it, which hides whatever is under without cropping
     // anything. Fill is the default: it covers, and nothing peeks out at the sides.
     int          lfit = LFIT_FILL;
+    int          lanchor = LANCHOR_CENTER;  // which part survives a fill crop
 
     // ---- text overlay (any clip kind; Text cards use it for placement too)
     bool         ovlOn = false;
@@ -1896,6 +1920,9 @@ static void SplitClipIn(std::vector<std::unique_ptr<Clip>>& v, int i, double off
     t->reversed = c.reversed;
     t->group = c.group;
     t->skip = c.skip;
+    t->lanchor = c.lanchor;
+    t->look = c.look;
+    t->look43 = c.look43;
     t->grade = c.grade;
     t->tex = c.tex;
     t->ovlOn = c.ovlOn; t->ovlText = c.ovlText; t->ovlScale = c.ovlScale;
@@ -2021,6 +2048,9 @@ static bool SplitNest(int index, double off) {
     nc->duration = n.duration - off;
     nc->reversed = n.reversed;
     nc->skip = n.skip;
+    nc->lanchor = n.lanchor;
+    nc->look = n.look;
+    nc->look43 = n.look43;
     nc->grade = n.grade;
     nc->lblend = n.lblend;
     nc->lopacity = n.lopacity;
@@ -2902,6 +2932,15 @@ static std::wstring ProjectorScriptPath() {
     return {};
 }
 
+// The clip shader helper sits wherever projector_render.py does.
+static std::wstring ClipShaderScriptPath() {
+    std::wstring r = ProjectorScriptPath();
+    if (r.empty()) return r;
+    size_t cut = r.find_last_of(L"\\/");
+    if (cut == std::wstring::npos) return L"";
+    return r.substr(0, cut + 1) + L"clip_shader_export.py";
+}
+
 static std::wstring ProjectorArgs(int W, int H, bool still) {
     wchar_t buf[900];
     swprintf(buf, 900,
@@ -2934,6 +2973,58 @@ static std::wstring ProjectorArgs(int W, int H, bool still) {
 // export still hands the finished file to projector_render.py.
 static bool g_projLive = false;
 
+static bool WriteWholeFile(const std::wstring& path, const std::string& data);
+
+// Which screen the cut is playing on at time t. A sequence claims the screen for
+// everything inside it; otherwise the shot resolved out of it speaks for itself.
+static void LookAtTime(double t, int* look, int* pillar) {
+    *look = LOOK_PROJECTOR;
+    *pillar = 0;
+    if (g_baseOff) return;
+    double start = 0;
+    int i = ClipAt(t, &start);
+    if (i < 0 || i >= (int)g_clips.size()) return;
+    Clip& c = *g_clips[i];
+    if (c.look != LOOK_PROJECTOR) {
+        *look = c.look;
+        *pillar = c.look43 ? 1 : 0;
+        return;
+    }
+    if (c.kind != Clip::Nest) return;
+    std::vector<NestHit> flat;
+    NestResolve(c, t - start, flat);
+    for (auto& h : flat) {
+        if (h.clip->look != LOOK_PROJECTOR) {
+            *look = h.clip->look;
+            *pillar = h.clip->look43 ? 1 : 0;
+            return;
+        }
+    }
+}
+
+// The same answer for every frame of the cut, run-length encoded as
+// "firstFrame frameCount look pillar", so the offline renderer can switch screens
+// frame by frame in one pass rather than the file being cut into pieces and joined
+// back up. Returns false when the whole cut is the projector and needs no schedule.
+static bool LookSchedule(std::string& out) {
+    out.clear();
+    const int n = (int)(TotalDuration() * g_fps + 0.5);
+    bool any = false;
+    int runLook = LOOK_PROJECTOR, runPillar = 0, runStart = 0;
+    for (int f = 0; f <= n; f++) {
+        int look = LOOK_PROJECTOR, pillar = 0;
+        if (f < n) LookAtTime((f + 0.5) / g_fps, &look, &pillar);
+        if (f == 0) { runLook = look; runPillar = pillar; continue; }
+        if (f < n && look == runLook && pillar == runPillar) continue;
+        out += std::to_string(runStart) + " " + std::to_string(f - runStart) + " "
+             + std::to_string(runLook) + " " + std::to_string(runPillar) + "\n";
+        if (runLook != LOOK_PROJECTOR) any = true;
+        runLook = look; runPillar = pillar; runStart = f;
+    }
+    return any;
+}
+
+
 // ------------------------------------------------------------------- export
 
 struct ExportJob {
@@ -2949,6 +3040,7 @@ struct ExportJob {
     std::string  message;
     int          stage = 1;               // 1 = ffmpeg encode, 2 = projector shader pass
     bool         wantProjector = false;   // run stage 2 when the encode succeeds
+    bool         lookSchedule = false;    // some of the cut plays on its own screen
     std::wstring stageTmp;                // stage-2 output, moved over outPath at the end
     bool         toClipboard = false;     // hand the finished file to the OS clipboard
     std::wstring stageExt;                // container the encode was actually built for
@@ -3457,7 +3549,8 @@ static void StartExport(const std::wstring& outPath) {
     // Everything lands on an rgba bed: where the clip does not reach and asks for no
     // bed of its own, the alpha is the mask, so a layer shows the cut underneath and a
     // base cut shows the wall - the same as the preview's transparent canvas.
-    auto FitOne = [&](int inIdx, const std::wstring& out, int lfit) {
+    auto FitOne = [&](int inIdx, const std::wstring& out, int lfit,
+                      int anchor = LANCHOR_CENTER) {
         wchar_t seg[768];
         int u = scratch++;
         if (lfit == LFIT_BLUR) {           // opaque blurred bed, the layer whole on top
@@ -3480,12 +3573,16 @@ static void StartExport(const std::wstring& outPath) {
                      L"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,format=rgba,setsar=1",
                      inIdx, FPS, W, H, W, H);
         } else if (lfit == LFIT_FILL) {    // crop until it covers the frame
+            float ax, ay;
+            AnchorFrac(anchor, &ax, &ay);
+            // The overflow is (iw-ow) wide; the anchor says how much of it comes
+            // off the left, so the preview and the render keep the same part.
             swprintf(seg, 768,
                      L"[%d:v]fps=%d,setpts=PTS-STARTPTS,"
                      L"scale=%d:%d:force_original_aspect_ratio=increase:"
                      L"flags=lanczos+accurate_rnd+full_chroma_int,"
-                     L"crop=%d:%d,format=rgba,setsar=1",
-                     inIdx, FPS, W, H, W, H);
+                     L"crop=%d:%d:(iw-ow)*%.1f:(ih-oh)*%.1f,format=rgba,setsar=1",
+                     inIdx, FPS, W, H, W, H, ax, ay);
         } else {
             swprintf(seg, 768,
                      L"[%d:v]fps=%d,setpts=PTS-STARTPTS,"
@@ -3534,7 +3631,14 @@ static void StartExport(const std::wstring& outPath) {
 
     // One clip's picture: fit to canvas, blend its double exposure, burn its text.
     // Leaves the result in [v<uid>].
-    auto ClipChain = [&](Clip& c, bool layer, bool reversed) {
+    // The inputs as they stand now: a shot that plays on its own screen is rendered
+    // on its own first, by re-running ffmpeg with these same inputs and just that
+    // shot's slice of the graph.
+    const std::wstring lookInputs = cmd;
+    std::string lookJobs;
+
+    auto ClipChain = [&](Clip& c, bool layer, bool reversed, int look = LOOK_PROJECTOR) {
+        const size_t chainStart = fc.size();
         wchar_t seg[768];
         wchar_t cur[32];
         swprintf(cur, 32, L"p%d", c.uid);
@@ -3544,7 +3648,7 @@ static void StartExport(const std::wstring& outPath) {
             swprintf(seg, 768, L"[%d:v]fps=%d,setsar=1[%ls];", vIn[c.uid], FPS, stage.c_str());
             fc += seg;
         } else {
-            FitOne(vIn[c.uid], stage, c.lfit);
+            FitOne(vIn[c.uid], stage, c.lfit, c.lanchor);
         }
 
         if (reversed && c.kind != Clip::Image) {
@@ -3572,7 +3676,7 @@ static void StartExport(const std::wstring& outPath) {
         if (dit != dIn.end()) {            // double exposure
             wchar_t dl[32];
             swprintf(dl, 32, L"d%d", c.uid);
-            FitOne(dit->second, dl, c.lfit);
+            FitOne(dit->second, dl, c.lfit, c.lanchor);
             wchar_t out[32];
             swprintf(out, 32, L"x%d", c.uid);
             int bm = c.dxBlend;
@@ -3608,10 +3712,30 @@ static void StartExport(const std::wstring& outPath) {
             swprintf(seg, 768, L"[%ls]null[v%d];", stage.c_str(), c.uid);
             fc += seg;
         }
+
+        // A shot on its own screen is rendered by itself, before any track blending, so
+        // the render matches the preview: whatever is layered over it stays off the
+        // glass. Its slice of the graph is lifted out here and replaced by the file
+        // that slice will have produced.
+        if (look != LOOK_PROJECTOR) {
+            const std::string name = "look_" + std::to_string(c.uid);
+            const std::wstring graph = fc.substr(chainStart);
+            if (!WriteWholeFile(g_workDir + Widen(name + ".graph"), Narrow(graph)))
+                lookJobs += "ERROR\n";
+            lookJobs += name + " " + std::to_string(look) + " "
+                      + std::to_string(c.duration) + (c.look43 ? " 1" : " 0") + "\n";
+            fc.resize(chainStart);
+            // No fps filter here: the renderer already wrote exactly this shot's frames
+            // at the project rate, and an fps pass over them drops the last one.
+            wchar_t back[256];
+            swprintf(back, 256, L"movie=%ls.mkv,settb=1/%d,setpts=N,setsar=1[v%d];",
+                     Widen(name).c_str(), FPS, c.uid);
+            fc += back;
+        }
     };
 
-    for (auto& c : g_clips) if (!c->skip) ClipChain(*c, false, c->reversed);
-    for (Clip* c : layers)  if (c->kind != Clip::Nest) ClipChain(*c, true, c->reversed);
+    for (auto& c : g_clips) if (!c->skip) ClipChain(*c, false, c->reversed, c->look);
+    for (Clip* c : layers)  if (c->kind != Clip::Nest) ClipChain(*c, true, c->reversed, c->look);
 
     if (clipAudio) {                       // one audio block per clip, exact length
         for (size_t i = 0; i < g_clips.size(); i++) {
@@ -3708,7 +3832,8 @@ static void StartExport(const std::wstring& outPath) {
             if (placed) {
                 pic = EmitNest(*it.clip, it.start, it.rev);
             } else {
-                ClipChain(*it.clip, true, it.rev);
+                ClipChain(*it.clip, true, it.rev,
+                          n.look != LOOK_PROJECTOR ? n.look : it.clip->look);
                 wchar_t v[32];
                 swprintf(v, 32, L"v%d", it.clip->uid);
                 pic = v;
@@ -3912,7 +4037,29 @@ static void StartExport(const std::wstring& outPath) {
     if (g_faststart && g_container != CT_MKV) cmd += L" -movflags +faststart";
     cmd += L" \"" + outPath + L"\"";
 
-    g_export.cmd = Narrow(cmd);
+    // Shots that play on a screen of their own are rendered one at a time first, so
+    // a helper drives the whole run: the per-shot passes, then this command. Without
+    // any, ffmpeg is launched directly exactly as before.
+    std::wstring launch = cmd;
+    if (!lookJobs.empty()) {
+        std::wstring helper = ClipShaderScriptPath();
+        if (helper.empty()) {
+            g_export.failed = true;
+            g_export.message = "clip_shader_export.py was not found next to the exe.";
+            return;
+        }
+        if (!WriteWholeFile(g_workDir + L"looks.jobs", lookJobs) ||
+            !WriteWholeFile(g_workDir + L"looks.inputs", Narrow(lookInputs)) ||
+            !WriteWholeFile(g_workDir + L"looks.final", Narrow(cmd)) ||
+            !WriteWholeFile(g_workDir + L"looks.args", Narrow(ProjectorArgs(W, H, false)))) {
+            g_export.failed = true;
+            g_export.message = "Could not stage the clip shader jobs.";
+            return;
+        }
+        launch = Widen(g_pythonExe) + L" \"" + helper + L"\"";
+    }
+
+    g_export.cmd = Narrow(launch);
     g_export.outPath = outPath;
     g_export.stageExt = ContainerExt(g_container);
     g_export.logFile = std::wstring(tmp) + L"slidecut_ffmpeg.log";
@@ -3929,14 +4076,15 @@ static void StartExport(const std::wstring& outPath) {
     si.hStdError = log;
     si.hStdOutput = log;
     PROCESS_INFORMATION pi = {};
-    std::vector<wchar_t> mut(cmd.begin(), cmd.end());
+    std::vector<wchar_t> mut(launch.begin(), launch.end());
     mut.push_back(0);
     BOOL ok = CreateProcessW(nullptr, mut.data(), nullptr, nullptr, TRUE,
                              CREATE_NO_WINDOW, nullptr, g_workDir.c_str(), &si, &pi);
     if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
     if (!ok) {
         g_export.failed = true;
-        g_export.message = "Could not launch ffmpeg (is it on PATH?)";
+        g_export.message = lookJobs.empty() ? "Could not launch ffmpeg (is it on PATH?)"
+                                            : "Could not launch python for the clip shaders.";
         return;
     }
     CloseHandle(pi.hThread);
@@ -3946,7 +4094,14 @@ static void StartExport(const std::wstring& outPath) {
     g_export.active = true;
     g_export.failed = false;
     g_export.stage = 1;
+    // The screens are already baked in by the per-shot passes above, so stage 2 is
+    // only ever the film look. The schedule tells it which frames to leave alone:
+    // a shot that played on a tube must not then be projected onto a wall.
+    std::string schedule;
+    const bool anyLook = LookSchedule(schedule);
     g_export.wantProjector = g_projOn;
+    g_export.lookSchedule = anyLook && g_projOn;
+    if (g_export.lookSchedule) WriteWholeFile(g_workDir + L"looks.schedule", schedule);
     g_export.message = "Encoding…";
 }
 
@@ -3966,6 +4121,8 @@ static bool StartProjectorPass() {
     DeleteFileW(g_export.stageTmp.c_str());
     std::wstring cmd = Widen(g_pythonExe) + L" \"" + script + L"\" \"" + g_export.outPath +
                        L"\" -o \"" + g_export.stageTmp + L"\"" + ProjectorArgs(W, H, false);
+    if (g_export.lookSchedule)
+        cmd += L" --look-schedule \"" + g_workDir + L"looks.schedule\"";
     g_export.cmd = Narrow(cmd);
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
@@ -6454,6 +6611,7 @@ struct ProjCB {
     float fxFlicker;       float fxDust;     float fxHair;    float fxScratch;
     float fxVignette;      float pad1[3];
     float gBright;         float gContrastM1; float gSatM1;  float gTemp;
+    float lookMode;        float lookPillar;  float lookPad[2];
 };
 static_assert(sizeof(ProjCB) % 16 == 0, "cbuffer must be 16-byte aligned");
 
@@ -6474,6 +6632,7 @@ cbuffer CB : register(b0) {
     float  fxFlicker; float fxDust;   float fxHair;  float fxScratch;
     float  fxVignette; float3 pad1;
     float  gBright;    float gContrastM1;  float gSatM1;  float gTemp;
+    float  lookMode;   float lookPillar;   float2 lookPad;
 };
 Texture2D    tex0 : register(t0);      // source / top layer
 Texture2D    tex1 : register(t1);      // bottom layer, blend pass only
@@ -6556,7 +6715,13 @@ float4 sampleSrc(float2 uv) {
     return tex0.Sample(samp, clamp(uv, 0.0, 1.0) * srcScale + srcOffset);
 }
 
+)HLSL"
+#include "../surveillance_shader.h"
+R"HLSL(
+
 float4 PSProjector(VSOut input) : SV_Target {
+    // A tube is not a projector: no plate, no gate, no wall behind it.
+    if (lookMode >= 1.0) return Surveillance(input.uv);
     float2 tc = input.uv;                       // y down
     float2 px = tc * outSize;
     float2 uv0 = (px - plateOrg) / plateSize;
@@ -6841,7 +7006,8 @@ static void SetCB(const ProjCB& cb) {
 
 // Draw one texture into the offscreen canvas, cover- or contain-fitted.
 static void CompositeQuad(ID3D11ShaderResourceView* srv, float aspect, bool cover,
-                          float alpha, int w, int h, const Grade* g = nullptr) {
+                          float alpha, int w, int h, const Grade* g = nullptr,
+                          int anchor = LANCHOR_CENTER) {
     if (!srv) return;
     ProjCB cb = {};
     if (g) {
@@ -6854,8 +7020,10 @@ static void CompositeQuad(ID3D11ShaderResourceView* srv, float aspect, bool cove
     float u0 = 0, v0 = 0, u1 = 1, v1 = 1;
     float x0 = -1, y0 = -1, x1 = 1, y1 = 1;     // NDC, y up
     if (cover) {
-        if (aspect > boxA) { float f = boxA / aspect; u0 = 0.5f - f * 0.5f; u1 = 0.5f + f * 0.5f; }
-        else               { float f = aspect / boxA; v0 = 0.5f - f * 0.5f; v1 = 0.5f + f * 0.5f; }
+        float ax, ay;
+        AnchorFrac(anchor, &ax, &ay);
+        if (aspect > boxA) { float f = boxA / aspect; u0 = (1.0f - f) * ax; u1 = u0 + f; }
+        else               { float f = aspect / boxA; v0 = (1.0f - f) * ay; v1 = v0 + f; }
     } else {
         float fw = 2.0f, fh = 2.0f;
         if (aspect > boxA) fh = 2.0f * (boxA / aspect);
@@ -6943,7 +7111,9 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
     int curAt[PROJ_MAX_DEPTH + 1] = {};
     auto blendElement = [&](int depth, ID3D11ShaderResourceView* srv, float ar, int mode,
                             float opacity, const Grade* grade, bool fitCover,
-                            int bed = LFIT_INSIDE) {
+                            int bed = LFIT_INSIDE, int look = LOOK_PROJECTOR,
+                            bool pillar = false, double effectTime = 0.0,
+                            int anchor = LANCHOR_CENTER) {
         if (!srv || opacity <= 0.001f) return;
         const int T = TargetBase(depth);
         const int stage = T + 2;
@@ -6957,8 +7127,35 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
         // The blurred bed is a cover-fitted copy of the layer under the whole frame.
         // The preview does not blur it - the export's gblur is the real thing - but it
         // is opaque and the right colours, so the cut underneath stays hidden here too.
-        if (bed == LFIT_BLUR) CompositeQuad(srv, ar, true, 1.0f, outW, outH, grade);
-        CompositeQuad(srv, ar, fitCover, 1.0f, outW, outH, grade);
+        if (bed == LFIT_BLUR) CompositeQuad(srv, ar, true, 1.0f, outW, outH, grade, anchor);
+        CompositeQuad(srv, ar, fitCover, 1.0f, outW, outH, grade, anchor);
+
+        // 1b. a shot on its own screen runs the look here, on the element alone, so the
+        // treatment lands before track blending rather than over the finished frame.
+        ID3D11ShaderResourceView* element = g_projSRV[stage];
+        if (look != LOOK_PROJECTOR) {
+            // No plate, no gate, no wall: a set needs only the frame, the clock and
+            // the strength.
+            ProjCB fx = {};
+            fx.outSize[0] = (float)outW;
+            fx.outSize[1] = (float)outH;
+            fx.time = (float)(effectTime + g_projTimeOffset);
+            fx.intensity = g_projIntensity < 0 ? 0 : (g_projIntensity > 1 ? 1 : g_projIntensity);
+            fx.lookMode = (float)look;
+            fx.lookPillar = pillar ? 1.0f : 0.0f;
+            SetCB(fx);
+            ID3D11ShaderResourceView* empty[2] = { nullptr, nullptr };
+            g_d3dContext->PSSetShaderResources(0, 2, empty);
+            g_d3dContext->OMSetRenderTargets(1, &g_projRTV[3], nullptr);
+            g_d3dContext->ClearRenderTargetView(g_projRTV[3], clear);
+            g_d3dContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g_d3dContext->VSSetShader(g_fsVS, nullptr, 0);
+            g_d3dContext->PSSetShader(g_projPS, nullptr, 0);
+            g_d3dContext->PSSetShaderResources(0, 1, &element);
+            g_d3dContext->Draw(3, 0);
+            g_d3dContext->PSSetShaderResources(0, 2, empty);
+            element = g_projSRV[3];
+        }
 
         // 2. blend it over the canvas into the other target
         int dst = curAt[depth] ^ 1;
@@ -6969,7 +7166,7 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
         ID3D11ShaderResourceView* none2[2] = { nullptr, nullptr };
         g_d3dContext->PSSetShaderResources(0, 2, none2);
         g_d3dContext->OMSetRenderTargets(1, &g_projRTV[T + dst], nullptr);
-        ID3D11ShaderResourceView* srvs[2] = { g_projSRV[stage], g_projSRV[T + curAt[depth]] };
+        ID3D11ShaderResourceView* srvs[2] = { element, g_projSRV[T + curAt[depth]] };
         g_d3dContext->PSSetShaderResources(0, 2, srvs);
         g_d3dContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_d3dContext->VSSetShader(g_fsVS, nullptr, 0);
@@ -6981,8 +7178,13 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
 
     // A clip is its picture (mode/opacity of its track) followed by its double
     // exposure, blended in its own mode at its own amount.
-    std::function<void(Clip&, double, int, float, int)> compositeClip;
-    compositeClip = [&](Clip& c, double local, int mode, float opacity, int depth) {
+    // `claimed` means a sequence above this clip already put it on a screen of its
+    // own, so the clip's own look is not applied a second time inside it.
+    std::function<void(Clip&, double, int, float, int, bool)> compositeClip;
+    compositeClip = [&](Clip& c, double local, int mode, float opacity, int depth,
+                        bool claimed) {
+        const int look = claimed ? LOOK_PROJECTOR : c.look;
+        const bool claims = claimed || c.look != LOOK_PROJECTOR;
         if (c.kind == Clip::Nest) {
             // A sequence is one picture, not a bag of clips. Its cut and its own
             // layers composite onto a canvas of its own - each with the mode it was
@@ -7001,7 +7203,7 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
                 NestResolve(c, local, flat);
                 for (auto& h : flat)
                     compositeClip(*h.clip, h.local, h.mode ? h.mode : mode,
-                                  opacity * h.opacity, depth);
+                                  opacity * h.opacity, depth, claims);
                 return;
             }
             const int T2 = TargetBase(d2);
@@ -7009,10 +7211,12 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
             g_d3dContext->ClearRenderTargetView(g_projRTV[T2], clear);
             g_d3dContext->ClearRenderTargetView(g_projRTV[T2 + 1], clear);
             for (auto& k : kids)
-                compositeClip(*k.clip, k.local, k.mode, k.opacity, d2);
-            // The canvas already matches the output frame, so it goes in 1:1.
+                compositeClip(*k.clip, k.local, k.mode, k.opacity, d2, claims);
+            // The canvas already matches the output frame, so it goes in 1:1. If the
+            // sequence owns a screen, the finished canvas is what plays on it.
             blendElement(depth, g_projSRV[T2 + curAt[d2]], (float)outW / (float)outH,
-                         mode, opacity, nullptr, true);
+                         mode, opacity, nullptr, true, LFIT_INSIDE, look, c.look43, local,
+                         c.lanchor);
             return;
         }
         ID3D11ShaderResourceView* srv = nullptr;
@@ -7026,7 +7230,7 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
             ar = c.texAspect;
         }
         if (srv) blendElement(depth, srv, ar, mode, opacity, &c.grade,
-                              c.lfit == LFIT_FILL, c.lfit);
+                              c.lfit == LFIT_FILL, c.lfit, look, c.look43, local, c.lanchor);
         if (c.dxOn) {
             ID3D11ShaderResourceView* lay = c.dxTex;
             float la = c.dxAspect;
@@ -7036,17 +7240,18 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
             }
             // the double-exposure list starts at "screen", the layer list at "normal"
             if (lay) blendElement(depth, lay, la, c.dxBlend + 1, opacity * c.dxAmount,
-                                  &c.grade, c.lfit == LFIT_FILL, c.lfit);
+                                  &c.grade, c.lfit == LFIT_FILL, c.lfit, look, c.look43, local,
+                                  c.lanchor);
         }
     };
 
     g_d3dContext->ClearRenderTargetView(g_projRTV[1], clear);
-    if (ci >= 0 && !g_baseOff) compositeClip(*g_clips[ci], ph - clipStart, 0, 1.0f, 0);
+    if (ci >= 0 && !g_baseOff) compositeClip(*g_clips[ci], ph - clipStart, 0, 1.0f, 0, false);
     for (auto& tr : g_over) {
         if (!tr->visible) continue;
         for (auto& c : tr->clips)
             if (!c->skip && ph >= c->start && ph < c->start + c->duration)
-                compositeClip(*c, ph - c->start, c->lblend, c->lopacity, 0);
+                compositeClip(*c, ph - c->start, c->lblend, c->lopacity, 0, false);
     }
     int cur = curAt[0];
 
@@ -7066,7 +7271,12 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
         cur = dst;
     }
 
-    if (!applyFilm) {                      // compositing only, no film look
+    // A shot playing on its own screen is not being projected: the look already ran
+    // on it during compositing, so no plate, gate or wall goes over the top.
+    int lookNow = LOOK_PROJECTOR, pillarNow = 0;
+    LookAtTime(ph, &lookNow, &pillarNow);
+
+    if (!applyFilm || lookNow != LOOK_PROJECTOR) {   // compositing only, no film look
         g_d3dContext->OMSetRenderTargets(1, &oldRTV, oldDSV);
         if (oldRTV) oldRTV->Release();
         if (oldDSV) oldDSV->Release();
@@ -7137,14 +7347,17 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
 
 // Fill `a`..`b` with a texture, cropping (cover) or letterboxing (contain).
 static void DrawFitted(ImDrawList* dl, ImTextureID tex, float aspect,
-                       ImVec2 a, ImVec2 b, bool cover, ImU32 tint) {
+                       ImVec2 a, ImVec2 b, bool cover, ImU32 tint,
+                       int anchor = LANCHOR_CENTER) {
     float bw = b.x - a.x, bh = b.y - a.y;
     if (bw <= 1 || bh <= 1 || aspect <= 0) return;
     float boxA = bw / bh;
     if (cover) {
         ImVec2 uv0(0, 0), uv1(1, 1);
-        if (aspect > boxA) { float f = boxA / aspect; uv0.x = 0.5f - f * 0.5f; uv1.x = 0.5f + f * 0.5f; }
-        else               { float f = aspect / boxA; uv0.y = 0.5f - f * 0.5f; uv1.y = 0.5f + f * 0.5f; }
+        float ax, ay;
+        AnchorFrac(anchor, &ax, &ay);
+        if (aspect > boxA) { float f = boxA / aspect; uv0.x = (1.0f - f) * ax; uv1.x = uv0.x + f; }
+        else               { float f = aspect / boxA; uv0.y = (1.0f - f) * ay; uv1.y = uv0.y + f; }
         dl->AddImage(tex, a, b, uv0, uv1, tint);
     } else {
         float w = bw, h = w / aspect;
@@ -7249,7 +7462,7 @@ static void DrawPreviewArea(ImVec2 size) {
             double at = c.reversed ? c.duration - local : local;
             ID3D11ShaderResourceView* fr = ProxyFrame(*c.vid, c.trimIn + at);
             if (fr) DrawFitted(dl, (ImTextureID)fr, c.vid->aspect > 0 ? c.vid->aspect : 1.0f,
-                               f0, f1, c.lfit == LFIT_FILL, tint);
+                               f0, f1, c.lfit == LFIT_FILL, tint, c.lanchor);
             else {
                 const char* msg = c.vid->probed.load() ? "building preview…" : "reading video…";
                 ImVec2 ts = ImGui::CalcTextSize(msg);
@@ -7257,7 +7470,8 @@ static void DrawPreviewArea(ImVec2 size) {
                             IM_COL32(130, 130, 130, 255), msg);
             }
         } else if (c.kind == Clip::Image && c.tex) {
-            DrawFitted(dl, (ImTextureID)c.tex, c.texAspect, f0, f1, c.lfit == LFIT_FILL, tint);
+            DrawFitted(dl, (ImTextureID)c.tex, c.texAspect, f0, f1, c.lfit == LFIT_FILL, tint,
+                       c.lanchor);
         } else if (c.kind == Clip::Text) {
             dl->AddRectFilled(f0, f1, IM_COL32(0, 0, 0, a));
         }
@@ -7666,6 +7880,57 @@ static void DrawClipInspector() {
                               "Fill: crop this clip until it covers.\n"
                               "Blur bed / Black bed: keep this clip whole and hide\n"
                               "  what is behind it, cropping neither.");
+
+        // Filling crops, so say which part of the shot survives. Only the axis that
+        // actually overflows can move, which is why one row or column of the grid
+        // will look inert on a clip that only overflows the other way.
+        ImGui::BeginDisabled(c.lfit != LFIT_FILL);
+        Prop("keep");
+        float cell = ImGui::GetFrameHeight();
+        ImGui::BeginGroup();
+        for (int row = 0; row < 3; row++) {
+            for (int col = 0; col < 3; col++) {
+                int a = row * 3 + col;
+                if (col) ImGui::SameLine(0.0f, 2.0f);
+                ImGui::PushID(a);
+                bool on = c.lanchor == a;
+                if (on) ImGui::PushStyleColor(ImGuiCol_Button,
+                                              ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                if (ImGui::Button("##anchor", ImVec2(cell, cell))) {
+                    c.lanchor = a;
+                    ForEachOtherSelected(c, [&](Clip& o) { o.lanchor = a; });
+                }
+                if (on) ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", LANCHOR_ITEMS[a]);
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndGroup();
+        ImGui::EndDisabled();
+    }
+
+    {                                       // which screen this shot plays on
+        ImGui::SeparatorText("screen");
+        if (SegRow("look", &c.look, LOOK_ITEMS))
+            ForEachOtherSelected(c, [&](Clip& o) { o.look = c.look; });
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Projector: the film treatment, as the projector panel sets it.\n"
+                              "CRT: play this shot on the glass of a tube set.\n"
+                              "CCTV: a low-bandwidth monochrome camera feed.\n"
+                              "CCTV + CRT: that feed shown on the tube.\n"
+                              "The tube looks bypass the plate and gate entirely.\n"
+                              "On a sequence, the screen it picks overrides every\n"
+                              "clip inside it.");
+        ImGui::BeginDisabled(c.look == LOOK_PROJECTOR);
+        Prop("4:3 glass");
+        if (ImGui::Checkbox("##look43", &c.look43))
+            ForEachOtherSelected(c, [&](Clip& o) { o.look43 = c.look43; });
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("A tube and a CCTV monitor are 4:3 objects. On, the set keeps the\n"
+                              "full frame height and crops the frame to a centred 4:3 window,\n"
+                              "so the side edges are lost and nothing is rescaled.\n"
+                              "Off, the set fills the whole frame.");
+        ImGui::EndDisabled();
     }
 
     if (isLayer) {                          // how this layer sits over the cut
@@ -8038,6 +8303,9 @@ static void WriteClip(std::string& o, const Clip& c, int track, int seq = 0) {
     PutI(o, "track", track);
     PutI(o, "nest", c.nest);
     PutI(o, "skip", c.skip);
+    PutI(o, "lanchor", c.lanchor);
+    PutI(o, "look", c.look);
+    PutI(o, "look43", c.look43);
     PutN(o, "gBright", c.grade.bright);
     PutN(o, "gContrast", c.grade.contrast);
     PutN(o, "gSat", c.grade.sat);
@@ -8295,6 +8563,9 @@ static Clip* MakeClipFromKV(const KV& kv) {
     c->group = kv.i("group", 0);
     c->nest = kv.i("nest", 0);
     c->skip = kv.b("skip");
+    c->lanchor = std::clamp(kv.i("lanchor", LANCHOR_CENTER), 0, 8);
+    c->look = std::clamp(kv.i("look"), 0, (int)LOOK_CCTV_CRT);
+    c->look43 = kv.b("look43");
     c->grade.bright = (float)kv.num("gBright", 0.0);
     c->grade.contrast = (float)kv.num("gContrast", 1.0);
     c->grade.sat = (float)kv.num("gSat", 1.0);

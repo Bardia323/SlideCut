@@ -33,6 +33,7 @@ Examples
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import json
 import os
 import shutil
@@ -440,6 +441,17 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("Examples")[-1],
     )
+    p.add_argument("--look", type=int, default=0,
+                   help="play every frame on this screen instead of through the "
+                        "projector: 1 CRT, 2 CCTV, 3 CCTV on a CRT. The plate, gate "
+                        "and wall are skipped entirely -- a set is not a projector.")
+    p.add_argument("--pillarbox", action="store_true",
+                   help="with --look, crop the frame to a centred 4:3 window, the "
+                        "shape a tube and a CCTV monitor actually are")
+    p.add_argument("--look-schedule", metavar="FILE",
+                   help="'firstFrame count look pillar' lines saying which frames "
+                        "already played on a screen of their own. Those frames are "
+                        "passed through untouched; the rest still get the film look.")
     p.add_argument("input", help="source image or video")
     p.add_argument("-o", "--output", required=True,
                    help="output file (.mp4/.mov/.mkv/.webm, or .png for a still)")
@@ -532,6 +544,58 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit(f"could not create an OpenGL 3.3 context: {exc}")
 
     quad = ctx.buffer(np.array([-1, -1, 3, -1, -1, 3], dtype="f4").tobytes())
+
+    # Frames that already played on a screen of their own during compositing. The film
+    # look must not run over the top of them a second time.
+    skip_film = []
+    if args.look_schedule:
+        for line in Path(args.look_schedule).read_text(encoding="utf-8-sig").splitlines():
+            if not line.strip():
+                continue
+            first, count, look, _pillar = (int(v) for v in line.split())
+            if first + count > len(skip_film):
+                skip_film.extend([False] * (first + count - len(skip_film)))
+            for i in range(first, first + count):
+                skip_film[i] = look != 0
+
+    # Frames the film has to leave alone still have to reach the encoder, so they get
+    # a straight blit in the same orientation the plate path would have written.
+    copy_prog = copy_vao = None
+    if any(skip_film):
+        copy_prog = ctx.program(vertex_shader=VERTEX, fragment_shader="""#version 330
+    uniform sampler2D tex0;
+    in vec2 v_uv;
+    out vec4 f_color;
+    void main() { f_color = texture(tex0, vec2(v_uv.x, 1.0 - v_uv.y)); }""")
+        copy_vao = ctx.vertex_array(copy_prog, [(quad, "2f", "in_pos")])
+        copy_prog["tex0"] = 0
+
+    signal_prog = signal_vao = None
+    if args.look:
+        # The live HLSL and this GLSL are the same expressions, translated: the header
+        # is the one source of truth for how a tube or a camera looks.
+        body = Path(__file__).with_name("surveillance_shader.h").read_text(encoding="utf-8-sig")
+        body = body.split('R"SIGNAL(', 1)[1].rsplit(')SIGNAL"', 1)[0]
+        body = body.replace("tex0.Sample(samp, ", "texture(tex0, ")
+        for old, new in (("float2", "vec2"), ("float3", "vec3"), ("float4", "vec4"),
+                         ("frac(", "fract("), ("lerp(", "mix("), ("fmod(", "mod(")):
+            body = body.replace(old, new)
+        signal_prog = ctx.program(vertex_shader=VERTEX, fragment_shader="""#version 330
+    uniform sampler2D tex0;
+    uniform float time, lookMode, intensity, lookPillar;
+    uniform vec2 outSize;
+    in vec2 v_uv;
+    out vec4 f_color;
+    float saturate(float v) { return clamp(v, 0.0, 1.0); }
+    vec2 saturate(vec2 v) { return clamp(v, 0.0, 1.0); }
+    vec3 saturate(vec3 v) { return clamp(v, 0.0, 1.0); }
+    """ + body + "\nvoid main() { f_color = Surveillance(vec2(v_uv.x, 1.0-v_uv.y)); }")
+        signal_vao = ctx.vertex_array(signal_prog, [(quad, "2f", "in_pos")])
+        signal_prog["tex0"] = 0
+        signal_prog["outSize"] = (float(out_w), float(out_h))
+        signal_prog["intensity"] = float(np.clip(args.intensity, 0.0, 1.0))
+        signal_prog["lookMode"] = float(args.look)
+        signal_prog["lookPillar"] = 1.0 if args.pillarbox else 0.0
 
     prog_plate = ctx.program(vertex_shader=VERTEX, fragment_shader=PLATE_FRAG)
     prog_gate = ctx.program(vertex_shader=VERTEX, fragment_shader=GATE_FRAG)
@@ -637,16 +701,32 @@ def main(argv: list[str] | None = None) -> int:
 
             t = args.time_offset + written / fps
 
-            src_tex.use(0)
-            fbo_plate.use()
-            ctx.clear(0.0, 0.0, 0.0, 0.0)
-            prog_plate["u_time"] = t
-            vao_plate.render(moderngl.TRIANGLES)
+            played = skip_film[written] if written < len(skip_film) else False
+            if signal_vao is not None:
+                # No plate, no gate, no wall: this frame IS the screen.
+                src_tex.use(0)
+                fbo_out.use()
+                ctx.clear(0.0, 0.0, 0.0, 1.0)
+                signal_prog["time"] = t
+                signal_vao.render(moderngl.TRIANGLES)
+            elif played:
+                # This shot already ran its own screen before the tracks were blended,
+                # so the projector has no business touching it now: copy it straight.
+                src_tex.use(0)
+                fbo_out.use()
+                ctx.clear(0.0, 0.0, 0.0, 1.0)
+                copy_vao.render(moderngl.TRIANGLES)
+            else:
+                src_tex.use(0)
+                fbo_plate.use()
+                ctx.clear(0.0, 0.0, 0.0, 0.0)
+                prog_plate["u_time"] = t
+                vao_plate.render(moderngl.TRIANGLES)
 
-            plate_tex.use(0)
-            fbo_out.use()
-            prog_gate["u_time"] = t
-            vao_gate.render(moderngl.TRIANGLES)
+                plate_tex.use(0)
+                fbo_out.use()
+                prog_gate["u_time"] = t
+                vao_gate.render(moderngl.TRIANGLES)
 
             fbo_out.read_into(out_view, components=3)
             enc.stdin.write(out_view)                          # type: ignore[union-attr]

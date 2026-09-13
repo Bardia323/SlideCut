@@ -9,6 +9,18 @@ float signalHash2(float2 p) {
     p += dot(p, p + 45.32);
     return frac(p.x * p.y);
 }
+// Hashed value noise with a smooth blend between cells: grain with a size of its own
+// instead of a fizz exactly one output pixel wide, which is what an encoder smears.
+float valueNoise(float2 p) {
+    float2 i = floor(p);
+    float2 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = signalHash2(i);
+    float b = signalHash2(i + float2(1.0, 0.0));
+    float c = signalHash2(i + float2(0.0, 1.0));
+    float d = signalHash2(i + float2(1.0, 1.0));
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
 // A 525-line set carries 480 active lines with SQUARE pixels, so the horizontal
 // sample count follows the glass's own aspect: 640x480 on 4:3, 853x480 on 16:9.
 // Deriving it keeps sensor pixels and beam smear from stretching on a wide set.
@@ -24,22 +36,30 @@ float boxMask(float2 c) {
     float2 m = saturate(d / w + 0.5);
     return m.x * m.y;
 }
+// The source through a small vertical low-pass half a signal line tall, so no single
+// point of a sharp source picture can decide what an analog line carries.
+float3 signalTapV(float2 uv, float dy) {
+    return tex0.Sample(samp, uv - float2(0, dy)).rgb * 0.25
+         + tex0.Sample(samp, uv).rgb * 0.50
+         + tex0.Sample(samp, uv + float2(0, dy)).rgb * 0.25;
+}
 float3 signalSample(float2 uv, bool camera, float2 size) {
     float2 grid = signalGrid(size);
     float tx = 1.0 / grid.x;
     float3 c = float3(0, 0, 0);
     if (camera) {
-        // A security camera resolves maybe 330 lines and rings at every edge on its
-        // way down a composite cable: the picture is soft AND overshoots, not one or
-        // the other.
-        uv = (floor(uv * grid) + 0.5) / grid;
-        float3 soft = tex0.Sample(samp, uv).rgb * 0.34;
-        soft += (tex0.Sample(samp, uv - float2(tx, 0)).rgb
-               + tex0.Sample(samp, uv + float2(tx, 0)).rgb) * 0.22;
-        soft += (tex0.Sample(samp, uv - float2(tx * 2.0, 0)).rgb
-               + tex0.Sample(samp, uv + float2(tx * 2.0, 0)).rgb) * 0.11;
-        float3 wide = (tex0.Sample(samp, uv - float2(tx * 3.5, 0)).rgb
-                     + tex0.Sample(samp, uv + float2(tx * 3.5, 0)).rgb) * 0.5;
+        // A security camera is soft AND rings at every edge on its way down a
+        // composite cable. It is an analog picture, not a grid of sensor squares: it
+        // is filtered continuously, never snapped to cells, so it stays smooth when
+        // the file is shown larger than it was made. It resolves a little more than
+        // the tube's own raster (about 600 lines), soft rather than coarse.
+        float cx = tx / 1.25;
+        float dy = 0.5 / (grid.y * 1.25);
+        float3 soft = signalTapV(uv, dy) * 0.34;
+        soft += (signalTapV(uv - float2(cx, 0), dy) + signalTapV(uv + float2(cx, 0), dy)) * 0.22;
+        soft += (signalTapV(uv - float2(cx * 2.0, 0), dy) + signalTapV(uv + float2(cx * 2.0, 0), dy)) * 0.11;
+        float3 wide = (tex0.Sample(samp, uv - float2(cx * 3.5, 0)).rgb
+                     + tex0.Sample(samp, uv + float2(cx * 3.5, 0)).rgb) * 0.5;
         float3 ring = soft + (soft - wide) * 0.35;
         float y = dot(ring, float3(0.299, 0.587, 0.114));
         // Cheap sensor, cheap line: the blacks never get down, the whites clip early.
@@ -47,12 +67,88 @@ float3 signalSample(float2 uv, bool camera, float2 size) {
         y = 0.045 + y * 0.90;
         c = float3(y * 0.94, y, y * 0.96);
     } else {
-        // The tube's own beam spot: a narrow smear, nothing more.
-        c = tex0.Sample(samp, uv).rgb * 0.60;
-        c += tex0.Sample(samp, uv - float2(tx, 0)).rgb * 0.20;
-        c += tex0.Sample(samp, uv + float2(tx, 0)).rgb * 0.20;
+        // The tube's own beam spot: a narrow horizontal smear, taken at half-sample
+        // steps so a sharp source is low-passed rather than skipped over. Skipping is
+        // what left edges crawling and stepped.
+        c = tex0.Sample(samp, uv).rgb * 0.36;
+        c += (tex0.Sample(samp, uv - float2(tx * 0.5, 0)).rgb
+            + tex0.Sample(samp, uv + float2(tx * 0.5, 0)).rgb) * 0.22;
+        c += (tex0.Sample(samp, uv - float2(tx, 0)).rgb
+            + tex0.Sample(samp, uv + float2(tx, 0)).rgb) * 0.10;
     }
     return c;
+}
+// A security camera is a wide-angle lens, so the picture bulges before it ever
+// reaches a screen. The lens fills its sensor, though: the distortion belongs in the
+// image, not in the shape of the frame. Normalising by the corner term keeps the
+// corners pinned and the edges straight, so this reads as a wide lens rather than as
+// curved glass.
+float2 cameraLens(float2 suv) {
+    float bulge = 0.12;                    // wide, not fish-eye: at 0.22 it read as a warp
+    float2 lp = suv * 2.0 - 1.0;
+    return (lp * (1.0 + bulge * dot(lp, lp)) / (1.0 + 2.0 * bulge)) * 0.5 + 0.5;
+}
+// Tape and line faults, all horizontal: head switching tears the last few lines of a
+// field sideways, every line jitters a little, and the whole picture sways.
+float2 cameraShake(float2 suv, float lineIdx, float field) {
+    float tear = smoothstep(0.972, 0.998, suv.y);
+    suv.x += tear * (signalHash(float2(floor(suv.y * 486.0), field)) - 0.5) * 0.09
+           + tear * 0.012;
+    suv.x += (signalHash(float2(lineIdx, field)) - 0.5) * 0.0006;
+    suv.x += 0.0010 * sin(suv.y * 35.0 + time * 1.4);
+    return suv;
+}
+// The raster, drawn the way a tube draws it: every output pixel is lit by the beams
+// of the scanlines around it, each a gaussian spot that fattens where its line is
+// bright. The pixel's own footprint is folded into each gaussian (a one-pixel box has
+// the variance of a gaussian of sigma 1/sqrt(12)), so the lines are band-limited
+// exactly as far as the output needs - soft and even at 1080p, crisp at 4K - rather
+// than point-sampled into stripes that alias, crawl and fall apart in the encode.
+float3 crtRaster(float2 q, float2 picFit, float ly, float linePx, float parity, float LINES,
+                 float field, bool camera, float2 size) {
+    float scanLine = floor(ly);
+    float sigmaPix = linePx / 3.4641;
+    float3 acc = float3(0, 0, 0);
+    float3 nearest = float3(0, 0, 0);
+    float2 nearestUv = float2(0.5, 0.5);
+    float bestW = -1.0;
+    for (int k = -1; k <= 1; k++) {
+        float li = scanLine + float(k);
+        // Time-base error: every line lands a whisker off, and once in a while the
+        // whole picture skips sideways a beat.
+        float tbe = (signalHash2(float2(li * 0.7, field)) - 0.5) * 0.00035
+                  + step(0.992, signalHash(float2(field * 3.7, 11.0)))
+                  * (signalHash(float2(field * 9.1, 23.0)) - 0.5) * 0.004;
+        // Sampled at the line's own centre: vertical detail is honestly quantised to
+        // what the raster can carry, and the beams blend it back together.
+        float2 s = (float2(q.x + tbe, (li + 0.5 - parity * 0.5) / LINES) - 0.5) / picFit + 0.5;
+        if (camera) s = cameraShake(cameraLens(s), li, field);
+        // What the line carries is the picture averaged over the line's own height, not
+        // one point on its centre - point samples are what turned a diagonal into a
+        // staircase of hard four-pixel steps. Averaged, each step lands as a shade.
+        float dyv = (0.36 / LINES) / picFit.y;
+        float3 ck = signalSample(s - float2(0, dyv), camera, size) * 0.25
+                  + signalSample(s, camera, size) * 0.50
+                  + signalSample(s + float2(0, dyv), camera, size) * 0.25;
+        // Beam sigma in line units. Summed gaussians one line apart ripple by about
+        // 2*exp(-2*pi^2*sigma^2): 0.30 gives a ~34% gap in the shadows, 0.42 closes it
+        // to ~6% in the highlights - soft lines that bloom shut, not stripes.
+        float bw = lerp(0.30, 0.42, sqrt(saturate(dot(ck, float3(0.299, 0.587, 0.114)))));
+        float s2 = bw * bw + sigmaPix * sigmaPix;
+        float d = ly - (li + 0.5);
+        // Peak scaled by bw/sqrt(s2) keeps each beam's light constant as the pixel blur
+        // widens it; dividing by a mid beam's area (0.36 * sqrt(2 pi)) keeps a flat
+        // field near unit brightness.
+        float w = exp(-(d * d) / (2.0 * s2)) * (bw / sqrt(s2)) / 0.9024;
+        acc += ck * w;
+        if (w > bestW) { bestW = w; nearest = ck; nearestUv = s; }
+    }
+    // A whisker of red/blue convergence error at the shadow mask, measured in signal
+    // samples rather than output pixels so it is the same size at every resolution.
+    float2 conv = float2(0.5 / signalGrid(size).x, 0.0);
+    acc.r += (signalSample(nearestUv - conv, camera, size).r - nearest.r) * 0.6 * bestW;
+    acc.b += (signalSample(nearestUv + conv, camera, size).b - nearest.b) * 0.6 * bestW;
+    return acc;
 }
 float4 Surveillance(float2 uv) {
     bool camera = lookMode > 1.5;
@@ -91,70 +187,41 @@ float4 Surveillance(float2 uv) {
 
     // The picture bulges outward on the curved glass, wider than it is tall. That dome
     // is the whole reason a tube reads as an object rather than a flat panel, so it is
-    // deliberately NOT normalised the way the camera lens below is. Nothing gets cut by
-    // it because the glass outline is built in this warped space further down: the edge
+    // deliberately NOT normalised the way the camera lens is. Nothing gets cut by it
+    // because the glass outline is built in this warped space further down: the edge
     // of the tube is the edge of the bulge.
     float2 bow = float2(0.023, 0.037);
     if (crt) q = (p * (1.0 + bow * dot(p, p))) * 0.5 + 0.5;
 
-    // Fine scan structure has to be band-limited: at small preview sizes 486 lines
-    // land under one output pixel each and beat into vertical moire.
-    float scanWeight = smoothstep(360.0, 960.0, tubeSize.y);
-
-    // Scan geometry: 486 visible lines carried as two fields half a line apart, so
-    // fine vertical detail twitters at 60 Hz the way a live broadcast does.
-    float LINES = 486.0;
-    float parity = fmod(field, 2.0);
+    // Scan geometry. A tube's lines have to be drawn over at least four output pixels
+    // each, or no beam shape survives: 486 lines on 1080p glass are two pixels apiece,
+    // which point-samples into hard stripes that crawl when the file is scaled up. So
+    // below that the set shows one field - 243 lines, the chunky progressive raster of
+    // a game console - and only glass tall enough for 486 (4K) gets the full
+    // interlaced frame, twitter and all. A camera feed on its own has no raster.
+    float LINES = (crt && tubeSize.y / 486.0 < 4.0) ? 243.0 : 486.0;
+    float parity = LINES > 300.0 ? fmod(field, 2.0) : 0.0;
     float ly = q.y * LINES + parity * 0.5;
     float scanLine = floor(ly);
-    float dl = frac(ly) - 0.5;
-
-    if (crt) {
-        // Time-base error: every line lands a whisker off, and once in a while the
-        // whole picture skips sideways a beat.
-        float tbe = (signalHash2(float2(scanLine * 0.7, field)) - 0.5) * 0.00035
-                  + step(0.992, signalHash(float2(field * 3.7, 11.0)))
-                  * (signalHash(float2(field * 9.1, 23.0)) - 0.5) * 0.004;
-        // Sample at the scanline centre, so vertical detail is honestly quantised to
-        // what 486 lines can carry -- but only once the output can resolve them.
-        float2 snapped = float2(q.x + tbe, (scanLine + 0.5 - parity * 0.5) / LINES);
-        q = lerp(q, snapped, scanWeight);
-    }
+    float linePx = max(fwidth(ly), 0.0001);   // how many lines one output pixel spans
 
     // The raster lives on the glass; the signal it draws lives in the picture area,
     // so sampling moves to its own coordinate here.
     float2 suv = (q - 0.5) / picFit + 0.5;
-    float tear = 0.0;
-
-    if (camera) {
-        // A security camera is a wide-angle lens, so the picture bulges before it ever
-        // reaches a screen. The lens fills its sensor, though: the distortion belongs
-        // in the image, not in the shape of the frame. Normalising by the corner term
-        // keeps the corners pinned and the edges straight, so this reads as a wide
-        // lens rather than as curved glass.
-        float bulge = 0.22;
-        float2 lp = suv * 2.0 - 1.0;
-        suv = (lp * (1.0 + bulge * dot(lp, lp)) / (1.0 + 2.0 * bulge)) * 0.5 + 0.5;
-    }
+    if (camera) suv = cameraLens(suv);
 
     // Where the picture ends, geometrically. Taken before the signal is shaken about,
     // so a torn or jittered line does not drag the edge feather with it.
     float inPic = boxMask(suv);
 
+    float tear = 0.0;
     if (camera) {
-
-        // Head switching: the last few lines of a tape field are torn sideways where
-        // the heads change over, and never quite line up with the picture above.
         tear = smoothstep(0.972, 0.998, suv.y);
-        suv.x += tear * (signalHash(float2(floor(suv.y * LINES), field)) - 0.5) * 0.09
-               + tear * 0.012;
-
-        float jitter = signalHash(float2(scanLine, field)) - 0.5;
-        suv.x += jitter * 0.0012;
-        suv.x += 0.0025 * sin(suv.y * 35.0 + time * 1.4);
+        suv = cameraShake(suv, scanLine, field);
     }
 
-    float3 col = signalSample(suv, camera, tubeSize);
+    float3 col = crt ? crtRaster(q, picFit, ly, linePx, parity, LINES, field, camera, tubeSize)
+                     : signalSample(suv, camera, tubeSize);
 
     if (camera) {
         // CCD vertical smear: a genuinely blown-out spot -- a lamp, a window, a
@@ -176,7 +243,9 @@ float4 Surveillance(float2 uv) {
         col *= 1.0 + 0.055 * sin(time * 0.9) + 0.035 * sin(time * 0.37 + 1.7);
 
         float2 grid = signalGrid(tubeSize);
-        float noise = signalHash(floor(suv * grid) + float2(field * 17.0, field * 7.0)) - 0.5;
+        // Sensor noise at the sensor's own scale, blended between cells: hashed per cell
+        // it came out as hard squares that a bigger screen turned into mosaic.
+        float noise = (valueNoise(suv * grid * 1.25 + float2(field * 17.0, field * 7.0)) - 0.5) * 1.3;
         float hum = exp(-pow((frac(suv.y - time * 0.075) - 0.5) / 0.065, 2.0));
         col = col * (0.96 - 0.09 * hum) + noise * (0.055 + 0.06 * (1.0 - col.g));
         float dropout = step(0.998, signalHash(float2(scanLine, floor(field / 2.0))));
@@ -189,34 +258,28 @@ float4 Surveillance(float2 uv) {
     }
 
     if (crt) {
-        // A whisker of red/blue convergence error at the shadow mask.
-        float2 conv = float2(1.1 * texel.x, 0.0);
-        col.r = lerp(col.r, signalSample(suv - conv, camera, tubeSize).r, 0.6 * scanWeight);
-        col.b = lerp(col.b, signalSample(suv + conv, camera, tubeSize).b, 0.6 * scanWeight);
+        // Shadow mask: RGB phosphor triads fixed to the glass, so they key off the
+        // undistorted glass coordinate. The pitch is a property of the set - about 360
+        // triads down the glass - not of the output. A triad needs three output pixels
+        // or more to exist at all; below that the stripes can only alias, and 4:2:0
+        // chroma throws them away regardless, so they fade to their average (flat)
+        // instead. At 1080p that is most of the way; at 4K they are really there.
+        float pitch = tubeSize.y / 360.0;
+        float gx = tuv.x * tubeSize.x / pitch;
+        float3 grille = 1.0 + 0.30 * cos((gx + float3(0.0, 0.3333, 0.6667)) * 6.2831853);
+        col *= lerp(float3(1, 1, 1), grille, saturate((pitch - 3.0) / 3.0));
 
-        // The beam is a gaussian spot that gets FATTER where the picture is bright,
-        // so highlights bloom and nearly close the line gap while shadows stay ribbed.
-        float lum = dot(col, float3(0.299, 0.587, 0.114));
-        float bw = lerp(0.32, 0.62, lum);
-        float scan = exp(-(dl * dl) / (2.0 * bw * bw));
-        col *= lerp(1.0, lerp(0.30, 1.15, scan), scanWeight);
-
-        // Aperture grille: RGB phosphor stripes fixed to the glass, so they key off
-        // the undistorted glass coordinate rather than the warped one.
-        float gx = tuv.x * tubeSize.x / 3.0;
-        float3 grille = 0.78 + 0.36 * cos((gx + float3(0.0, 0.3333, 0.6667)) * 6.2831853);
-        col *= lerp(float3(1, 1, 1), grille, smoothstep(640.0, 1280.0, tubeSize.x));
-
-        // Make-up gain for the scan and grille losses.
-        col *= lerp(1.0, 1.30, scanWeight);
-
-        // Halation: highlights bleed into the glass around them.
+        // Halation: highlights bleed into the glass around them. The radius is in
+        // signal samples, so the glow is the same size on 1080p and 4K glass.
+        float2 halR = 3.0 / signalGrid(tubeSize);
         float3 halo = float3(0, 0, 0);
         for (int i = 0; i < 6; i++) {
             float ang = float(i) * 1.0471976;
-            halo += tex0.Sample(samp, suv + float2(cos(ang), sin(ang)) * 6.5 * texel).rgb;
+            halo += tex0.Sample(samp, suv + float2(cos(ang), sin(ang)) * halR).rgb;
         }
         halo /= 6.0;
+        // A camera feed is monochrome by the time it reaches the tube, so its glow is too.
+        if (camera) halo = dot(halo, float3(0.299, 0.587, 0.114)) * float3(1, 1, 1);
         col += halo * halo * float3(0.16, 0.17, 0.20);
 
         // A slow mains hum bar rolling up, plus per-field brightness twitter.
@@ -228,12 +291,18 @@ float4 Surveillance(float2 uv) {
 
         // Phosphor grain: the coating is not smooth and the beam lighting it is a
         // stream of electrons, so a lit screen always fizzes a little. Shot noise, so
-        // it grows where the beam works hardest rather than sitting flat over the top.
-        // The grain is a touch coarser than one output pixel, the way real grains are.
-        float2 gpx = floor(tuv * tubeSize / 1.5);
-        float grain = signalHash2(gpx + float2(field * 3.1, field * 7.7)) - 0.5;
+        // it grows where the beam works hardest. The grains are about two pixels on
+        // 1080p glass and blend into each other, so they read as a surface rather than
+        // as digital noise - and survive the encode instead of turning to mush.
+        float cell = max(2.0, tubeSize.y / 480.0);
+        float grain = valueNoise(tuv * tubeSize / cell + float2(field * 3.1, field * 7.7)) - 0.5;
         float glow = dot(col, float3(0.299, 0.587, 0.114));
-        col += grain * 0.077 * (0.30 + 0.70 * sqrt(saturate(glow)));
+        col += grain * 0.085 * (0.30 + 0.70 * sqrt(saturate(glow)));
+
+        // The room in the glass: a broad, faint reflection high on the dome. It is what
+        // puts the picture BEHIND a surface instead of painted on the frame.
+        float2 hp = p - float2(-0.42, -0.58);
+        col += exp(-dot(hp, hp) * 2.4) * 0.030 + (1.0 - dot(p, p) * 0.5) * 0.006;
     }
 
     // The tube itself: rounded glass with a dark rim where the beam lands shallow at

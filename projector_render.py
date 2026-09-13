@@ -192,8 +192,11 @@ void main() {
     // --- lens chromatic aberration ----------------------------------------
     vec2 rc  = (cuv - 0.5) * vec2(aspect, 1.0);
     vec2 cav = (cuv - 0.5) * dot(rc, rc) * 0.0035 * u_aber;
-    t.r = sampleSrc(cuv - cav).r;
-    t.b = sampleSrc(cuv + cav).b;
+    // A spread of wavelengths, not one shifted copy: same mean offset as a single tap,
+    // but the fringe is smeared, so a sharp full-res source does not get a hard
+    // coloured edge the preview's softer proxy never shows. Kept identical to the HLSL.
+    t.r = (sampleSrc(cuv - cav * 0.5).r + sampleSrc(cuv - cav).r + sampleSrc(cuv - cav * 1.5).r) / 3.0;
+    t.b = (sampleSrc(cuv + cav * 0.5).b + sampleSrc(cuv + cav).b + sampleSrc(cuv + cav * 1.5).b) / 3.0;
 
     // --- soft ring blur: halation + focus breathing -----------------------
     vec3 blur = t.rgb;
@@ -496,6 +499,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="shader clock offset in seconds (reroll the random events)")
     p.add_argument("--crf", type=int, default=16, help="x264 quality (default 16)")
     p.add_argument("--preset", default="slow", help="x264 preset (default slow)")
+    p.add_argument("--lossless", action="store_true",
+                   help="write an ffv1 intermediate instead of a delivery encode")
+    p.add_argument("--venc-file", metavar="FILE",
+                   help="file holding the ffmpeg video encoder arguments to use "
+                        "(codec, rate control, tags) instead of x264 --crf/--preset")
     p.add_argument("--audio", choices=("copy", "encode", "none"), default="encode",
                    help="what to do with the source audio (default encode)")
     p.add_argument("--no-progress", action="store_true", help="silence progress")
@@ -609,7 +617,11 @@ def main(argv: list[str] | None = None) -> int:
     plate_tex = ctx.texture((out_w, out_h), 4, dtype="f1")
     plate_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
     fbo_plate = ctx.framebuffer(color_attachments=[plate_tex])
-    fbo_out = ctx.framebuffer(color_attachments=[ctx.texture((out_w, out_h), 3)])
+    # A lossless intermediate is a shot SlideCut composites again, so it keeps its
+    # alpha: a screen on a layer track is transparent round its glass, and the export
+    # graph pulls that alpha out to blend with. Delivery encodes stay RGB.
+    out_comps = 4 if (args.lossless and not still_out) else 3
+    fbo_out = ctx.framebuffer(color_attachments=[ctx.texture((out_w, out_h), out_comps)])
 
     px, py, pw, ph = plate_rect(out_w, out_h, src_w, src_h, args.margin, args.plate_ar)
     scale, offset = fit_uv(pw, ph, src_w, src_h, args.fit)
@@ -661,7 +673,7 @@ def main(argv: list[str] | None = None) -> int:
                    "-vf", "vflip", "-frames:v", "1", args.output]
     else:
         enc_cmd = [ffmpeg, "-v", "error", "-y",
-                   "-f", "rawvideo", "-pix_fmt", "rgb24",
+                   "-f", "rawvideo", "-pix_fmt", "rgba" if out_comps == 4 else "rgb24",
                    "-s", f"{out_w}x{out_h}", "-r", f"{fps}", "-i", "-"]
         want_audio = args.audio != "none" and has_audio and not is_still_in
         if want_audio:
@@ -669,8 +681,17 @@ def main(argv: list[str] | None = None) -> int:
                 enc_cmd += ["-ss", f"{args.start}"]
             enc_cmd += ["-i", src, "-map", "0:v:0", "-map", "1:a:0?", "-shortest"]
             enc_cmd += ["-c:a", "copy"] if args.audio == "copy" else ["-c:a", "aac", "-b:a", "192k"]
-        enc_cmd += ["-vf", "vflip", "-c:v", "libx264", "-preset", args.preset,
-                    "-crf", str(args.crf), "-pix_fmt", "yuv420p", args.output]
+        enc_cmd += ["-vf", "vflip"]
+        if args.lossless:
+            enc_cmd += ["-c:v", "ffv1", "-pix_fmt", "bgra"]
+        elif args.venc_file:
+            # SlideCut's own encoder line: plain tokens, no quoting or spaces in values.
+            with open(args.venc_file, encoding="utf-8-sig") as fh:
+                enc_cmd += fh.read().split()
+        else:
+            enc_cmd += ["-c:v", "libx264", "-preset", args.preset,
+                        "-crf", str(args.crf), "-pix_fmt", "yuv420p"]
+        enc_cmd += [args.output]
     enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE)
 
     # ---- render loop ------------------------------------------------------ #
@@ -679,7 +700,7 @@ def main(argv: list[str] | None = None) -> int:
     # One readback buffer for the whole run. fbo.read() hands back a fresh bytes
     # object every frame - at 1080p that is 6 MB of allocation and free per frame,
     # for pixels that go straight down the pipe.
-    out_buf = bytearray(out_w * out_h * 3)
+    out_buf = bytearray(out_w * out_h * out_comps)
     out_view = memoryview(out_buf)
     try:
         while True:
@@ -706,7 +727,7 @@ def main(argv: list[str] | None = None) -> int:
                 # No plate, no gate, no wall: this frame IS the screen.
                 src_tex.use(0)
                 fbo_out.use()
-                ctx.clear(0.0, 0.0, 0.0, 1.0)
+                ctx.clear(0.0, 0.0, 0.0, 0.0)             # the shader writes its own alpha
                 signal_prog["time"] = t
                 signal_vao.render(moderngl.TRIANGLES)
             elif played:
@@ -728,7 +749,7 @@ def main(argv: list[str] | None = None) -> int:
                 prog_gate["u_time"] = t
                 vao_gate.render(moderngl.TRIANGLES)
 
-            fbo_out.read_into(out_view, components=3)
+            fbo_out.read_into(out_view, components=out_comps)
             enc.stdin.write(out_view)                          # type: ignore[union-attr]
             written += 1
 

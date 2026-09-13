@@ -41,7 +41,14 @@ endif()
 
 add_custom_command(TARGET SlideCut POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
-            ${CMAKE_CURRENT_SOURCE_DIR}/assets $<TARGET_FILE_DIR:SlideCut>/assets)
+            ${CMAKE_CURRENT_SOURCE_DIR}/assets $<TARGET_FILE_DIR:SlideCut>/assets
+    # The exe looks for its helper scripts beside itself first, so a copy left there
+    # would shadow the real ones. Refresh them on every build instead.
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/projector_render.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/clip_shader_export.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/surveillance_shader.h
+            $<TARGET_FILE_DIR:SlideCut>)
 
 if(NOT MSVC)
     # -g keeps the symbol tables in the exe. They cost disk, not speed, and without

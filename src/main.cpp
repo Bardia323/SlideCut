@@ -866,6 +866,11 @@ static bool                g_audioReady = false;
 // the clips themselves. Export and the project file never see it.
 static std::atomic<bool>   g_hushClips(false);
 
+// Ripple editing. On, trimming or deleting a base shot closes the film up and
+// everything downstream follows. Off, the time is kept: what a shot gives up becomes
+// a gap card, and nothing after the edit moves.
+static bool g_rippleOn = true;
+
 // Where each shot sits on the film, once mutes and dissolves are taken into
 // account. Muted shots collapse onto the cut they sit on; a dissolve pulls the
 // next shot back over the tail of this one.
@@ -2086,6 +2091,136 @@ static int SplitPoint(double t) {
     return (int)g_clips.size();
 }
 
+// ---- ripple off: gaps
+// A gap is an empty card - a plain black frame - named so it can be found again.
+static bool IsGap(const Clip& c) {
+    return c.kind == Clip::Text && c.text.empty() && c.label == "gap";
+}
+
+// Put `dur` seconds of gap at base index `at`, folded into a gap already beside it
+// so repeated trims do not leave a row of slivers.
+static void InsertGap(int at, double dur) {
+    if (dur < MinClipDur() * 0.5) return;
+    if (at > 0 && at - 1 < (int)g_clips.size() && IsGap(*g_clips[at - 1])) {
+        g_clips[at - 1]->duration += dur;
+        return;
+    }
+    if (at >= 0 && at < (int)g_clips.size() && IsGap(*g_clips[at])) {
+        g_clips[at]->duration += dur;
+        return;
+    }
+    auto g = std::make_unique<Clip>();
+    g->kind = Clip::Text;
+    g->label = "gap";
+    g->duration = dur;
+    if (at < 0) at = 0;
+    if (at > (int)g_clips.size()) at = (int)g_clips.size();
+    g_clips.insert(g_clips.begin() + at, std::move(g));
+}
+
+static void EraseBaseClip(int i) {
+    Clip& c = *g_clips[i];
+    if (c.kind != Clip::Video) RetireTexture(c.tex);
+    ClearDoubleExposure(c);
+    g_clips.erase(g_clips.begin() + i);
+}
+
+// Overwrite: a shot growing into its neighbours eats them instead of pushing them.
+// Walks from base index `from` - forward trims heads, backward trims tails - taking
+// `want` seconds: shots wholly covered go, the one the edge lands in is trimmed and
+// keeps the right piece of its source. Muted shots have no width and are stepped
+// over; a sequence owns its length, so the walk stops there. Returns what is left
+// over, which can only push.
+static double OverwriteNeighbours(int from, double want, bool forward) {
+    int j = from;
+    while (want > 1e-9 && j >= 0 && j < (int)g_clips.size()) {
+        Clip& n = *g_clips[j];
+        if (n.skip) { j += forward ? 1 : -1; continue; }
+        if (n.kind == Clip::Nest) break;
+        if (want >= n.duration - MinClipDur() * 0.5) {
+            want = fmax(0.0, want - n.duration);
+            EraseBaseClip(j);
+            if (!forward) j--;
+            continue;
+        }
+        // Losing the head of a forward shot, or the tail of a reversed one, is losing
+        // the start of its source window.
+        if (n.kind == Clip::Video && forward != n.reversed) n.trimIn += want;
+        n.duration -= want;
+        want = 0;
+    }
+    return want;
+}
+
+// Neighbouring gaps become one, and a gap at the very end is no film at all.
+static void MergeGaps() {
+    for (int i = (int)g_clips.size() - 1; i > 0; i--)
+        if (IsGap(*g_clips[i]) && IsGap(*g_clips[i - 1])) {
+            g_clips[i - 1]->duration += g_clips[i]->duration;
+            g_clips.erase(g_clips.begin() + i);
+        }
+    while (!g_clips.empty() && IsGap(*g_clips.back())) g_clips.pop_back();
+}
+
+// Base index of the first shot at or after time t, splitting the shot t falls inside
+// so the cut lands exactly there. A sequence is not torn: t goes to its nearer edge.
+static int CutBaseAt(double t) {
+    std::vector<BaseSpan> lay;
+    BaseLayout(lay);
+    for (int i = 0; i < (int)g_clips.size(); i++) {
+        if (g_clips[i]->skip) continue;
+        if (t <= lay[i].start + 1e-4) return i;
+        if (t < lay[i].end - 1e-4) {
+            if (g_clips[i]->kind == Clip::Nest)
+                return t - lay[i].start < lay[i].end - t ? i : i + 1;
+            SplitClip(i, t - lay[i].start);
+            return i + 1;
+        }
+    }
+    return (int)g_clips.size();
+}
+
+// Ripple off, a shot dragged along the base track: lift it out, leaving its time
+// behind as a gap, and lay it down at `at` over whatever is there. Nothing else on
+// the film moves. Returns the shot's new index.
+static int LayDownOverwrite(std::unique_ptr<Clip> mv, double at);
+static int PlaceOverwrite(int idx, double at) {
+    if (idx < 0 || idx >= (int)g_clips.size()) return -1;
+    std::vector<BaseSpan> lay;
+    BaseLayout(lay);
+    double len = lay[idx].end - lay[idx].start;
+    auto mv = std::move(g_clips[idx]);
+    g_clips.erase(g_clips.begin() + idx);
+    InsertGap(idx, len);
+    return LayDownOverwrite(std::move(mv), at);
+}
+
+// Lay a shot - lifted off the base track or brought down from a layer - onto the base
+// track at `at` seconds, covering whatever is there. Nothing else moves.
+static int LayDownOverwrite(std::unique_ptr<Clip> mv, double at) {
+    double len = mv->duration;
+    mv->xfade = 0;                         // what it dissolved into is not beside it now
+    const int uid = mv->uid;
+    if (at < 0) at = 0;
+    double total = TotalDuration();
+    if (at >= total - 1e-6) {              // past the end: a gap up to it, then the shot
+        InsertGap((int)g_clips.size(), at - total);
+        g_clips.push_back(std::move(mv));
+    } else {
+        int a = CutBaseAt(at);
+        int b = CutBaseAt(at + len);       // splits at or after a, so a stays put
+        for (int i = b - 1; i >= a; i--)
+            if (!g_clips[i]->skip) EraseBaseClip(i);
+        int ins = a;
+        if (ins > (int)g_clips.size()) ins = (int)g_clips.size();
+        g_clips.insert(g_clips.begin() + ins, std::move(mv));
+    }
+    MergeGaps();
+    for (int i = 0; i < (int)g_clips.size(); i++)
+        if (g_clips[i]->uid == uid) return i;
+    return -1;
+}
+
 static void RippleOthers(double fromTime, double shift) {
     if (fabs(shift) < 1e-9) return;
     for (auto& m : g_editMarkers)
@@ -3044,6 +3179,11 @@ struct ExportJob {
     std::wstring stageTmp;                // stage-2 output, moved over outPath at the end
     bool         toClipboard = false;     // hand the finished file to the OS clipboard
     std::wstring stageExt;                // container the encode was actually built for
+    bool         clipShaders = false;     // stage 1 runs per-shot screen passes before ffmpeg
+    bool         encoding = false;        // ffmpeg itself has started reporting progress
+    std::string  shaderStep;              // last "Clip shader n/N: name" the helper printed
+    std::string  encNote;                 // why the encoder differs from the one picked, if it does
+    std::wstring stage1;                  // lossless stage-1 intermediate the projector pass reads
 } g_export;
 
 // Temp films rendered for the Windows clipboard. They are ours to clean up, so the
@@ -3065,6 +3205,7 @@ static void CancelClipboardRender() {
         g_export.process = nullptr;
     }
     if (!g_export.stageTmp.empty()) DeleteFileW(g_export.stageTmp.c_str());
+    if (!g_export.stage1.empty()) DeleteFileW(g_export.stage1.c_str());
     if (!g_clipTemps.empty()) {                // the half-written film is no use to anyone
         DeleteFileW(g_clipTemps.back().c_str());
         g_clipTemps.pop_back();
@@ -3118,8 +3259,8 @@ enum FitMode { FIT_BLUR = 0, FIT_BARS, FIT_CROP };   // the pre-per-clip global
 static int LfitFromOldFit(int f) {
     return f == FIT_CROP ? LFIT_FILL : f == FIT_BARS ? LFIT_BLACK : LFIT_BLUR;
 }
-// Video encoder. NVENC entries need an NVIDIA GPU; they fall back to nothing, so
-// the export just fails with ffmpeg's own message if the encoder is missing.
+// Video encoder. NVENC entries need an NVIDIA GPU; when ffmpeg cannot open one the
+// export falls back to the matching software encoder (see ResolveEncoder).
 enum VCodec { VC_X264 = 0, VC_X265, VC_NVENC_H264, VC_NVENC_HEVC };
 enum RateMode { RM_CRF = 0, RM_BITRATE };
 enum Container { CT_MP4 = 0, CT_MOV, CT_MKV };
@@ -3138,6 +3279,7 @@ static int   g_container = CT_MP4;
 static int   g_abrIdx = 3;                // index into AUDIO_KBPS
 static bool  g_loudnorm = false;          // one-pass EBU R128 normalise of the final mix
 static bool  g_faststart = true;          // move the moov atom up front (mp4/mov)
+static bool  g_keepGrain = false;         // x264/x265 -tune grain: spend bits on noise, don't smooth it
 static float g_fadeIn = 0.0f;             // seconds of fade from black / silence
 static float g_fadeOut = 0.0f;            // audio levels live on the tracks themselves
 
@@ -3154,6 +3296,32 @@ static const char* FIT_ITEMS = "Blur fill\0" "Black bars\0" "Crop to fill\0";
 static const char* CONTAINER_ITEMS = "MP4\0" "MOV\0" "MKV\0";
 
 static bool IsNvenc(int c) { return c == VC_NVENC_H264 || c == VC_NVENC_HEVC; }
+
+// Whether this machine's ffmpeg can actually open the NVENC encoder: a tiny null
+// encode, run once per encoder and remembered. A build without NVENC, no NVIDIA GPU,
+// an old driver, or a card without HEVC all fail it the same way.
+static bool NvencWorks(int c) {
+    static int known[2] = { -1, -1 };      // h264, hevc: -1 untested, 0 no, 1 yes
+    int& k = known[c == VC_NVENC_HEVC ? 1 : 0];
+    if (k < 0) {
+        std::wstring cmd = std::wstring(L"ffmpeg -hide_banner -nostdin -loglevel error"
+                           L" -f lavfi -i color=c=black:s=256x256:r=30:d=0.2 -c:v ") +
+                           (c == VC_NVENC_HEVC ? L"hevc_nvenc" : L"h264_nvenc") + L" -f null -";
+        k = RunHidden(cmd) ? 1 : 0;
+    }
+    return k == 1;
+}
+
+// The encoder an export really uses: the one picked, or its software twin when the
+// GPU one will not open. `note` says so in words when that happens.
+static int ResolveEncoder(int c, std::string* note) {
+    note->clear();
+    if (!IsNvenc(c) || NvencWorks(c)) return c;
+    int sw = c == VC_NVENC_HEVC ? VC_X265 : VC_X264;
+    *note = sw == VC_X265 ? "no NVENC HEVC on this machine, used libx265"
+                          : "no NVENC on this machine, used libx264";
+    return sw;
+}
 static const wchar_t* ContainerExt(int c) {
     return c == CT_MOV ? L"mov" : c == CT_MKV ? L"mkv" : L"mp4";
 }
@@ -3608,7 +3776,10 @@ static void StartExport(const std::wstring& outPath) {
         swprintf(seg, 768, L"[%ls]split=2[%lsba%d][%lsbb%d];",
                  bottom.c_str(), tag, uid, tag, uid);
         fc += seg;
-        swprintf(seg, 768, L"[%ls]split=2[%lsta%d][%lstb%d];[%lsta%d]alphaextract[%lsm%d];",
+        // format=rgba before the mask is pulled: any filter upstream that only speaks YUV
+        // drops the alpha plane, and then this would fail the whole export. Pinned here,
+        // the worst such a clip can do is come out opaque.
+        swprintf(seg, 768, L"[%ls]format=rgba,split=2[%lsta%d][%lstb%d];[%lsta%d]alphaextract[%lsm%d];",
                  top.c_str(), tag, uid, tag, uid, tag, uid, tag, uid);
         fc += seg;
         swprintf(seg, 768,
@@ -3645,7 +3816,10 @@ static void StartExport(const std::wstring& outPath) {
         std::wstring stage = cur;          // label holding the picture so far
 
         if (c.kind == Clip::Text) {        // the lavfi colour source is already canvas-size
-            swprintf(seg, 768, L"[%d:v]fps=%d,setsar=1[%ls];", vIn[c.uid], FPS, stage.c_str());
+            // format=rgba: the colour source carries no alpha plane, and a card on a
+            // layer track goes through the masked blend, which extracts one. Opaque
+            // black, the same card the preview draws.
+            swprintf(seg, 768, L"[%d:v]fps=%d,format=rgba,setsar=1[%ls];", vIn[c.uid], FPS, stage.c_str());
             fc += seg;
         } else {
             FitOne(vIn[c.uid], stage, c.lfit, c.lanchor);
@@ -3664,8 +3838,15 @@ static void StartExport(const std::wstring& outPath) {
 
         std::wstring gf = GradeFilter(c.grade);
         if (!gf.empty()) {                 // this shot's own colour
-            wchar_t gseg[384];
-            swprintf(gseg, 384, L"[%ls]%ls[g%d];", stage.c_str(), gf.c_str(), c.uid);
+            // eq and friends only take YUV: ffmpeg converts on the way in and the alpha
+            // plane is simply gone, which a layer's masked blend then fails on. So the
+            // alpha is lifted off first and put back on the graded picture.
+            wchar_t gseg[512];
+            swprintf(gseg, 512,
+                     L"[%ls]split=2[ga%d][gb%d];[ga%d]alphaextract[gm%d];"
+                     L"[gb%d]%ls,format=rgba[gc%d];[gc%d][gm%d]alphamerge[g%d];",
+                     stage.c_str(), c.uid, c.uid, c.uid, c.uid,
+                     c.uid, gf.c_str(), c.uid, c.uid, c.uid, c.uid);
             fc += gseg;
             wchar_t gl[32];
             swprintf(gl, 32, L"g%d", c.uid);
@@ -3728,7 +3909,9 @@ static void StartExport(const std::wstring& outPath) {
             // No fps filter here: the renderer already wrote exactly this shot's frames
             // at the project rate, and an fps pass over them drops the last one.
             wchar_t back[256];
-            swprintf(back, 256, L"movie=%ls.mkv,settb=1/%d,setpts=N,setsar=1[v%d];",
+            // format=rgba: the layer blend pulls alpha out of this, and must never meet a
+            // file that has none ("Requested planes not available").
+            swprintf(back, 256, L"movie=%ls.mkv,format=rgba,settb=1/%d,setpts=N,setsar=1[v%d];",
                      Widen(name).c_str(), FPS, c.uid);
             fc += back;
         }
@@ -3756,21 +3939,33 @@ static void StartExport(const std::wstring& outPath) {
             fc += seg2;
         }
     }
+    // Picture and sound are joined by two separate concats, never one v+a concat. A
+    // combined concat couples the streams segment by segment: over a long cut the
+    // sound falls a fraction of a second behind the picture inside it, and at the end
+    // it spins waiting to pair them - the export sat at 98% forever. Every block is
+    // already cut to its shot's exact length, so the two stay in step on their own.
     size_t nCat = 0;
+    std::wstring vCat, aCat;
     for (auto& cp : g_clips) {             // concat only walks the base track
         if (cp->skip) continue;            // muted shots are not in the film at all
         nCat++;
-        wchar_t seg[64];
-        if (clipAudio) swprintf(seg, 64, L"[v%d][a%d]", cp->uid, cp->uid);
-        else           swprintf(seg, 64, L"[v%d]", cp->uid);
-        fc += seg;
+        wchar_t seg[32];
+        swprintf(seg, 32, L"[v%d]", cp->uid);
+        vCat += seg;
+        swprintf(seg, 32, L"[a%d]", cp->uid);
+        aCat += seg;
     }
     {   // NOTE: never %s a wide literal through swprintf — MinGW reads %s as char*
         // and silently truncates it (that is what turned "[ac]" into "["). Concatenate.
         wchar_t seg[128];
-        swprintf(seg, 128, L"concat=n=%zu:v=1:a=%d[vc]", nCat, clipAudio ? 1 : 0);
+        swprintf(seg, 128, L"concat=n=%zu:v=1:a=0[vc];", nCat);
+        fc += vCat;
         fc += seg;
-        fc += clipAudio ? L"[ac];" : L";";
+        if (clipAudio) {
+            swprintf(seg, 128, L"concat=n=%zu:v=0:a=1[ac];", nCat);
+            fc += aCat;
+            fc += seg;
+        }
     }
     double total = TotalDuration();
 
@@ -3987,11 +4182,14 @@ static void StartExport(const std::wstring& outPath) {
         cmd += ab;
     }
 
+    // The video half of the encode is kept on its own: the projector pass re-encodes
+    // the film and must come out with exactly the same encoder and rate settings.
+    const int vc = ResolveEncoder(g_vcodec, &g_export.encNote);
     const wchar_t* enc_name =
-        g_vcodec == VC_X264 ? L"libx264" : g_vcodec == VC_X265 ? L"libx265"
-      : g_vcodec == VC_NVENC_H264 ? L"h264_nvenc" : L"hevc_nvenc";
-    const wchar_t* prof = (g_vcodec == VC_X264 || g_vcodec == VC_NVENC_H264) ? L"high" : L"main";
-    cmd += L" -c:v " + std::wstring(enc_name) + L" -pix_fmt yuv420p -profile:v " + prof +
+        vc == VC_X264 ? L"libx264" : vc == VC_X265 ? L"libx265"
+      : vc == VC_NVENC_H264 ? L"h264_nvenc" : L"hevc_nvenc";
+    const wchar_t* prof = (vc == VC_X264 || vc == VC_NVENC_H264) ? L"high" : L"main";
+    std::wstring venc = L" -c:v " + std::wstring(enc_name) + L" -pix_fmt yuv420p -profile:v " + prof +
            L" -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv";
 
     // CRF mode still gets a ceiling so a busy shot cannot blow past what an
@@ -4005,7 +4203,7 @@ static void StartExport(const std::wstring& outPath) {
 
     const int gop = FPS * 2;
     wchar_t enc[384];
-    if (IsNvenc(g_vcodec)) {
+    if (IsNvenc(vc)) {
         if (g_rateMode == RM_CRF)
             swprintf(enc, 384, L" -preset %ls -tune hq -rc vbr -cq %d -b:v 0"
                                L" -maxrate %lldk -bufsize %lldk -bf 3",
@@ -4014,6 +4212,11 @@ static void StartExport(const std::wstring& outPath) {
             swprintf(enc, 384, L" -preset %ls -tune hq -rc vbr -b:v %lldk"
                                L" -maxrate %lldk -bufsize %lldk -bf 3",
                      NVENC_SPEEDS[g_speed], maxrate / 1000, maxrate / 1000, maxrate / 500);
+    } else if (g_rateMode == RM_CRF && g_keepGrain) {
+        // Grain is the one thing a ceiling destroys: at CRF 15 a grainy 1080p shot
+        // wants many times the cap above, and held to it the encoder averages the
+        // grain away whatever the CRF says. Keeping grain means trusting the CRF alone.
+        swprintf(enc, 384, L" -preset %ls -crf %d", SPEED_NAMES[g_speed], g_crf);
     } else if (g_rateMode == RM_CRF) {
         swprintf(enc, 384, L" -preset %ls -crf %d -maxrate %lldk -bufsize %lldk",
                  SPEED_NAMES[g_speed], g_crf, maxrate / 1000, maxrate / 500);
@@ -4021,21 +4224,38 @@ static void StartExport(const std::wstring& outPath) {
         swprintf(enc, 384, L" -preset %ls -b:v %lldk -maxrate %lldk -bufsize %lldk",
                  SPEED_NAMES[g_speed], maxrate / 1000, maxrate / 1000, maxrate / 500);
     }
-    cmd += enc;
-    if (g_vcodec == VC_X264) {             // x264-only knobs; the others reject or ignore them
+    venc += enc;
+    if (g_keepGrain && (vc == VC_X264 || vc == VC_X265))
+        venc += L" -tune grain";           // NVENC has no such mode; it keeps its -tune hq
+    if (vc == VC_X264) {                   // x264-only knobs; the others reject or ignore them
         wchar_t x[128];
         swprintf(x, 128, L" -level %ls -sc_threshold 0 -bf 3 -refs 4", FPS >= 50 ? L"5.1" : L"4.2");
-        cmd += x;
+        venc += x;
     }
-    if ((g_vcodec == VC_X265 || g_vcodec == VC_NVENC_HEVC) && g_container != CT_MKV)
-        cmd += L" -tag:v hvc1";            // QuickTime/Apple players need the hvc1 brand
+    if ((vc == VC_X265 || vc == VC_NVENC_HEVC) && g_container != CT_MKV)
+        venc += L" -tag:v hvc1";           // QuickTime/Apple players need the hvc1 brand
     wchar_t rate[96];
     swprintf(rate, 96, L" -r %d -g %d -keyint_min %d", FPS, gop, gop);
-    cmd += rate;
+    venc += rate;
+    // With the projector on, this encode is not the delivery: the projector pass decodes
+    // it and encodes the real file. A lossy file here would make that a second
+    // generation - grain and fine texture lost once, then again - so stage 1 writes a
+    // lossless intermediate and the chosen encoder runs exactly once, at the end.
+    std::wstring stage1Out = outPath;
+    if (g_projOn) {
+        stage1Out = outPath + L".stage1.mkv";
+        DeleteFileW(stage1Out.c_str());
+        cmd += L" -c:v libx264 -qp 0 -preset ultrafast -pix_fmt yuv444p"
+               L" -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv";
+        cmd += rate;
+    } else {
+        cmd += venc;
+    }
 
     cmd += L" -t " + std::wstring(tbuf);
-    if (g_faststart && g_container != CT_MKV) cmd += L" -movflags +faststart";
-    cmd += L" \"" + outPath + L"\"";
+    if (!g_projOn && g_faststart && g_container != CT_MKV) cmd += L" -movflags +faststart";
+    cmd += L" \"" + stage1Out + L"\"";
+    if (g_faststart && g_container != CT_MKV) venc += L" -movflags +faststart";   // for stage 2
 
     // Shots that play on a screen of their own are rendered one at a time first, so
     // a helper drives the whole run: the per-shot passes, then this command. Without
@@ -4062,6 +4282,12 @@ static void StartExport(const std::wstring& outPath) {
     g_export.cmd = Narrow(launch);
     g_export.outPath = outPath;
     g_export.stageExt = ContainerExt(g_container);
+    g_export.stage1 = g_projOn ? stage1Out : L"";
+    if (g_projOn && !WriteWholeFile(g_workDir + L"projector.venc", Narrow(venc))) {
+        g_export.failed = true;
+        g_export.message = "Could not stage the projector pass encoder settings.";
+        return;
+    }
     g_export.logFile = std::wstring(tmp) + L"slidecut_ffmpeg.log";
     SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
     HANDLE log = CreateFileW(g_export.logFile.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
@@ -4094,6 +4320,9 @@ static void StartExport(const std::wstring& outPath) {
     g_export.active = true;
     g_export.failed = false;
     g_export.stage = 1;
+    g_export.clipShaders = !lookJobs.empty();
+    g_export.encoding = false;
+    g_export.shaderStep.clear();
     // The screens are already baked in by the per-shot passes above, so stage 2 is
     // only ever the film look. The schedule tells it which frames to leave alone:
     // a shot that played on a tube must not then be projected onto a wall.
@@ -4109,7 +4338,7 @@ static void StartExport(const std::wstring& outPath) {
 static bool StartProjectorPass() {
     std::wstring script = ProjectorScriptPath();
     if (script.empty()) {
-        g_export.message = "Exported, but projector_render.py was not found.";
+        g_export.message = "projector_render.py was not found - nothing exported.";
         g_export.failed = true;
         return false;
     }
@@ -4119,15 +4348,25 @@ static bool StartProjectorPass() {
     // says now: a clipboard copy renders mp4 whatever the delivery setting is.
     g_export.stageTmp = g_export.outPath + L".proj." + g_export.stageExt;
     DeleteFileW(g_export.stageTmp.c_str());
-    std::wstring cmd = Widen(g_pythonExe) + L" \"" + script + L"\" \"" + g_export.outPath +
-                       L"\" -o \"" + g_export.stageTmp + L"\"" + ProjectorArgs(W, H, false);
+    // Stage 1 wrote a lossless intermediate; its audio is already the final encode, so
+    // it is copied across rather than squeezed a second time.
+    const std::wstring& src = g_export.stage1.empty() ? g_export.outPath : g_export.stage1;
+    std::wstring cmd = Widen(g_pythonExe) + L" \"" + script + L"\" \"" + src +
+                       L"\" -o \"" + g_export.stageTmp + L"\"" + ProjectorArgs(W, H, false) +
+                       L" --audio copy";
     if (g_export.lookSchedule)
         cmd += L" --look-schedule \"" + g_workDir + L"looks.schedule\"";
+    cmd += L" --venc-file \"" + g_workDir + L"projector.venc\"";   // same encoder as stage 1
     g_export.cmd = Narrow(cmd);
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
     HANDLE log = CreateFileW(g_export.logFile.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
                              &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (log != INVALID_HANDLE_VALUE) {     // same header as stage 1, so "open log" names the run
+        std::string hdr = "# " + g_export.cmd + "\r\n";
+        DWORD wr = 0;
+        WriteFile(log, hdr.data(), (DWORD)hdr.size(), &wr, nullptr);
+    }
     STARTUPINFOW si = { sizeof(si) };
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdError = log;
@@ -4139,7 +4378,7 @@ static bool StartProjectorPass() {
                              CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
     if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
     if (!ok) {
-        g_export.message = "Exported, but python could not be launched.";
+        g_export.message = "python could not be launched for the projector pass - nothing exported.";
         g_export.failed = true;
         return false;
     }
@@ -4157,9 +4396,34 @@ static void PumpExport() {
     // Progress: last out_time_us= line in the progress file. Reopening and reading
     // it every frame fights ffmpeg for the same file for a bar that only needs to
     // move a few times a second, so the read is on its own clock.
+    // Stage 2 has no feed of its own, and stage 1's finished file is still lying there:
+    // reading it would pin the bar at full instead of the indeterminate sweep.
     static ULONGLONG lastProgRead = 0;
     ULONGLONG nowMs = GetTickCount64();
-    HANDLE f = (nowMs - lastProgRead < 100) ? INVALID_HANDLE_VALUE : CreateFileW(g_export.progressFile.c_str(), GENERIC_READ,
+    if (g_export.stage == 1 && g_export.clipShaders && !g_export.encoding &&
+        nowMs - lastProgRead >= 100) {
+        // The helper prints one line per shot it renders; the newest one is the step.
+        HANDLE lf = CreateFileW(g_export.logFile.c_str(), GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                OPEN_EXISTING, 0, nullptr);
+        if (lf != INVALID_HANDLE_VALUE) {
+            DWORD size = GetFileSize(lf, nullptr);
+            DWORD want = size > 4096 ? 4096 : size;
+            if (want > 0) {
+                SetFilePointer(lf, -(LONG)want, nullptr, FILE_END);
+                std::string buf(want, 0);
+                DWORD rd = 0;
+                ReadFile(lf, buf.data(), want, &rd, nullptr);
+                size_t p = buf.rfind("Clip shader ");
+                if (p != std::string::npos) {
+                    size_t e = buf.find_first_of("\r\n", p);
+                    g_export.shaderStep = buf.substr(p, e == std::string::npos ? e : e - p);
+                }
+            }
+            CloseHandle(lf);
+        }
+    }
+    HANDLE f = (g_export.stage != 1 || nowMs - lastProgRead < 100) ? INVALID_HANDLE_VALUE : CreateFileW(g_export.progressFile.c_str(), GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                            OPEN_EXISTING, 0, nullptr);
     if (f != INVALID_HANDLE_VALUE) {
@@ -4173,6 +4437,7 @@ static void PumpExport() {
             size_t p = buf.rfind("out_time_us=");
             if (p != std::string::npos) {
                 double us = atof(buf.c_str() + p + 12);
+                g_export.encoding = true;
                 if (g_export.totalDur > 0)
                     g_export.progress = (float)fmin(us / 1e6 / g_export.totalDur, 1.0);
             }
@@ -4190,6 +4455,7 @@ static void PumpExport() {
         if (g_export.stage == 2) {         // projector pass finished
             g_export.stage = 1;
             g_export.progress = 1.0f;
+            if (!g_export.stage1.empty()) DeleteFileW(g_export.stage1.c_str());   // lossless: huge
             if (code == 0 && MoveFileExW(g_export.stageTmp.c_str(), g_export.outPath.c_str(),
                                          MOVEFILE_REPLACE_EXISTING)) {
                 g_export.failed = false;
@@ -4203,17 +4469,19 @@ static void PumpExport() {
                 }
                 g_lastExportDir = DirName(g_export.outPath);
                 g_export.message = "Done (projector) — " + Narrow(BaseName(g_export.outPath));
+                if (!g_export.encNote.empty()) g_export.message += "  (" + g_export.encNote + ")";
             } else {
                 DeleteFileW(g_export.stageTmp.c_str());
                 g_export.toClipboard = false;
                 g_export.failed = true;
-                g_export.message = "Encode is fine, projector pass failed — see the log.";
+                g_export.message = "Projector pass failed — see the log.";
             }
             return;
         }
         if (code == 0 && g_export.wantProjector) {
             if (StartProjectorPass()) return;
-            g_lastExportDir = DirName(g_export.outPath);
+            // Stage 1 was only an intermediate, so there is nothing to hand over.
+            if (!g_export.stage1.empty()) DeleteFileW(g_export.stage1.c_str());
             g_export.progress = 1.0f;
             return;                        // message already explains what went wrong
         }
@@ -4229,9 +4497,11 @@ static void PumpExport() {
             }
             g_lastExportDir = DirName(g_export.outPath);
             g_export.message = "Done — " + Narrow(BaseName(g_export.outPath));
+            if (!g_export.encNote.empty()) g_export.message += "  (" + g_export.encNote + ")";
             g_export.progress = 1.0f;
         } else {
             g_export.toClipboard = false;
+            if (!g_export.stage1.empty()) DeleteFileW(g_export.stage1.c_str());
             // ffmpeg's *first* error line is the useful one — the last is usually the
             // generic "Invalid argument" epilogue, which says nothing on its own.
             g_export.message = "ffmpeg failed — see the log for details";
@@ -4271,7 +4541,7 @@ struct TimelineState {
     // drag state
     enum DragKind { None, LeftEdge, RightEdge, Move, Audio, AudioLeft, AudioRight,
                     LayerMove, LayerLeft, LayerRight, Scrub, RowResize, Fade,
-                    AspectMove, Marquee } drag = None;
+                    AspectMove, Marquee, RangeIn, RangeOut } drag = None;
     int    rzKind = 0;                    // 0 base, 1 overlay, 2 audio
     float  rzStartH = 0;
     float  rzStartY = 0;
@@ -4310,10 +4580,18 @@ struct TimelineState {
     // Where the ripple starts on the timeline, measured before the drag changed
     // anything: layer clips and sound at or after this point ride the ripple out.
     double rippleAt = -1e18;
+    // Ripple off: where a base shot being moved will be laid down, in timeline seconds.
+    double overwriteAt = -1;
+    int    overwriteUid = -1;             // the clip that drop belongs to
     // Ctrl-drag over the tracks draws a box; everything it touches is selected.
     ImVec2 boxFrom = ImVec2(0, 0);
     std::vector<int> boxKeep;             // what was already selected when it started
 } g_tl;
+
+// The stretch EXPORT RANGE renders, in timeline seconds; -1 = not marked. Set with
+// i / o at the playhead or by dragging its edges on the ruler.
+static double g_rangeIn = -1, g_rangeOut = -1;
+static bool HasRange() { return g_rangeIn >= 0 && g_rangeOut > g_rangeIn + 1e-3; }
 
 // text-card editor state, shared by "Add Text" and double-click-to-edit
 static char  g_textBuf[1024] = "";
@@ -5197,6 +5475,17 @@ static void DrawTimeline() {
             if (x1 < trackX || x0 > origin.x + avail.x) continue;
             if (x0 < trackX) x0 = trackX;
 
+            if (IsGap(c)) {
+                // Empty film: a faint outline and nothing else. It is not a clip to pick
+                // up or edit - hovering it only lets Delete close it.
+                dl->AddRect(ImVec2(x0 + 1, clipY + 2), ImVec2(x1 - 1, clipY + clipH - 2),
+                            IM_COL32(255, 255, 255, 22), 5.0f);
+                if (inTracks && io.MousePos.y >= clipY && io.MousePos.y <= clipY + clipH &&
+                    hotEdgeClip == -1 && io.MousePos.x > x0 && io.MousePos.x < x1)
+                    hotBody = i;
+                continue;
+            }
+
             if (c.kind == Clip::Video && c.vid) c.tex = ProxyFrame(*c.vid, c.trimIn);
             bool isDragged = g_tl.drag == TimelineState::Move && g_tl.dragIndex == i;
             bool selected = SelHas(c.uid);
@@ -5661,6 +5950,12 @@ static void DrawTimeline() {
 
     // ---- interactions
     bool overRuler = hovered && io.MousePos.y >= rulerY && io.MousePos.y <= rulerY + RULER_H;
+    int rangeEdge = 0;                     // -1 in, +1 out: the ruler grabs a range edge before it scrubs
+    if (overRuler && HasRange()) {
+        if (fabs(io.MousePos.x - SecToX(g_rangeOut)) <= 5) rangeEdge = 1;
+        else if (fabs(io.MousePos.x - SecToX(g_rangeIn)) <= 5) rangeEdge = -1;
+        if (rangeEdge) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    }
     if (ImGui::IsItemActivated()) {
         g_tl.dragStartMouseX = io.MousePos.x;
         g_tl.clickCollapseUid = -1;
@@ -5767,6 +6062,8 @@ static void DrawTimeline() {
             else if (g_selUids.size() > 1) g_tl.clickCollapseUid = mc.uid;
             SelAddGroupOf(mc);
             g_sel = hotMute; g_selTrack = -1;
+        } else if (hotBody >= 0 && IsGap(*g_clips[hotBody])) {
+            g_tl.drag = TimelineState::Scrub;     // a gap is empty film: clicking it scrubs
         } else if (hotBody >= 0 && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             g_tl.editIndex = hotBody;
             g_tl.editTrack = -1;
@@ -5793,6 +6090,8 @@ static void DrawTimeline() {
             g_tl.boxFrom = io.MousePos;
             if (!io.KeyShift) g_selUids.clear();
             g_tl.boxKeep = g_selUids;             // shift keeps what was already picked
+        } else if (rangeEdge != 0) {
+            g_tl.drag = rangeEdge < 0 ? TimelineState::RangeIn : TimelineState::RangeOut;
         } else if (overRuler || inTracks) {
             g_tl.drag = TimelineState::Scrub;
         }
@@ -5801,6 +6100,20 @@ static void DrawTimeline() {
     if (active && g_tl.drag != TimelineState::None) {
         double dSec = (double)(io.MousePos.x - g_tl.dragStartMouseX) / g_tl.pps;
         switch (g_tl.drag) {
+        case TimelineState::RangeIn:
+        case TimelineState::RangeOut: {
+            double t = XToSec(io.MousePos.x);
+            if (!io.KeyAlt) t = round(t * g_fps) / g_fps;           // land on a frame
+            double lim = TimelineEnd();
+            t = t < 0 ? 0 : (t > lim ? lim : t);
+            bool in = g_tl.drag == TimelineState::RangeIn;
+            if (in) g_rangeIn = fmax(0.0, fmin(t, g_rangeOut - MinClipDur()));
+            else    g_rangeOut = fmax(t, g_rangeIn + MinClipDur());
+            double at = in ? g_rangeIn : g_rangeOut;
+            ImGui::SetTooltip("%s %d:%05.2f  ·  range %.2f s", in ? "in" : "out",
+                              (int)at / 60, fmod(at, 60.0), g_rangeOut - g_rangeIn);
+            break;
+        }
         case TimelineState::RowResize: {
             float h = g_tl.rzStartH - (io.MousePos.y - g_tl.rzStartY);   // up = taller
             if (h < ROW_H_MIN) h = ROW_H_MIN;
@@ -5919,6 +6232,9 @@ static void DrawTimeline() {
                     auto mv = std::move(g_clips[g_tl.dragIndex]);
                     mv->start = s;
                     g_clips.erase(g_clips.begin() + g_tl.dragIndex);
+                    // Ripple off: the shot leaves its time behind as empty film instead
+                    // of the cut closing up over where it was.
+                    if (!g_rippleOn) { InsertGap(g_tl.dragIndex, mv->duration); MergeGaps(); }
                     g_over[dest]->clips.push_back(std::move(mv));
                     g_tl.dragTrack = dest;
                     g_tl.dragIndex = (int)g_over[dest]->clips.size() - 1;
@@ -5935,6 +6251,26 @@ static void DrawTimeline() {
             // a shot flip back and forth around a single pixel.
             const float DRAG_SLOP = 6.0f;
             if (fabsf(io.MousePos.x - g_tl.dragStartMouseX) < DRAG_SLOP) break;
+            if (!g_rippleOn) {
+                // Ripple off: the shot is not reordered, it is picked up. A ghost follows
+                // the pointer in time and the drop overwrites whatever it lands on.
+                int idx = g_tl.dragIndex;
+                if (idx < 0 || idx >= (int)g_clips.size()) break;
+                std::vector<BaseSpan> lay;
+                BaseLayout(lay);
+                double len = lay[idx].end - lay[idx].start;
+                double at = snapPos(lay[idx].start + dSec, g_clips[idx]->uid);
+                if (at < 0) at = 0;
+                g_tl.overwriteAt = at;
+                float gx0 = SecToX(at), gx1 = SecToX(at + len);
+                dl->AddRectFilled(ImVec2(gx0 + 1, clipY + 2), ImVec2(gx1 - 1, clipY + clipH - 2),
+                                  IM_COL32(255, 255, 255, 45), 5.0f);
+                dl->AddRect(ImVec2(gx0 + 1, clipY + 2), ImVec2(gx1 - 1, clipY + clipH - 2),
+                            IM_COL32(255, 255, 255, 220), 5.0f, 0, 2.0f);
+                ImGui::SetTooltip("overwrite at %d:%05.2f  ·  %.2f s", (int)at / 60,
+                                  fmod(at, 60.0), len);
+                break;
+            }
             {
                 int idx = g_tl.dragIndex;
                 if (idx < 0 || idx >= (int)g_clips.size()) break;
@@ -5990,6 +6326,21 @@ static void DrawTimeline() {
             bool ontoBase = false;
             for (auto& r : rows)
                 if (r.kind == 0 && io.MousePos.y >= r.y0 && io.MousePos.y <= r.y1) ontoBase = true;
+            g_tl.overwriteAt = -1;                // re-armed each frame it is over the base row
+            if (ontoBase && !g_rippleOn) {
+                // Ripple off: not folded in between shots (which pushes the film along) but
+                // shown where it will cover the base track; the drop lays it down.
+                g_tl.overwriteAt = c.start;
+                g_tl.overwriteUid = c.uid;
+                float gx0 = SecToX(c.start), gx1 = SecToX(c.start + c.duration);
+                dl->AddRectFilled(ImVec2(gx0 + 1, clipY + 2), ImVec2(gx1 - 1, clipY + clipH - 2),
+                                  IM_COL32(255, 255, 255, 45), 5.0f);
+                dl->AddRect(ImVec2(gx0 + 1, clipY + 2), ImVec2(gx1 - 1, clipY + clipH - 2),
+                            IM_COL32(255, 255, 255, 220), 5.0f, 0, 2.0f);
+                ImGui::SetTooltip("overwrite at %d:%05.2f  ·  %.2f s", (int)c.start / 60,
+                                  fmod(c.start, 60.0), c.duration);
+                break;
+            }
             if (ontoBase) {
                 double t = XToSec(io.MousePos.x);
                 double s = 0;
@@ -6262,8 +6613,48 @@ static void DrawTimeline() {
         // The ripple lands here: base shots downstream close up on their own, so the
         // layers and the sound over them move by the same amount.
         if ((g_tl.drag == TimelineState::LeftEdge || g_tl.drag == TimelineState::RightEdge) &&
-            g_tl.holdFrom >= 0 && g_tl.rippleAt > -1e17)
-            RippleOthers(g_tl.rippleAt, -g_tl.holdShift);
+            g_tl.holdFrom >= 0 && g_tl.rippleAt > -1e17) {
+            if (g_rippleOn) {
+                RippleOthers(g_tl.rippleAt, -g_tl.holdShift);
+            } else {
+                // Ripple off: the time the shot gave up stays on the film as a gap, on
+                // the side that was trimmed. Growing a shot overwrites its neighbours -
+                // gaps and shots alike - and only what cannot be taken (a sequence, the
+                // start of the film) still pushes.
+                bool head = g_tl.drag == TimelineState::LeftEdge;
+                int i = g_tl.dragIndex;
+                double shift = g_tl.holdShift;             // > 0: the shot got shorter
+                if (shift > 0) {
+                    InsertGap(head ? i : i + 1, shift);
+                } else if (shift < 0) {
+                    double left = OverwriteNeighbours(head ? i - 1 : i + 1, -shift, !head);
+                    if (left > 1e-9) RippleOthers(g_tl.rippleAt, left);
+                }
+                MergeGaps();
+            }
+        }
+        // Ripple off, a base shot let go after a move: lay it down where the ghost was.
+        if (g_tl.drag == TimelineState::Move && !g_rippleOn && g_tl.overwriteAt >= 0 &&
+            fabsf(io.MousePos.x - g_tl.dragStartMouseX) >= 4.0f) {
+            int ni = PlaceOverwrite(g_tl.dragIndex, g_tl.overwriteAt);
+            if (ni >= 0) { g_sel = ni; g_selTrack = -1; }
+        }
+        // Ripple off, a layer clip let go over the base track: it leaves its layer and
+        // covers the base track at the time it sits at. Checked by uid, in case the
+        // drop was already taken by something else (a sequence under the pointer).
+        if (g_tl.drag == TimelineState::LayerMove && !g_rippleOn && g_tl.overwriteAt >= 0 &&
+            g_tl.dragTrack >= 0 && g_tl.dragTrack < (int)g_over.size()) {
+            auto& src = g_over[g_tl.dragTrack]->clips;
+            if (g_tl.dragIndex >= 0 && g_tl.dragIndex < (int)src.size() &&
+                src[g_tl.dragIndex]->uid == g_tl.overwriteUid) {
+                auto mv = std::move(src[g_tl.dragIndex]);
+                src.erase(src.begin() + g_tl.dragIndex);
+                int ni = LayDownOverwrite(std::move(mv), g_tl.overwriteAt);
+                if (ni >= 0) { g_sel = ni; g_selTrack = -1; }
+            }
+        }
+        g_tl.overwriteAt = -1;
+        g_tl.overwriteUid = -1;
         g_tl.rippleAt = -1e18;
         g_tl.clickCollapseUid = -1;
         g_tl.drag = TimelineState::None;
@@ -6284,6 +6675,21 @@ static void DrawTimeline() {
     if (g_tl.drag == TimelineState::None && !io.WantTextInput &&
         io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_M, false))
         g_hushClips.store(!g_hushClips.load());
+
+    // export range: i / o mark it at the playhead, alt+x forgets it. Marking one end
+    // alone fills in the other from the film's own start or end.
+    if (g_tl.drag == TimelineState::None && !io.WantTextInput && !io.KeyCtrl) {
+        double ph = round(g_playhead.load() * g_fps) / g_fps;
+        if (!io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_I, false)) {
+            g_rangeIn = ph;
+            if (g_rangeOut <= ph + MinClipDur()) g_rangeOut = TimelineEnd();
+        }
+        if (!io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
+            g_rangeOut = ph;
+            if (g_rangeIn < 0 || g_rangeIn >= ph - MinClipDur()) g_rangeIn = 0;
+        }
+        if (io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_X, false)) g_rangeIn = g_rangeOut = -1;
+    }
 
     // trim the whole selection to the length of the shot the panel is on
     if (g_tl.drag == TimelineState::None && !io.WantTextInput &&
@@ -6369,9 +6775,16 @@ static void DrawTimeline() {
                 // still measured in the world the one before it left behind.
                 std::vector<BaseSpan> lay0;
                 BaseLayout(lay0);
-                for (int i = (int)g_clips.size() - 1; i >= 0; i--)
-                    if (SelHas(g_clips[i]->uid))
+                for (int i = (int)g_clips.size() - 1; i >= 0; i--) {
+                    if (!SelHas(g_clips[i]->uid)) continue;
+                    // Ripple off leaves the shot's time behind as a gap (the gap is a
+                    // new clip, unselected, so the sweep below keeps it). Deleting a gap
+                    // itself is how you close one, so that still ripples.
+                    if (g_rippleOn || IsGap(*g_clips[i]))
                         RippleOthers(lay0[i].end, -TimeLen(*g_clips[i]));
+                    else
+                        InsertGap(i + 1, TimeLen(*g_clips[i]));
+                }
             }
             auto sweep = [&](std::vector<std::unique_ptr<Clip>>& v) {
                 for (int i = (int)v.size() - 1; i >= 0; i--) {
@@ -6395,10 +6808,12 @@ static void DrawTimeline() {
             g_selUids.clear();
             g_sel = -1;
         } else if (hotBody >= 0) {
-            {
+            if (g_rippleOn || IsGap(*g_clips[hotBody])) {
                 std::vector<BaseSpan> lay0;
                 BaseLayout(lay0);
                 RippleOthers(lay0[hotBody].end, -TimeLen(*g_clips[hotBody]));
+            } else {
+                InsertGap(hotBody + 1, TimeLen(*g_clips[hotBody]));   // lands after, index stays
             }
             if (g_clips[hotBody]->tex && g_clips[hotBody]->kind != Clip::Video)
                 RetireTexture(g_clips[hotBody]->tex);
@@ -6458,6 +6873,24 @@ static void DrawTimeline() {
 
     // The text-card editor is opened by the root window (see DrawApp) so that the
     // toolbar button and this double-click share one popup id.
+
+    // ---- export range: dim what it leaves out, band the ruler over what it keeps
+    if (HasRange()) {
+        float bottom = rows.empty() ? origin.y + needH : rows.back().y1;
+        float right = origin.x + avail.x;
+        float xi = SecToX(g_rangeIn), xo = SecToX(g_rangeOut);
+        float ci = xi < trackX ? trackX : (xi > right ? right : xi);
+        float co = xo < trackX ? trackX : (xo > right ? right : xo);
+        const ImU32 dim = IM_COL32(0, 0, 0, 90);
+        if (ci > trackX) dl->AddRectFilled(ImVec2(trackX, rulerY + RULER_H), ImVec2(ci, bottom), dim);
+        if (co < right)  dl->AddRectFilled(ImVec2(co, rulerY + RULER_H), ImVec2(right, bottom), dim);
+        if (co > ci)
+            dl->AddRectFilled(ImVec2(ci, rulerY), ImVec2(co, rulerY + RULER_H),
+                              IM_COL32(230, 180, 90, 60));
+        const ImU32 edge = IM_COL32(230, 180, 90, 220);
+        if (xi >= trackX && xi <= right) dl->AddLine(ImVec2(xi, rulerY), ImVec2(xi, bottom), edge);
+        if (xo >= trackX && xo <= right) dl->AddLine(ImVec2(xo, rulerY), ImVec2(xo, bottom), edge);
+    }
 
     // ---- playhead
     double ph = g_playhead.load();
@@ -6562,6 +6995,17 @@ static void DrawOutputPanel() {
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::Checkbox("-14 LUFS", &g_loudnorm);
+
+    Prop("grain");                         // its own row: a third flag overflows a narrow panel
+    ImGui::BeginDisabled(IsNvenc(g_vcodec));
+    ImGui::Checkbox("keep##grain", &g_keepGrain);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip(IsNvenc(g_vcodec)
+            ? "H.264 / H.265 only - NVENC has no grain mode"
+            : "tell x264 / x265 to keep noise and grain instead of smoothing it,\n"
+              "and in Quality mode drop the bitrate ceiling so it can afford to\n"
+              "(much bigger files - fine for Vimeo, check before other uploads)");
 
     Prop("fade in");
     ImGui::SliderFloat("##fin", &g_fadeIn, 0.0f, 3.0f, "%.2f s");
@@ -6763,8 +7207,12 @@ float4 PSProjector(VSOut input) : SV_Target {
         // --- lens chromatic aberration ----------------------------------
         float2 rc  = (cuv - 0.5) * float2(aspect, 1.0);
         float2 cav = (cuv - 0.5) * dot(rc, rc) * 0.0035 * fxAber;
-        t.r = sampleSrc(cuv - cav).r;
-        t.b = sampleSrc(cuv + cav).b;
+        // Lateral aberration is a spread of wavelengths, not one shifted copy, so each
+        // fringe is smeared along its own offset. A single-tap shift is a hard coloured
+        // edge on a sharp source (the full-res export) and only looked soft on a soft
+        // one (the preview proxy). Same mean offset, so the amount is unchanged.
+        t.r = (sampleSrc(cuv - cav * 0.5).r + sampleSrc(cuv - cav).r + sampleSrc(cuv - cav * 1.5).r) / 3.0;
+        t.b = (sampleSrc(cuv + cav * 0.5).b + sampleSrc(cuv + cav).b + sampleSrc(cuv + cav * 1.5).b) / 3.0;
 
         // --- soft ring blur: halation + focus breathing ------------------
         float3 blur = t.rgb;
@@ -8369,8 +8817,11 @@ static std::string ProjectToText(bool undoMode = false, bool includeBranches = t
     PutI(o, "abrIdx", g_abrIdx);
     PutI(o, "loudnorm", g_loudnorm);
     PutI(o, "faststart", g_faststart);
+    PutI(o, "keepGrain", g_keepGrain);
     PutN(o, "fadeIn", g_fadeIn);
     PutN(o, "fadeOut", g_fadeOut);
+    PutN(o, "rangeIn", g_rangeIn);
+    PutN(o, "rangeOut", g_rangeOut);
     PutI(o, "preview", g_preview);
     PutW(o, "namePrefix", g_namePrefix);
     PutW(o, "lastExportDir", g_lastExportDir);
@@ -8621,8 +9072,11 @@ static void ApplySettings(const KV& kv, double savedPh, float savedPps, float sa
     g_abrIdx = kv.i("abrIdx", g_abrIdx);
     g_loudnorm = kv.b("loudnorm");
     g_faststart = kv.b("faststart", true);
+    g_keepGrain = kv.b("keepGrain");
     g_fadeIn = (float)kv.num("fadeIn", g_fadeIn);
     g_fadeOut = (float)kv.num("fadeOut", g_fadeOut);
+    g_rangeIn = kv.num("rangeIn", -1);
+    g_rangeOut = kv.num("rangeOut", -1);
     g_preview = kv.i("preview", g_preview);
     g_namePrefix = Widen(kv.str("namePrefix", Narrow(g_namePrefix).c_str()));
     g_lastExportDir = Widen(kv.str("lastExportDir"));
@@ -9574,6 +10028,98 @@ static void TrimToSelection(const std::vector<int>& uids) {
     }
 }
 
+// Cut the whole project down to [r0, r1) and pull it back to zero, so a render of what
+// is left is that stretch of the real film. Shots crossing an edge are trimmed, not
+// dropped: the source in-point moves with the head (or the tail, when reversed), and
+// sound blocks the same way. Runs on a snapshot, after nests on the base are opened.
+static void TrimToRange(double r0, double r1) {
+    std::vector<BaseSpan> lay;
+    BaseLayout(lay);
+    MixGuard lock;                                 // the mixer must not be in these lists
+    auto cut = [](Clip& c, double head, double tail) {
+        if (c.kind == Clip::Video) c.trimIn += c.reversed ? tail : head;
+        if (c.dxOn && c.dxIsVideo) c.dxTrimIn += head;
+        c.duration -= head + tail;
+    };
+
+    std::vector<std::unique_ptr<Clip>> kept;
+    for (size_t i = 0; i < g_clips.size(); i++) {
+        Clip& c = *g_clips[i];
+        if (c.skip || lay[i].end <= r0 + 1e-6 || lay[i].start >= r1 - 1e-6) continue;
+        double head = fmax(0.0, r0 - lay[i].start);
+        // The range opens inside a dissolve: the shot fading out has lost the same head,
+        // so the overlap left between the two is only what remains of it.
+        if (head > 0 && !kept.empty()) kept.back()->xfade = fmax(0.0, kept.back()->xfade - head);
+        cut(c, head, fmax(0.0, lay[i].end - r1));
+        kept.push_back(std::move(g_clips[i]));
+    }
+    if (!kept.empty()) kept.back()->xfade = 0;     // nothing after it to dissolve into
+    g_clips = std::move(kept);
+
+    // The film is as long as the range: a base cut that ends early gets a blank card,
+    // so layers and sound past its end still make it in.
+    double len = r1 - r0, baseEnd = TotalDuration();
+    if (baseEnd < len - 1e-3) {
+        auto blank = std::make_unique<Clip>();
+        blank->kind = Clip::Text;                  // an empty card is a plain black frame
+        blank->label = "blank";
+        blank->duration = len - baseEnd;
+        g_clips.push_back(std::move(blank));
+    }
+
+    for (auto& t : g_over)
+        for (size_t i = 0; i < t->clips.size(); ) {
+            Clip& c = *t->clips[i];
+            double s = c.start, e = c.start + c.duration;
+            if (e <= r0 + 1e-6 || s >= r1 - 1e-6) { t->clips.erase(t->clips.begin() + i); continue; }
+            if (c.kind == Clip::Nest) {
+                // A sequence has no in-point of its own: slide it back and let the head
+                // fall before zero. Its length stays, or a reversed one would remap.
+                c.start = s - r0;
+            } else {
+                cut(c, fmax(0.0, r0 - s), fmax(0.0, e - r1));
+                c.start = fmax(s, r0) - r0;
+            }
+            i++;
+        }
+
+    for (auto& t : g_atracks)
+        for (size_t i = 0; i < t->blocks.size(); ) {
+            Song& b = *t->blocks[i];
+            double s = b.offset, e = s + (b.trimEnd - b.trimStart);
+            if (e <= r0 + 1e-6 || s >= r1 - 1e-6) { t->blocks.erase(t->blocks.begin() + i); continue; }
+            double head = fmax(0.0, r0 - s), tail = fmax(0.0, e - r1);
+            if (b.reversed) { b.trimEnd -= head; b.trimStart += tail; }
+            else            { b.trimStart += head; b.trimEnd -= tail; }
+            b.offset = fmax(s, r0) - r0;
+            i++;
+        }
+}
+
+// The delivery name with the range in it, so a test render is never mistaken for the film.
+static std::wstring RangeOutputName() {
+    std::wstring n = DefaultOutputName();
+    wchar_t tag[64];
+    swprintf(tag, 64, L"_range_%dm%02d-%dm%02d",
+             (int)g_rangeIn / 60, (int)g_rangeIn % 60, (int)g_rangeOut / 60, (int)g_rangeOut % 60);
+    size_t dot = n.rfind(L'.');
+    n.insert(dot == std::wstring::npos ? n.size() : dot, tag);
+    return n;
+}
+
+// EXPORT RANGE: the marked stretch through the real export - same encoder, projector
+// pass, screens, layers and sound - then the project put back exactly as it was.
+static void ExportRange(const std::wstring& outPath) {
+    if (!HasRange()) return;
+    std::string snap = ProjectToText();
+    g_undoBusy = true;
+    FlattenNestsHere();
+    TrimToRange(g_rangeIn, g_rangeOut);
+    StartExport(outPath);                          // spawns before it returns
+    LoadProjectFromText(snap, true);               // sync, as in ExportFlattened
+    g_undoBusy = false;
+}
+
 // Ctrl+Shift+C: put the picked shots on the Windows clipboard as a file, so anything
 // that takes a dropped file takes a paste from here. A single untouched still goes
 // over as its own source file; everything else is rendered to a temp film first and
@@ -9935,6 +10481,19 @@ static void ClipToolBar(bool doAdd) {
             ImGui::SetTooltip(hush ? "shift+m — clip sound is off in the preview (music tracks still play)"
                                    : "shift+m — silence every clip's own sound while editing (export unaffected)");
     }
+    nextTool();
+    {   // ripple: trims and deletes close the film up, or leave a gap and move nothing
+        bool off = !g_rippleOn;
+        if (off) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        if (ImGui::Button(off ? "NO RIPPLE" : "RIPPLE", md)) g_rippleOn = !g_rippleOn;
+        if (off) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(off ? "ripple is off — overwrite editing: nothing after an edit moves\n"
+                                    "drag a shot anywhere and it covers what it lands on\n"
+                                    "stretch an edge and it eats into the shot beside it\n"
+                                    "trims and deletes leave empty film (hover it, delete to close)"
+                                  : "ripple is on — trims and deletes close the film up and everything after follows");
+    }
 
     // ---- where you are: the reel, then every sequence you stepped into. Each
     // one steps back to that level, so the depth is never a guess.
@@ -10086,6 +10645,7 @@ static void DrawApp() {
             "ctrl+f fold sequence     ctrl+u unfold\n"
             "ctrl+down step in        ctrl+up  step out\n"
             "m      mute / unmute\n"
+            "i / o  range in / out    alt+x  clear range\n"
             "ctrl+b snapshot to backups\n"
             "ctrl-click add to sel    shift-click range\n"
             "del    remove hovered    ctrl+i  add media\n"
@@ -10120,12 +10680,38 @@ static void DrawApp() {
                      W, H, g_fps, codec, g_targetMbps);
         const char* exp = g_container == CT_MOV ? "EXPORT MOV"
                         : g_container == CT_MKV ? "EXPORT MKV" : "EXPORT MP4";
+        const char* rexp = "EXPORT RANGE";
         float need = ImGui::CalcTextSize(spec).x + ImGui::CalcTextSize(exp).x +
-                     ImGui::GetStyle().FramePadding.x * 2 +
-                     ImGui::GetStyle().ItemSpacing.x * 2 + 12;
+                     ImGui::CalcTextSize(rexp).x + ImGui::CalcTextSize("x").x +
+                     ImGui::GetStyle().FramePadding.x * 6 +
+                     ImGui::GetStyle().ItemSpacing.x * 4 + 12;
         float x = ImGui::GetWindowContentRegionMax().x - need;
         if (x > ImGui::GetCursorPosX() + 12) ImGui::SameLine(x); else ImGui::SameLine();
         ImGui::TextDisabled("%s", spec);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(g_clips.empty() || g_export.active || !HasRange());
+        if (ImGui::Button(rexp)) {
+            std::wstring out = PickSaveVideo(RangeOutputName(), ContainerExt(g_container),
+                                             SuggestExportDir());
+            if (!out.empty()) ExportRange(out);
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (HasRange())
+                ImGui::SetTooltip("render %d:%05.2f - %d:%05.2f (%.2f s) with the export settings",
+                                  (int)g_rangeIn / 60, fmod(g_rangeIn, 60.0),
+                                  (int)g_rangeOut / 60, fmod(g_rangeOut, 60.0),
+                                  g_rangeOut - g_rangeIn);
+            else
+                ImGui::SetTooltip("press i / o on the timeline to mark a range");
+        }
+        ImGui::SameLine(0, 3);
+        // Always laid out, only live with a range: the row is right-aligned, so a
+        // button that came and went would shove everything beside it.
+        ImGui::BeginDisabled(!HasRange());
+        if (ImGui::Button("x##range")) g_rangeIn = g_rangeOut = -1;
+        ImGui::EndDisabled();
+        if (HasRange() && ImGui::IsItemHovered()) ImGui::SetTooltip("clear the range (alt+x)");
         ImGui::SameLine();
         ImGui::BeginDisabled(g_clips.empty() || g_export.active);
         if (ImGui::Button(exp) || (doExport && !g_clips.empty() && !g_export.active)) {
@@ -10150,6 +10736,31 @@ static void DrawApp() {
         else if (!g_projectStatus.empty()) msg = g_projectStatus.c_str();
 
         if (g_export.active) {
+            // Which stage of the run this is, above the bar: screen passes, the encode,
+            // then the projector look - numbered out of the stages this export has.
+            {
+                int total = 1 + (g_export.clipShaders ? 1 : 0) + (g_export.wantProjector ? 1 : 0);
+                int at;
+                std::string what;
+                if (g_export.stage == 2) {
+                    at = total;
+                    what = "Projector shader pass";
+                } else if (g_export.clipShaders && !g_export.encoding) {
+                    at = 1;
+                    what = g_export.shaderStep.empty() ? "Clip shaders: starting"
+                                                       : g_export.shaderStep;
+                } else {
+                    at = g_export.clipShaders ? 2 : 1;
+                    char pct[32] = "";
+                    if (g_export.progress >= 0)
+                        snprintf(pct, sizeof(pct), " (%d%%)", (int)(g_export.progress * 100));
+                    what = std::string("Encoding with ffmpeg") + pct;
+                }
+                ImGui::TextDisabled("Stage %d/%d: %s%s%s%s", at, total, what.c_str(),
+                                    g_export.toClipboard ? "  - for the clipboard" : "",
+                                    g_export.encNote.empty() ? "" : "  - ",
+                                    g_export.encNote.c_str());
+            }
             // Stage 2 has no progress feed, so run the bar as an indeterminate sweep.
             float p = g_export.progress < 0 ? -1.0f * (float)ImGui::GetTime() : g_export.progress;
             ImGui::ProgressBar(p, ImVec2(-1, 6),

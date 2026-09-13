@@ -3503,7 +3503,27 @@ static bool FlattenNestsHere() {
             w->ovlShadow = n.ovlShadow;
             words.push_back(std::move(w));
         }
+        // A sequence can run longer than its own cut - one made of layers alone has no
+        // cut at all. Opened out, only the cut takes up room on the base track, so
+        // everything after it would slide earlier while the sound stays put. A blank
+        // card holds the rest of its length: black, what the preview shows there too.
+        double gap = n.duration;
+        size_t inner = 0;
+        if (Sequence* q = FindSeq(n.nest)) {
+            std::vector<BaseSpan> cut;
+            BaseLayoutIn(q->clips, cut);
+            for (size_t k = 0; k < cut.size(); k++)
+                if (!q->clips[k]->skip) gap = std::min(gap, n.duration - cut[k].end);
+            inner = q->clips.size();
+        }
         UnfoldNest(idx);
+        if (gap > 1e-4) {
+            auto blank = std::make_unique<Clip>();
+            blank->kind = Clip::Text;              // an empty card is a plain black frame
+            blank->label = "blank";
+            blank->duration = gap;
+            g_clips.insert(g_clips.begin() + idx + inner, std::move(blank));
+        }
         did = true;
     }
     if (!words.empty()) {
@@ -3896,7 +3916,9 @@ static void StartExport(const std::wstring& outPath) {
         wchar_t seg[768];
         swprintf(seg, 768,
                  L"drawtext=fontfile=font.ttf:textfile=%ls%d.txt:"
-                 L"fontcolor=0x%06x@%.3f:fontsize=%d:line_spacing=%d:"
+                 // text_align=C: every line centred in the block, the way the preview
+                 // lays them out - drawtext's default starts each one at the left.
+                 L"fontcolor=0x%06x@%.3f:fontsize=%d:line_spacing=%d:text_align=C:"
                  L"x=(w*%.4f-text_w/2):y=(h*%.4f-text_h/2)%ls",
                  card ? L"t" : L"o", c.uid,
                  rgb, c.ovlAlpha, fs, fs / 4,

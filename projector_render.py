@@ -66,7 +66,6 @@ RES_PRESETS = {
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".tga"}
 
-
 def parse_res(text: str) -> tuple[int, int]:
     key = text.strip().lower()
     if key in RES_PRESETS:
@@ -447,7 +446,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--look", type=int, default=0,
                    help="play every frame on this screen instead of through the "
                         "projector: 1 CRT, 2 CCTV, 3 CCTV on a CRT. The plate, gate "
-                        "and wall are skipped entirely -- a set is not a projector.")
+                        "and wall are skipped entirely -- a set is not a projector. "
+                        "The set is measured on a 540p raster, so it looks the same at "
+                        "every output size; the picture keeps its full detail.")
     p.add_argument("--pillarbox", action="store_true",
                    help="with --look, crop the frame to a centred 4:3 window, the "
                         "shape a tube and a CCTV monitor actually are")

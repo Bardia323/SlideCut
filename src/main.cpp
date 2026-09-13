@@ -238,6 +238,10 @@ struct Clip {
     bool         skip = false;             // muted: the film runs straight past it
     int          look = LOOK_PROJECTOR;    // which screen this shot plays on
     bool         look43 = false;           // crop that screen to real 4:3 glass
+    // Export only, never saved: what a range render cut off the head and tail of a
+    // sequence. It still renders whole on its own clock and is trimmed after, so a
+    // screen's clock and everything inside stay where the preview has them.
+    double       nestHead = 0.0, nestTail = 0.0;
     Grade        grade;                    // this shot's own colour
     double       xfade = 0.0;              // dissolve into the next shot, seconds
     bool         useAudio = true;          // mix this clip's own audio into the export
@@ -2585,6 +2589,7 @@ static void UnfoldNest(int index) {
     q->clips.clear();
     for (auto& t : q->over) {
         int dst = NewOverlayTrack();
+        g_over[dst]->visible = t->visible;     // a hidden layer stays hidden
         for (auto& c : t->clips) {
             if (rev) {
                 c->start = dur - (c->start + c->duration);
@@ -2645,6 +2650,7 @@ static void UnfoldNestOnTrack(int track, int index) {
     q->clips.clear();
     for (auto& t : q->over) {
         int dst = NewOverlayTrack();
+        g_over[dst]->visible = t->visible;     // a hidden layer stays hidden
         for (auto& c : t->clips) {
             if (rev) {
                 c->start = dur - (c->start + c->duration);
@@ -3416,10 +3422,15 @@ static bool PrepareWorkDir() {
     g_workDir = std::wstring(tmp) + L"slidecut_work\\";
     CreateDirectoryW(g_workDir.c_str(), nullptr);
 
-    // every clip on every video track
+    // every clip on every video track, and inside every sequence: a sequence the
+    // export keeps whole still burns the words of the clips it holds
     std::vector<Clip*> all;
     for (auto& c : g_clips) all.push_back(c.get());
     for (auto& t : g_over) for (auto& c : t->clips) all.push_back(c.get());
+    for (auto& q : g_seqs) {
+        for (auto& c : q->clips) all.push_back(c.get());
+        for (auto& t : q->over) for (auto& c : t->clips) all.push_back(c.get());
+    }
 
     bool needFont = false;
     for (Clip* c : all)
@@ -3451,20 +3462,53 @@ static bool PrepareWorkDir() {
 // Rendering does not understand nesting: every sequence is opened out into plain
 // clips, layers and music first. The project is reloaded from a snapshot right
 // after, so the flattening is never something the editor sees.
+// How long a sequence renders on its own clock: all of it, whatever a range cut off.
+static double NestLen(const Clip& n) { return n.duration + n.nestHead + n.nestTail; }
+
 static bool FlattenNestsHere() {
     bool did = false;
+    // Opened out, a sequence is gone and so is the text overlay it carried. Its words
+    // come back as a text clip of the same length and place, on a track of their own
+    // above everything unfolding brings up: the preview draws them over the lot.
+    std::vector<std::unique_ptr<Clip>> words;
     for (int guard = 0; guard < 256; guard++) {
+        // A sequence on a screen of its own is not opened: the screen shows the whole
+        // sequence at once, and opened out there would be nothing left to put it on.
         int idx = -1;
         for (int i = 0; i < (int)g_clips.size(); i++)
-            if (g_clips[i]->kind == Clip::Nest) { idx = i; break; }
+            if (g_clips[i]->kind == Clip::Nest &&
+                (g_clips[i]->skip || g_clips[i]->look == LOOK_PROJECTOR)) { idx = i; break; }
         if (idx < 0) break;
         if (g_clips[idx]->skip) {          // muted: it never reaches the film
             g_clips.erase(g_clips.begin() + idx);
             did = true;
             continue;
         }
+        const Clip& n = *g_clips[idx];
+        if (n.ovlOn && !n.ovlText.empty()) {
+            std::vector<BaseSpan> lay;
+            BaseLayout(lay);
+            auto w = std::make_unique<Clip>();
+            w->kind = Clip::Text;
+            w->label = n.label;
+            w->start = lay[idx].start;
+            w->duration = n.duration;
+            w->ovlOn = true;
+            w->ovlText = n.ovlText;
+            w->ovlScale = n.ovlScale;
+            w->ovlX = n.ovlX;
+            w->ovlY = n.ovlY;
+            for (int k = 0; k < 3; k++) w->ovlCol[k] = n.ovlCol[k];
+            w->ovlAlpha = n.ovlAlpha;
+            w->ovlShadow = n.ovlShadow;
+            words.push_back(std::move(w));
+        }
         UnfoldNest(idx);
         did = true;
+    }
+    if (!words.empty()) {
+        int t = NewOverlayTrack();
+        for (auto& w : words) g_over[t]->clips.push_back(std::move(w));
     }
     // A nest on an overlay track is NOT opened out. A sequence is one picture: it
     // composites onto a canvas of its own and is blended into the cut once, in its
@@ -3513,24 +3557,45 @@ static bool FlattenNestsHere() {
             for (auto& c : t->clips)
                 if (c->kind == Clip::Nest && !c->skip)
                     liftAudio(*c, c->start, c->reversed);
+        // The same for a sequence left whole on the base cut because it plays on a
+        // screen. The sound of its own shots rides in its slot of the cut instead.
+        std::vector<BaseSpan> lay;
+        BaseLayout(lay);
+        for (size_t i = 0; i < g_clips.size(); i++)
+            if (g_clips[i]->kind == Clip::Nest && !g_clips[i]->skip)
+                liftAudio(*g_clips[i], lay[i].start, g_clips[i]->reversed);
     }
     return did;
 }
 
 // Returns "" when the grade is neutral, so a clip with no colour work on it adds
 // nothing to the graph at all.
+// The same steps as ApplyGrade in the preview shader, in RGB and in its order:
+// brightness, contrast about mid-grey, warmth on red and blue, saturation about luma.
+// eq works on luma in YUV instead, and its brightness lands visibly off the preview.
 static std::wstring GradeFilter(const Grade& g) {
     if (!g.On()) return L"";
-    wchar_t buf[256];
-    float sat = g.mono ? 0.0f : g.sat;
-    swprintf(buf, 256, L"eq=brightness=%.4f:contrast=%.4f:saturation=%.4f",
-             g.bright, g.contrast, sat);
-    std::wstring out = buf;
+    wchar_t buf[512];
+    const double c = 1.0 + (g.contrast - 1.0);
+    const double off = 255.0 * g.bright - 127.5;
+    std::wstring e;
+    swprintf(buf, 512, L"(val%+.4f)*%.4f+127.5", off, c);
+    e = buf;
+    std::wstring out = L"lutrgb=r=" + e + L":g=" + e + L":b=" + e;
     if (fabsf(g.temp) > 1e-4f) {
-        // colorbalance barely moves an already-saturated colour; the preview shader
-        // scales the red and blue channels, so the export has to do the same thing.
-        swprintf(buf, 256, L",colorchannelmixer=rr=%.4f:bb=%.4f",
+        swprintf(buf, 512, L",colorchannelmixer=rr=%.4f:bb=%.4f",
                  1.0f + 0.25f * g.temp, 1.0f - 0.25f * g.temp);
+        out += buf;
+    }
+    const double s = g.mono ? 0.0 : g.sat;
+    if (fabs(s - 1.0) > 1e-4) {
+        const double k = 1.0 - s;
+        swprintf(buf, 512,
+                 L",colorchannelmixer=rr=%.4f:rg=%.4f:rb=%.4f:gr=%.4f:gg=%.4f:gb=%.4f"
+                 L":br=%.4f:bg=%.4f:bb=%.4f",
+                 0.299 * k + s, 0.587 * k, 0.114 * k,
+                 0.299 * k, 0.587 * k + s, 0.114 * k,
+                 0.299 * k, 0.587 * k, 0.114 * k + s);
         out += buf;
     }
     return out;
@@ -3567,9 +3632,10 @@ static void StartExport(const std::wstring& outPath) {
     auto nestItems = [](Clip& n, double at, bool rev, std::vector<LayerItem>& out) {
         Sequence* q = FindSeq(n.nest);
         if (!q) return;
+        const double len = NestLen(n);
         double acc = 0;
         for (auto& b : q->clips) {
-            double s = rev ? n.duration - (acc + b->duration) : acc;
+            double s = rev ? len - (acc + b->duration) : acc;
             acc += b->duration;
             if (b->skip || b->duration <= 0.001) continue;
             out.push_back({ b.get(), at + s, b->duration, 0, 1.0f, rev != b->reversed });
@@ -3578,7 +3644,7 @@ static void StartExport(const std::wstring& outPath) {
             if (!t->visible) continue;
             for (auto& c : t->clips) {
                 if (c->skip || c->duration <= 0.001) continue;
-                double s = rev ? n.duration - (c->start + c->duration) : c->start;
+                double s = rev ? len - (c->start + c->duration) : c->start;
                 out.push_back({ c.get(), at + s, c->duration, c->lblend, c->lopacity,
                                 rev != c->reversed });
             }
@@ -3608,6 +3674,8 @@ static void StartExport(const std::wstring& outPath) {
         };
         for (Clip* c : layers)
             if (c->kind == Clip::Nest) walkNest(*c, c->reversed);
+        for (auto& c : g_clips)            // a base sequence left whole for its screen
+            if (c->kind == Clip::Nest && !c->skip) walkNest(*c, c->reversed);
     }
 
     bool anyPending = false, anyProbing = false;
@@ -3672,18 +3740,17 @@ static void StartExport(const std::wstring& outPath) {
             dIn[c.uid] = nIn++;
         }
     };
-    for (auto& c : g_clips) if (!c->skip) addClipInputs(*c);
+    for (auto& c : g_clips) if (!c->skip && c->kind != Clip::Nest) addClipInputs(*c);
     for (Clip* c : layers)  if (c->kind != Clip::Nest) addClipInputs(*c);
     for (Clip* c : nested)  addClipInputs(*c);
-    // One transparent canvas per nest, the length of the film, so a sequence can be
-    // composited in the parent's own time and dropped on in one piece.
+    // One transparent canvas per nest, as long as the sequence, so it can be composited
+    // on its own clock and dropped into its parent in one piece.
     std::map<int, int> nestIn;
     {
-        double filmLen = TotalDuration();
         for (Clip* n : nests) {
             wchar_t seg[160];
             swprintf(seg, 160, L" -f lavfi -t %.4f -i color=c=black:s=%dx%d:r=%d",
-                     filmLen, W, H, FPS);
+                     NestLen(*n), W, H, FPS);
             cmd += seg;
             nestIn[n->uid] = nIn++;
         }
@@ -3703,11 +3770,17 @@ static void StartExport(const std::wstring& outPath) {
 
     // Any clip contributing its own audio forces the concat to carry an audio pad,
     // so every other clip needs a matching block of silence.
+    // A sequence kept whole on the base cut counts by the shots of its own cut.
+    std::function<bool(const Clip&)> ownSound = [&](const Clip& c) -> bool {
+        if (c.kind == Clip::Video) return c.useAudio && c.vid && c.vid->hasAudio;
+        if (c.kind != Clip::Nest) return false;
+        if (Sequence* q = FindSeq(c.nest))
+            for (auto& b : q->clips) if (!b->skip && ownSound(*b)) return true;
+        return false;
+    };
     bool clipAudio = false;
     for (auto& c : g_clips)
-        if (c->skip) continue;
-        else if (c->kind == Clip::Video && c->useAudio && c->vid && c->vid->hasAudio)
-            clipAudio = true;
+        if (!c->skip && ownSound(*c)) clipAudio = true;
     bool music = !aIns.empty();
     bool audio = music || clipAudio;
 
@@ -3808,7 +3881,59 @@ static void StartExport(const std::wstring& outPath) {
     const std::wstring lookInputs = cmd;
     std::string lookJobs;
 
-    auto ClipChain = [&](Clip& c, bool layer, bool reversed, int look = LOOK_PROJECTOR) {
+    // A clip's words as a drawtext - the card's own, or the overlay burned over its
+    // picture - or "" when it has none.
+    auto TextFilter = [&](const Clip& c) -> std::wstring {
+        bool card = c.kind == Clip::Text && !c.text.empty();
+        bool ovl  = c.ovlOn && !c.ovlText.empty();
+        if (!card && !ovl) return L"";
+        float scale = card ? c.textScale : c.ovlScale;
+        int fs = (int)(scale * H);
+        if (fs < 8) fs = 8;
+        unsigned rgb = ((unsigned)(c.ovlCol[0] * 255) << 16) |
+                       ((unsigned)(c.ovlCol[1] * 255) << 8) |
+                        (unsigned)(c.ovlCol[2] * 255);
+        wchar_t seg[768];
+        swprintf(seg, 768,
+                 L"drawtext=fontfile=font.ttf:textfile=%ls%d.txt:"
+                 L"fontcolor=0x%06x@%.3f:fontsize=%d:line_spacing=%d:"
+                 L"x=(w*%.4f-text_w/2):y=(h*%.4f-text_h/2)%ls",
+                 card ? L"t" : L"o", c.uid,
+                 rgb, c.ovlAlpha, fs, fs / 4,
+                 c.ovlX, c.ovlY,
+                 c.ovlShadow ? L":shadowcolor=black@0.55:shadowx=2:shadowy=2" : L"");
+        return seg;
+    };
+
+    // A picture on a screen of its own - one shot, or a whole sequence - is rendered by
+    // itself, before any track blending, so the render matches the preview: whatever
+    // is layered over it stays off the glass. Its slice of the graph, everything from
+    // chainStart on and ending in [v<uid>], is lifted out here and replaced by the file
+    // that slice will have produced. Returns the label that file arrives in.
+    auto LiftLook = [&](int uid, int look, bool pillar, double dur, size_t chainStart) {
+        const std::string name = "look_" + std::to_string(uid);
+        const std::wstring graph = fc.substr(chainStart);
+        if (!WriteWholeFile(g_workDir + Widen(name + ".graph"), Narrow(graph)))
+            lookJobs += "ERROR\n";
+        lookJobs += name + " " + std::to_string(look) + " "
+                  + std::to_string(dur) + (pillar ? " 1" : " 0") + "\n";
+        fc.resize(chainStart);
+        // No fps filter here: the renderer already wrote exactly this picture's frames
+        // at the project rate, and an fps pass over them drops the last one.
+        wchar_t back[256];
+        // format=rgba: the layer blend pulls alpha out of this, and must never meet a
+        // file that has none ("Requested planes not available").
+        swprintf(back, 256, L"movie=%ls.mkv,format=rgba,settb=1/%d,setpts=N,setsar=1[lk%d];",
+                 Widen(name).c_str(), FPS, uid);
+        fc += back;
+        swprintf(back, 256, L"lk%d", uid);
+        return std::wstring(back);
+    };
+
+    // `words` false: a sequence above owns the screen, and burns this clip's words
+    // itself once the screen has run.
+    auto ClipChain = [&](Clip& c, bool layer, bool reversed, int look = LOOK_PROJECTOR,
+                         bool words = true) {
         const size_t chainStart = fc.size();
         wchar_t seg[768];
         wchar_t cur[32];
@@ -3817,9 +3942,17 @@ static void StartExport(const std::wstring& outPath) {
 
         if (c.kind == Clip::Text) {        // the lavfi colour source is already canvas-size
             // format=rgba: the colour source carries no alpha plane, and a card on a
-            // layer track goes through the masked blend, which extracts one. Opaque
-            // black, the same card the preview draws.
-            swprintf(seg, 768, L"[%d:v]fps=%d,format=rgba,setsar=1[%ls];", vIn[c.uid], FPS, stage.c_str());
+            // layer track goes through the masked blend, which extracts one. On the base
+            // track it is the opaque black card the preview draws. On a layer the preview
+            // draws only its words, so the shot or sequence underneath shows round them:
+            // the bed goes clear, in the text's own colour so the soft edges of the
+            // letters do not fringe dark once they are blended.
+            if (layer)
+                swprintf(seg, 768, L"[%d:v]fps=%d,format=rgba,lutrgb=r=%d:g=%d:b=%d:a=0,setsar=1[%ls];",
+                         vIn[c.uid], FPS, (int)(c.ovlCol[0] * 255), (int)(c.ovlCol[1] * 255),
+                         (int)(c.ovlCol[2] * 255), stage.c_str());
+            else
+                swprintf(seg, 768, L"[%d:v]fps=%d,format=rgba,setsar=1[%ls];", vIn[c.uid], FPS, stage.c_str());
             fc += seg;
         } else {
             FitOne(vIn[c.uid], stage, c.lfit, c.lanchor);
@@ -3869,75 +4002,187 @@ static void StartExport(const std::wstring& outPath) {
             stage = out;
         }
 
-        // Text: the card's own words, or an overlay burned over the picture.
-        bool card = c.kind == Clip::Text && !c.text.empty();
-        bool ovl  = c.ovlOn && !c.ovlText.empty();
-        if (card || ovl) {
-            float scale = card ? c.textScale : c.ovlScale;
-            int fs = (int)(scale * H);
-            if (fs < 8) fs = 8;
-            unsigned rgb = ((unsigned)(c.ovlCol[0] * 255) << 16) |
-                           ((unsigned)(c.ovlCol[1] * 255) << 8) |
-                            (unsigned)(c.ovlCol[2] * 255);
-            swprintf(seg, 768,
-                     L"[%ls]drawtext=fontfile=font.ttf:textfile=%ls%d.txt:"
-                     L"fontcolor=0x%06x@%.3f:fontsize=%d:line_spacing=%d:"
-                     L"x=(w*%.4f-text_w/2):y=(h*%.4f-text_h/2)%ls,setsar=1[v%d];",
-                     stage.c_str(), card ? L"t" : L"o", c.uid,
-                     rgb, c.ovlAlpha, fs, fs / 4,
-                     c.ovlX, c.ovlY,
-                     c.ovlShadow ? L":shadowcolor=black@0.55:shadowx=2:shadowy=2" : L"",
-                     c.uid);
-            fc += seg;
-        } else {
-            swprintf(seg, 768, L"[%ls]null[v%d];", stage.c_str(), c.uid);
-            fc += seg;
-        }
-
-        // A shot on its own screen is rendered by itself, before any track blending, so
-        // the render matches the preview: whatever is layered over it stays off the
-        // glass. Its slice of the graph is lifted out here and replaced by the file
-        // that slice will have produced.
-        if (look != LOOK_PROJECTOR) {
-            const std::string name = "look_" + std::to_string(c.uid);
-            const std::wstring graph = fc.substr(chainStart);
-            if (!WriteWholeFile(g_workDir + Widen(name + ".graph"), Narrow(graph)))
-                lookJobs += "ERROR\n";
-            lookJobs += name + " " + std::to_string(look) + " "
-                      + std::to_string(c.duration) + (c.look43 ? " 1" : " 0") + "\n";
-            fc.resize(chainStart);
-            // No fps filter here: the renderer already wrote exactly this shot's frames
-            // at the project rate, and an fps pass over them drops the last one.
-            wchar_t back[256];
-            // format=rgba: the layer blend pulls alpha out of this, and must never meet a
-            // file that has none ("Requested planes not available").
-            swprintf(back, 256, L"movie=%ls.mkv,format=rgba,settb=1/%d,setpts=N,setsar=1[v%d];",
-                     Widen(name).c_str(), FPS, c.uid);
-            fc += back;
-        }
+        // Text: the card's own words, or an overlay burned over the picture. The
+        // preview draws them over the finished frame, so a shot on a screen of its own
+        // gets them after the screen - off the glass, not into it.
+        // Inside a sequence that owns the screen, the words wait for that screen instead.
+        auto finish = [&](const std::wstring& in) {
+            std::wstring tf = words ? TextFilter(c) : L"";
+            if (tf.empty()) swprintf(seg, 768, L"null[v%d];", c.uid);
+            else            swprintf(seg, 768, L",setsar=1[v%d];", c.uid);
+            fc += L"[" + in + L"]" + tf + seg;
+        };
+        if (look == LOOK_PROJECTOR) { finish(stage); return; }
+        swprintf(seg, 768, L"[%ls]null[v%d];", stage.c_str(), c.uid);
+        fc += seg;
+        finish(LiftLook(c.uid, look, c.look43, c.duration, chainStart));
     };
 
-    for (auto& c : g_clips) if (!c->skip) ClipChain(*c, false, c->reversed, c->look);
+    // Put one element onto `canvas` in `mode` at `opacity`, live only between s and e.
+    // tpad gives the element a lead-in of s seconds so it lines up with the canvas's
+    // clock, and `enable` keeps the blend switched off everywhere outside the element.
+    // The layer is the TOP input of blend, so the cut underneath is second and
+    // all_opacity fades toward it. `enable` cannot gate blend here — a disabled
+    // filter passes its FIRST input through, which would show the bare layer — so the
+    // window is applied by an overlay of the blended result instead.
+    auto CompositeOn = [&](const std::wstring& canvas, int uid, const std::wstring& pic,
+                           double s, double e, int mode, float opacity,
+                           bool keepAlpha) -> std::wstring {
+        // The lead-in is transparent, not black: a black pad is opaque, and an
+        // opaque pad would blend over the cut on every frame before the layer.
+        wchar_t seg[768];
+        swprintf(seg, 768,
+                 L"[%ls]tpad=start_duration=%.4f:start_mode=add:color=0x00000000[L%d];",
+                 pic.c_str(), s, uid);
+        fc += seg;
+        wchar_t top[32];
+        swprintf(top, 32, L"L%d", uid);
+        int m = mode;
+        if (m < 0 || m >= (int)(sizeof(LAYER_MODES_W) / sizeof(*LAYER_MODES_W))) m = 0;
+        wchar_t lab[32], en[96];
+        swprintf(lab, 32, L"o%d", uid);
+        swprintf(en, 96, L":enable='between(t,%.4f,%.4f)'", s, e);
+        BlendMasked(top, canvas, LAYER_MODES_W[m], opacity, uid, L"ly", en, keepAlpha, lab);
+        return lab;
+    };
+
+    // Words waiting on a screen: whose they are, and when they show on the clock of the
+    // picture they will be burned over.
+    struct Words { const Clip* clip; double s, e; };
+    auto BurnWords = [&](const std::wstring& pic, const std::vector<Words>& ws, int uid) {
+        std::wstring chain;
+        for (auto& w : ws) {
+            std::wstring tf = TextFilter(*w.clip);
+            if (tf.empty() || w.e <= w.s) continue;
+            wchar_t en[96];
+            swprintf(en, 96, L":enable='between(t,%.4f,%.4f)'", w.s, w.e);
+            if (!chain.empty()) chain += L",";
+            chain += tf + en;
+        }
+        if (chain.empty()) return pic;
+        wchar_t seg[64];
+        swprintf(seg, 64, L",format=rgba,setsar=1[nt%d];", uid);
+        fc += L"[" + pic + L"]" + chain + seg;
+        swprintf(seg, 64, L"nt%d", uid);
+        return std::wstring(seg);
+    };
+
+    // A sequence as one picture, on its own clock from 0: its cut and its layers
+    // composited onto a canvas of its own, each in the mode it was given in there, and
+    // the finished canvas blended into its parent once. On a screen of its own it goes
+    // through the look job whole, the way the preview runs the look over the canvas.
+    // `claimed` means a screen further up owns this sequence: nothing inside runs a look
+    // of its own, and every word inside is handed up - on this sequence's clock - to go
+    // on after that screen, off the glass. A range render's cut comes off at the end.
+    std::function<std::wstring(Clip&, bool, std::vector<Words>*)> NestPicture;
+    NestPicture = [&](Clip& n, bool rev, std::vector<Words>* claimed) -> std::wstring {
+        const double len = NestLen(n);
+        const bool screen = !claimed && n.look != LOOK_PROJECTOR;
+        const size_t chainStart = fc.size();
+        std::vector<Words> own;
+        std::vector<Words>* held = claimed ? claimed : screen ? &own : nullptr;
+        wchar_t seg[256];
+        swprintf(seg, 256, L"[%d:v]format=rgba,colorchannelmixer=aa=0,setsar=1[nc%d];",
+                 nestIn[n.uid], n.uid);
+        fc += seg;
+        swprintf(seg, 256, L"nc%d", n.uid);
+        std::wstring pic = seg;
+        std::vector<LayerItem> items;
+        nestItems(n, 0.0, rev, items);
+        for (auto& it : items) {
+            double s = it.start < 0 ? 0 : it.start;
+            double e = it.start + it.dur;
+            if (e <= 0.001 || s >= len) continue;
+            if (e > len) e = len;
+            std::wstring layer;
+            if (it.clip->kind == Clip::Nest) {
+                size_t first = held ? held->size() : 0;
+                layer = NestPicture(*it.clip, it.rev, held);
+                if (held)                  // from the inner sequence's clock onto this one
+                    for (size_t k = first; k < held->size(); k++) {
+                        (*held)[k].s = std::max(s, (*held)[k].s + it.start);
+                        (*held)[k].e = std::min(e, (*held)[k].e + it.start);
+                    }
+            } else {
+                ClipChain(*it.clip, true, it.rev, held ? LOOK_PROJECTOR : it.clip->look, !held);
+                if (held) held->push_back({ it.clip, s, e });
+                swprintf(seg, 256, L"v%d", it.clip->uid);
+                layer = seg;
+            }
+            pic = CompositeOn(pic, it.clip->uid, layer, s, e, it.mode, it.opacity, true);
+        }
+        if (claimed) {
+            claimed->push_back({ &n, 0.0, len });      // the sequence's own words, over the lot
+            return pic;
+        }
+        if (screen) {
+            swprintf(seg, 256, L"[%ls]null[v%d];", pic.c_str(), n.uid);
+            fc += seg;
+            pic = LiftLook(n.uid, n.look, n.look43, len, chainStart);
+        }
+        own.push_back({ &n, 0.0, len });
+        pic = BurnWords(pic, own, n.uid);
+        if (n.nestHead > 1e-6 || n.nestTail > 1e-6) {
+            swprintf(seg, 256, L"[%ls]trim=start=%.4f:duration=%.4f,setpts=PTS-STARTPTS[tr%d];",
+                     pic.c_str(), n.nestHead, n.duration, n.uid);
+            fc += seg;
+            swprintf(seg, 256, L"tr%d", n.uid);
+            pic = seg;
+        }
+        return pic;
+    };
+
+    for (auto& c : g_clips) {
+        if (c->skip) continue;
+        if (c->kind != Clip::Nest) { ClipChain(*c, false, c->reversed, c->look); continue; }
+        // A sequence left whole for its screen, into its slot of the cut.
+        std::wstring pic = NestPicture(*c, c->reversed, nullptr);
+        wchar_t seg[160];
+        swprintf(seg, 160, L"[%ls]setsar=1[v%d];", pic.c_str(), c->uid);
+        fc += seg;
+    }
     for (Clip* c : layers)  if (c->kind != Clip::Nest) ClipChain(*c, true, c->reversed, c->look);
 
     if (clipAudio) {                       // one audio block per clip, exact length
-        for (size_t i = 0; i < g_clips.size(); i++) {
-            Clip& c = *g_clips[i];
-            if (c.skip) continue;
-            bool own = c.kind == Clip::Video && c.useAudio && c.vid && c.vid->hasAudio;
+        // A sequence's block is the blocks of its own cut end to end - the sound that
+        // cut carries opened out - cut down the way a range render cut the sequence.
+        std::function<void(Clip&, bool)> AudioBlock = [&](Clip& c, bool rev) {
             wchar_t seg2[512];
+            std::vector<Clip*> cut;
+            if (c.kind == Clip::Nest)
+                if (Sequence* q = FindSeq(c.nest))
+                    for (auto& b : q->clips)
+                        if (!b->skip && b->duration > 0.001) cut.push_back(b.get());
+            if (!cut.empty()) {
+                if (rev) std::reverse(cut.begin(), cut.end());
+                std::wstring cat;          // every block first: the concat's labels must be adjacent
+                for (Clip* b : cut) {
+                    AudioBlock(*b, rev != b->reversed);
+                    swprintf(seg2, 512, L"[a%d]", b->uid);
+                    cat += seg2;
+                }
+                fc += cat;
+                swprintf(seg2, 512,
+                         L"concat=n=%zu:v=0:a=1,apad,atrim=start=%.4f:duration=%.4f,"
+                         L"asetpts=PTS-STARTPTS[a%d];",
+                         cut.size(), c.nestHead, c.duration, c.uid);
+                fc += seg2;
+                return;
+            }
+            bool own = c.kind == Clip::Video && c.useAudio && c.vid && c.vid->hasAudio;
             if (own) {
                 swprintf(seg2, 512,
                          L"[%d:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
                          L"%lsasetpts=PTS-STARTPTS,volume=%.4f,apad,atrim=end=%.4f[a%d];",
-                         vIn[c.uid], c.reversed ? L"areverse," : L"", c.volume, c.duration, c.uid);
+                         vIn[c.uid], rev ? L"areverse," : L"", c.volume, c.duration, c.uid);
             } else {
                 swprintf(seg2, 512,
                          L"anullsrc=r=48000:cl=stereo,atrim=end=%.4f,asetpts=PTS-STARTPTS[a%d];",
                          c.duration, c.uid);
             }
             fc += seg2;
-        }
+        };
+        for (auto& c : g_clips) if (!c->skip) AudioBlock(*c, c->reversed);
     }
     // Picture and sound are joined by two separate concats, never one v+a concat. A
     // combined concat couples the streams segment by segment: over a long cut the
@@ -3969,76 +4214,8 @@ static void StartExport(const std::wstring& outPath) {
     }
     double total = TotalDuration();
 
-    // ---- overlay tracks: shift each layer to its start and composite it there.
-    // tpad prepends black so the layer stream lines up with the timeline, and
-    // `enable` keeps the blend switched off everywhere outside the clip.
-    // Put one element onto `canvas` in `mode` at `opacity`, live only between s and e.
-    // `placed` says the picture already sits on the film's clock and needs no lead-in,
-    // which is true of a nest canvas and of nothing else.
-    // The layer is the TOP input of blend, so the cut underneath is second and
-    // all_opacity fades toward it. `enable` cannot gate blend here — a disabled
-    // filter passes its FIRST input through, which would show the bare layer — so the
-    // window is applied by an overlay of the blended result instead.
-    auto CompositeOn = [&](const std::wstring& canvas, int uid, const std::wstring& pic,
-                           double s, double e, int mode, float opacity,
-                           bool placed, bool keepAlpha) -> std::wstring {
-        std::wstring top = pic;
-        if (!placed) {
-            // The lead-in is transparent, not black: a black pad is opaque, and an
-            // opaque pad would blend over the cut on every frame before the layer.
-            wchar_t seg[768];
-            swprintf(seg, 768,
-                     L"[%ls]tpad=start_duration=%.4f:start_mode=add:color=0x00000000[L%d];",
-                     pic.c_str(), s, uid);
-            fc += seg;
-            wchar_t lay[32];
-            swprintf(lay, 32, L"L%d", uid);
-            top = lay;
-        }
-        int m = mode;
-        if (m < 0 || m >= (int)(sizeof(LAYER_MODES_W) / sizeof(*LAYER_MODES_W))) m = 0;
-        wchar_t lab[32], en[96];
-        swprintf(lab, 32, L"o%d", uid);
-        swprintf(en, 96, L":enable='between(t,%.4f,%.4f)'", s, e);
-        BlendMasked(top, canvas, LAYER_MODES_W[m], opacity, uid, L"ly", en, keepAlpha, lab);
-        return lab;
-    };
-
-    // A sequence on a layer track: its own transparent canvas, everything inside it
-    // composited onto that in the modes it was given in there, and the finished
-    // canvas handed back as one picture for the parent to blend once.
-    std::function<std::wstring(Clip&, double, bool)> EmitNest =
-        [&](Clip& n, double at, bool rev) -> std::wstring {
-        wchar_t seg[256], cv[32];
-        swprintf(seg, 256, L"[%d:v]format=rgba,colorchannelmixer=aa=0,setsar=1[nc%d];",
-                 nestIn[n.uid], n.uid);
-        fc += seg;
-        swprintf(cv, 32, L"nc%d", n.uid);
-        std::wstring canvas = cv;
-        std::vector<LayerItem> items;
-        nestItems(n, at, rev, items);
-        for (auto& it : items) {
-            double s = it.start < 0 ? 0 : it.start;
-            double e = it.start + it.dur;
-            if (e <= 0.001 || s >= total) continue;
-            if (e > total) e = total;
-            std::wstring pic;
-            bool placed = it.clip->kind == Clip::Nest;
-            if (placed) {
-                pic = EmitNest(*it.clip, it.start, it.rev);
-            } else {
-                ClipChain(*it.clip, true, it.rev,
-                          n.look != LOOK_PROJECTOR ? n.look : it.clip->look);
-                wchar_t v[32];
-                swprintf(v, 32, L"v%d", it.clip->uid);
-                pic = v;
-            }
-            canvas = CompositeOn(canvas, it.clip->uid, pic, s, e, it.mode, it.opacity,
-                                 placed, true);
-        }
-        return canvas;
-    };
-
+    // ---- overlay tracks: each layer, or each sequence as one picture, shifted to its
+    // start and composited there.
     std::wstring vstage = L"vc";
     for (Clip* c : layers) {
         double s = c->start < 0 ? 0 : c->start;
@@ -4046,15 +4223,14 @@ static void StartExport(const std::wstring& outPath) {
         if (e <= 0.001 || s >= total) continue;          // outside the film entirely
         if (e > total) e = total;
         std::wstring pic;
-        bool placed = c->kind == Clip::Nest;
-        if (placed) {
-            pic = EmitNest(*c, c->start, c->reversed);
+        if (c->kind == Clip::Nest) {
+            pic = NestPicture(*c, c->reversed, nullptr);
         } else {
             wchar_t v[32];
             swprintf(v, 32, L"v%d", c->uid);
             pic = v;
         }
-        vstage = CompositeOn(vstage, c->uid, pic, s, e, c->lblend, c->lopacity, placed, false);
+        vstage = CompositeOn(vstage, c->uid, pic, s, e, c->lblend, c->lopacity, false);
     }
 
     {   // tag bt709 in the graph: output-side -color_primaries/-color_trc alone do not stick
@@ -7938,8 +8114,10 @@ static void DrawPreviewArea(ImVec2 size) {
         }
     };
 
-    // a clip's text — card words or burned overlay — plus drag-to-place
-    auto drawText = [&](Clip& c, int selTrack, int selIdx, int myTrack, int myIdx) {
+    // a clip's text — card words or burned overlay — plus drag-to-place. Words inside a
+    // sequence are drawn but not dragged here: they belong to the level they sit on.
+    auto drawText = [&](Clip& c, int selTrack, int selIdx, int myTrack, int myIdx,
+                        bool interactive = true) {
         bool card = c.kind == Clip::Text && !c.text.empty();
         bool ovl  = c.ovlOn && !c.ovlText.empty();
         if (!card && !ovl) return;
@@ -7949,6 +8127,7 @@ static void DrawPreviewArea(ImVec2 size) {
         ImU32 col = IM_COL32((int)(c.ovlCol[0] * 255), (int)(c.ovlCol[1] * 255),
                              (int)(c.ovlCol[2] * 255), (int)(c.ovlAlpha * 255));
         DrawTextBlock(dl, txt, px, center, col, c.ovlShadow);
+        if (!interactive) return;
 
         ImVec2 sz = MeasureTextBlock(txt, px, nullptr);
         ImVec2 a(center.x - sz.x * 0.5f - 6, center.y - sz.y * 0.5f - 6);
@@ -7973,13 +8152,27 @@ static void DrawPreviewArea(ImVec2 size) {
         }
         (void)selTrack; (void)selIdx;
     };
+    // The words of everything a sequence shows at the playhead, nested sequences
+    // included, under the sequence's own - the order the export burns them in.
+    std::function<void(Clip&, double)> drawInnerText = [&](Clip& n, double local) {
+        std::vector<NestHit> kids;
+        NestChildren(n, local, kids);
+        for (auto& k : kids) {
+            drawInnerText(*k.clip, k.local);
+            drawText(*k.clip, -1, -1, -1, -1, false);
+        }
+    };
 
     if (projFrame) {                        // the shader already composited the picture
         dl->AddImage((ImTextureID)projSRV, f0, f1);
-        if (ci >= 0 && !g_baseOff) drawText(*g_clips[ci], g_selTrack, g_sel, -1, ci);
+        if (ci >= 0 && !g_baseOff) {
+            drawInnerText(*g_clips[ci], ph - clipStart);
+            drawText(*g_clips[ci], g_selTrack, g_sel, -1, ci);
+        }
     } else if (ci >= 0 && !g_baseOff) {
         Clip& c = *g_clips[ci];
         drawPicture(c, ph - clipStart, 1.0f);
+        drawInnerText(c, ph - clipStart);
         drawText(c, g_selTrack, g_sel, -1, ci);
     } else if (g_clips.empty()) {
         const char* msg  = "Drop footage, stills or sound";
@@ -8002,6 +8195,7 @@ static void DrawPreviewArea(ImVec2 size) {
             Clip& c = *v[i];
             if (ph < c.start || ph >= c.start + c.duration) continue;
             if (!projFrame) drawPicture(c, ph - c.start, c.lopacity);
+            drawInnerText(c, ph - c.start);
             drawText(c, g_selTrack, g_sel, t, i);
         }
     }
@@ -10038,6 +10232,9 @@ static void TrimToRange(double r0, double r1) {
     MixGuard lock;                                 // the mixer must not be in these lists
     auto cut = [](Clip& c, double head, double tail) {
         if (c.kind == Clip::Video) c.trimIn += c.reversed ? tail : head;
+        // A sequence has no in-point: it renders whole and the export trims the picture,
+        // which is already the right way round, so head is head even when reversed.
+        if (c.kind == Clip::Nest) { c.nestHead += head; c.nestTail += tail; }
         if (c.dxOn && c.dxIsVideo) c.dxTrimIn += head;
         c.duration -= head + tail;
     };
@@ -10072,14 +10269,8 @@ static void TrimToRange(double r0, double r1) {
             Clip& c = *t->clips[i];
             double s = c.start, e = c.start + c.duration;
             if (e <= r0 + 1e-6 || s >= r1 - 1e-6) { t->clips.erase(t->clips.begin() + i); continue; }
-            if (c.kind == Clip::Nest) {
-                // A sequence has no in-point of its own: slide it back and let the head
-                // fall before zero. Its length stays, or a reversed one would remap.
-                c.start = s - r0;
-            } else {
-                cut(c, fmax(0.0, r0 - s), fmax(0.0, e - r1));
-                c.start = fmax(s, r0) - r0;
-            }
+            cut(c, fmax(0.0, r0 - s), fmax(0.0, e - r1));
+            c.start = fmax(s, r0) - r0;
             i++;
         }
 
@@ -11282,8 +11473,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     if (wcsstr(GetCommandLineW(), L"--workspace-test")) return RunWorkspaceTests();
     if (wcsstr(GetCommandLineW(), L"--workspace-ui")) return RunWorkspaceUITests(hInst);
     if (wcsstr(GetCommandLineW(), L"--workspace-media")) return RunWorkspaceUITests(hInst, true);
-    if (wcsstr(GetCommandLineW(), L"--undotest")) { RunUndoTest(); return 0; }
-    InstallCrashHandler();          // before anything that can fault
+    if (wcsstr(GetCommandLineW(), L"--undotest")) { RunUndoTest(); return 0; }    InstallCrashHandler();          // before anything that can fault
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     ImGui_ImplWin32_EnableDpiAwareness();
 

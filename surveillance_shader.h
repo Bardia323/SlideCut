@@ -27,6 +27,20 @@ float valueNoise(float2 p) {
 float2 signalGrid(float2 size) {
     return float2(480.0 * (size.x / size.y), 480.0);
 }
+// The look is measured on the preview's 540p raster: the frame scaled until its short
+// side is 540 pixels. Every size that would otherwise be counted in output pixels - the
+// beam's blur, the grain, the rim - is counted on this raster instead, so a 1080p or 4K
+// render is the set the preview shows drawn with more pixels, not a finer set with
+// thinner lines of its own. The picture it carries keeps the file's full detail.
+float2 lookRaster(float2 size) {
+    return size * (540.0 / min(size.x, size.y));
+}
+// A fresh place in the noise for every field. Sliding the same noise a fixed step per
+// field instead reads as a pattern drifting in one direction, worst when the render's
+// frame rate strobes against the 59.94 field rate.
+float2 fieldSeed(float field) {
+    return float2(signalHash(float2(field, 1.7)), signalHash(float2(field, 9.3))) * 997.0;
+}
 // A one-pixel feather on the unit box, so cutting a coordinate off at its edge does
 // not staircase. The width comes from how fast the coordinate moves per output pixel,
 // which is what keeps curved and cropped edges smooth at any resolution.
@@ -101,9 +115,9 @@ float2 cameraShake(float2 suv, float lineIdx, float field) {
 // The raster, drawn the way a tube draws it: every output pixel is lit by the beams
 // of the scanlines around it, each a gaussian spot that fattens where its line is
 // bright. The pixel's own footprint is folded into each gaussian (a one-pixel box has
-// the variance of a gaussian of sigma 1/sqrt(12)), so the lines are band-limited
-// exactly as far as the output needs - soft and even at 1080p, crisp at 4K - rather
-// than point-sampled into stripes that alias, crawl and fall apart in the encode.
+// the variance of a gaussian of sigma 1/sqrt(12)), never smaller than a pixel of the
+// look raster, so the lines are band-limited the same at every output size rather than
+// point-sampled into stripes that alias, crawl and fall apart in the encode.
 float3 crtRaster(float2 q, float2 picFit, float ly, float linePx, float parity, float LINES,
                  float field, bool camera, float2 size) {
     float scanLine = floor(ly);
@@ -169,6 +183,7 @@ float4 Surveillance(float2 uv) {
     // A raw camera feed is not an object, so it keeps the full frame.
     if (crt) winScale *= 0.94;
     float2 tubeSize = outSize * winScale;
+    float2 refTube = lookRaster(outSize) * winScale;     // the same glass, on the raster
     float2 tuv = (uv - 0.5) / winScale + 0.5;
     float inTube = boxMask(tuv);
 
@@ -193,17 +208,17 @@ float4 Surveillance(float2 uv) {
     float2 bow = float2(0.023, 0.037);
     if (crt) q = (p * (1.0 + bow * dot(p, p))) * 0.5 + 0.5;
 
-    // Scan geometry. A tube's lines have to be drawn over at least four output pixels
-    // each, or no beam shape survives: 486 lines on 1080p glass are two pixels apiece,
-    // which point-samples into hard stripes that crawl when the file is scaled up. So
-    // below that the set shows one field - 243 lines, the chunky progressive raster of
-    // a game console - and only glass tall enough for 486 (4K) gets the full
-    // interlaced frame, twitter and all. A camera feed on its own has no raster.
-    float LINES = (crt && tubeSize.y / 486.0 < 4.0) ? 243.0 : 486.0;
+    // Scan geometry. A tube's lines have to be drawn over at least four pixels each or
+    // no beam shape survives, and the raster's glass is barely 500 pixels tall, so the
+    // set always shows one field - 243 lines, the chunky progressive raster of a game
+    // console - whatever size the render is. A camera feed on its own has no raster.
+    float LINES = crt ? 243.0 : 486.0;
     float parity = LINES > 300.0 ? fmod(field, 2.0) : 0.0;
     float ly = q.y * LINES + parity * 0.5;
     float scanLine = floor(ly);
-    float linePx = max(fwidth(ly), 0.0001);   // how many lines one output pixel spans
+    // How many lines one pixel spans - never fewer than one raster pixel does, so the
+    // beams are exactly as soft on 4K glass as the preview draws them.
+    float linePx = max(fwidth(ly), LINES / refTube.y);
 
     // The raster lives on the glass; the signal it draws lives in the picture area,
     // so sampling moves to its own coordinate here.
@@ -245,7 +260,7 @@ float4 Surveillance(float2 uv) {
         float2 grid = signalGrid(tubeSize);
         // Sensor noise at the sensor's own scale, blended between cells: hashed per cell
         // it came out as hard squares that a bigger screen turned into mosaic.
-        float noise = (valueNoise(suv * grid * 1.25 + float2(field * 17.0, field * 7.0)) - 0.5) * 1.3;
+        float noise = (valueNoise(suv * grid * 1.25 + fieldSeed(field)) - 0.5) * 1.3;
         float hum = exp(-pow((frac(suv.y - time * 0.075) - 0.5) / 0.065, 2.0));
         col = col * (0.96 - 0.09 * hum) + noise * (0.055 + 0.06 * (1.0 - col.g));
         float dropout = step(0.998, signalHash(float2(scanLine, floor(field / 2.0))));
@@ -258,16 +273,8 @@ float4 Surveillance(float2 uv) {
     }
 
     if (crt) {
-        // Shadow mask: RGB phosphor triads fixed to the glass, so they key off the
-        // undistorted glass coordinate. The pitch is a property of the set - about 360
-        // triads down the glass - not of the output. A triad needs three output pixels
-        // or more to exist at all; below that the stripes can only alias, and 4:2:0
-        // chroma throws them away regardless, so they fade to their average (flat)
-        // instead. At 1080p that is most of the way; at 4K they are really there.
-        float pitch = tubeSize.y / 360.0;
-        float gx = tuv.x * tubeSize.x / pitch;
-        float3 grille = 1.0 + 0.30 * cos((gx + float3(0.0, 0.3333, 0.6667)) * 6.2831853);
-        col *= lerp(float3(1, 1, 1), grille, saturate((pitch - 3.0) / 3.0));
+        // No shadow mask: a triad needs three pixels to exist at all, and the raster
+        // fits about 360 of them down 500 pixels of glass, so it only averages out flat.
 
         // Halation: highlights bleed into the glass around them. The radius is in
         // signal samples, so the glow is the same size on 1080p and 4K glass.
@@ -291,11 +298,13 @@ float4 Surveillance(float2 uv) {
 
         // Phosphor grain: the coating is not smooth and the beam lighting it is a
         // stream of electrons, so a lit screen always fizzes a little. Shot noise, so
-        // it grows where the beam works hardest. The grains are about two pixels on
-        // 1080p glass and blend into each other, so they read as a surface rather than
-        // as digital noise - and survive the encode instead of turning to mush.
+        // it grows where the beam works hardest. Unlike the rest of the set the grain
+        // is a texture of the screen it is watched on, so it stays about two output
+        // pixels across at any size - grown with the picture it turns into blotches.
+        // The grains blend into each other, so they read as a surface rather than as
+        // digital noise - and survive the encode instead of turning to mush.
         float cell = max(2.0, tubeSize.y / 480.0);
-        float grain = valueNoise(tuv * tubeSize / cell + float2(field * 3.1, field * 7.7)) - 0.5;
+        float grain = valueNoise(tuv * tubeSize / cell + fieldSeed(field)) - 0.5;
         float glow = dot(col, float3(0.299, 0.587, 0.114));
         col += grain * 0.085 * (0.30 + 0.70 * sqrt(saturate(glow)));
 
@@ -313,10 +322,11 @@ float4 Surveillance(float2 uv) {
         // Measured in the bulged picture space, so the rim and the rounded corners
         // follow the dome round instead of cropping a curved picture with a straight
         // rectangle -- which is what flattened it and clipped the top.
-        float2 gp = (q - 0.5) * tubeSize;
-        float shortSide = min(tubeSize.x, tubeSize.y);
+        // In raster pixels, so the rim's wander has the preview's size at any output.
+        float2 gp = (q - 0.5) * refTube;
+        float shortSide = min(refTube.x, refTube.y);
         float corner = 0.028 * shortSide;
-        float2 halfSz = tubeSize * 0.5 - 3.0;
+        float2 halfSz = refTube * 0.5 - 3.0;
         float2 gd = abs(gp) - (halfSz - corner);
         float dist = length(max(gd, 0.0)) + min(max(gd.x, gd.y), 0.0) - corner;
 
@@ -334,9 +344,9 @@ float4 Surveillance(float2 uv) {
         // little as it reaches the edge of the glass.
         float rim = 0.16 * shortSide;
         col *= lerp(0.62, 1.0, 1.0 - smoothstep(-rim, 0.0, dist));
-        // Antialias the edge against however many output pixels one glass pixel spans,
-        // so the curved top and bottom do not staircase.
-        float aa = max(fwidth(dist), 0.0001);
+        // Antialias the edge over a raster pixel, or over however many one output pixel
+        // spans when that is more, so the curved top and bottom do not staircase.
+        float aa = max(fwidth(dist), 1.0);
         glass = 1.0 - smoothstep(-aa, aa, dist);
     }
 

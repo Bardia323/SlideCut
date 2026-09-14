@@ -555,9 +555,10 @@ static std::wstring AfxChain(int preset) {
 // What a noise bed plays: a sound made from nothing, not a chain run over audio.
 // The preview generates it here; the export asks ffmpeg for the same recipe, on a
 // mono line that is widened to stereo, so what you hear is what lands in the file.
-enum { TEX_AM = 0, TEX_TAPE, TEX_ROOM, TEX_HUM, TEX_LINE, TEX_CRACKLE, TEX_COUNT };
+enum { TEX_AM = 0, TEX_TAPE, TEX_ROOM, TEX_HUM, TEX_LINE, TEX_CRACKLE, TEX_CRT, TEX_COUNT };
 static const char* kTexNames[TEX_COUNT] = { "am radio hiss", "tape hiss", "room tone",
-                                            "mains hum", "phone line", "vinyl crackle" };
+                                            "mains hum", "phone line", "vinyl crackle",
+                                            "crt tv static" };
 
 struct TextureState {
     Biquad a, b, c;
@@ -578,6 +579,7 @@ struct TextureState {
                           c.LowPass(400.0f, 0.707f); break;
         case TEX_LINE:    a.HighPass(300.0f, 0.707f); b.LowPass(3400.0f, 0.707f); break;
         case TEX_CRACKLE: a.LowPass(6000.0f, 0.707f); break;
+        case TEX_CRT:     a.HighPass(200.0f, 0.707f); b.LowPass(9000.0f, 0.707f); break;
         default: break;
         }
     }
@@ -609,6 +611,11 @@ struct TextureState {
                 x = a.Run(0, click + 0.006f * N());
                 break;
             }
+            case TEX_CRT:                  // snow buzzing at twice mains, flyback whine, mains
+                x = b.Run(0, a.Run(0, 0.008f * N()));
+                x = (float)(x * (0.85 + 0.15 * sin(TAU * 100 * t)) +
+                            0.004 * sin(TAU * 15625 * t) + 0.006 * sin(TAU * 50 * t));
+                break;
             }
             x *= level;
             buf[i * 2 + 0] += x;
@@ -638,6 +645,11 @@ static std::wstring TexFilter(int kind) {
     case TEX_CRACKLE: return L"aformat=channel_layouts=mono,"
                              L"aeval=0.4*(random(1)*2-1)*floor(random(0)+0.0008)+0.006*(random(2)*2-1),"
                              L"lowpass=f=6000,aformat=channel_layouts=stereo";
+    case TEX_CRT:  return L"aformat=channel_layouts=mono,aeval=0.008*(random(0)*2-1),"
+                          L"highpass=f=200,lowpass=f=9000,"
+                          L"aeval=val(0)*(0.85+0.15*sin(2*PI*100*t))"
+                          L"+0.004*sin(2*PI*15625*t)+0.006*sin(2*PI*50*t),"
+                          L"aformat=channel_layouts=stereo";
     default: return L"";
     }
 }

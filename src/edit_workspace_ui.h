@@ -422,8 +422,19 @@ static void DrawMarkerPanel() {
     if (remove >= 0) g_editMarkers.erase(g_editMarkers.begin() + remove);
 }
 
-static void InsertLibraryItem(const LibraryItem& item) {
-    if (item.kind == 4) { StartSongLoad(item.path, -1, g_playhead.load()); return; }
+// rowKind is where it lands: 0 the base cut, 1 a layer track, 2 an audio track,
+// 3 / 4 the strips that spawn a new video / audio track. t < 0 means the playhead.
+static void InsertLibraryItem(const LibraryItem& item, int rowKind = 0, int track = -1,
+                              double t = -1) {
+    if (t < 0) t = g_playhead.load();
+    if (item.kind == 4) {
+        StartSongLoad(item.path, rowKind == 2 ? track : rowKind == 4 ? -2 : -1, t);
+        return;
+    }
+    if (rowKind == 2 || rowKind == 4) {
+        g_projectStatus = "Pictures go on a video track; sound on an audio track";
+        return;
+    }
     g_playing.store(false); g_audition = false;
     UndoCapture();
     KV kv = LibraryKV(item);
@@ -437,13 +448,25 @@ static void InsertLibraryItem(const LibraryItem& item) {
     }
     SetKV(kv, "skip", "0"); SetKV(kv, "group", "0"); SetKV(kv, "xfade", "0");
     auto c = std::unique_ptr<Clip>(MakeClipFromKV(kv));
-    int at = SplitPoint(g_playhead.load());
-    double time = g_playhead.load();
-    RippleOthers(time, c->duration);
     int uid = c->uid;
+    if (rowKind == 1 || rowKind == 3) {    // a layer: sits at t, nothing moves
+        if (rowKind == 3 || track < 0 || track >= (int)g_over.size()) track = NewOverlayTrack();
+        c->start = t;
+        auto& v = g_over[track]->clips;
+        v.push_back(std::move(c));
+        g_selTrack = track; g_sel = (int)v.size() - 1; SelSet(uid);
+        UndoCapture();
+        return;
+    }
+    int at = SplitPoint(t);
+    RippleOthers(t, c->duration);
     g_clips.insert(g_clips.begin() + at, std::move(c));
     g_selTrack = -1; g_sel = at; SelSet(uid); g_cutIndex = -1;
     UndoCapture();
+}
+static void DropLibraryItem(int lib, int rowKind, int track, double t) {
+    if (lib < 0 || lib >= (int)g_library.size()) return;
+    InsertLibraryItem(g_library[lib], rowKind, track, t);
 }
 static void DrawLibrary() {
     static ImGuiTextFilter filter;

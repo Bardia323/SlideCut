@@ -30,6 +30,7 @@ static void SyncLibrary() {
     };
     auto audio = [&](const std::vector<std::unique_ptr<AudioTrack>>& tracks) {
         for (const auto& t : tracks) for (const auto& b : t->blocks) {
+            if (b->gen || b->path.empty()) continue;   // texture blocks have no file to keep
             auto key = LibraryKey(4, b->path, "");
             if (known.emplace(key, true).second)
                 g_library.push_back({key, b->path, b->label, "", 4});

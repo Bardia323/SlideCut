@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "imgui.h"
+#include "imgui_internal.h"                // ImRect, BeginDragDropTargetCustom
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 #include "stb_image.h"
@@ -315,7 +316,16 @@ struct Song {
     int     framesPerPeak = 1024;
     bool    loaded = false;
     bool    reversed = false;
+    int     fx = 0;                        // the block's own chain (AFX_*), under the track's
+    float   fxMix = 1.0f;
+    // A texture block has no file. 1 = noise bed: its chain run on silence, heard on
+    // its own track. 2 = chain region: while it plays, its chain runs over `target`.
+    int     gen = 0;
+    int     target = -1;                   // chain region: the audio track it runs over
+    int     tex = 0;                       // noise bed: which texture it plays (TEX_*)
 };
+// A texture block's source is endless; this is how far its out-point can be pulled.
+static const double GEN_MAX = 3600.0;
 
 static const int SAMPLE_RATE = 48000;
 
@@ -539,6 +549,97 @@ static std::wstring AfxChain(int preset) {
              L"aformat=channel_layouts=stereo,";
     if (!f.empty()) f.pop_back();
     return f;
+}
+
+// ---- textures
+// What a noise bed plays: a sound made from nothing, not a chain run over audio.
+// The preview generates it here; the export asks ffmpeg for the same recipe, on a
+// mono line that is widened to stereo, so what you hear is what lands in the file.
+enum { TEX_AM = 0, TEX_TAPE, TEX_ROOM, TEX_HUM, TEX_LINE, TEX_CRACKLE, TEX_COUNT };
+static const char* kTexNames[TEX_COUNT] = { "am radio hiss", "tape hiss", "room tone",
+                                            "mains hum", "phone line", "vinyl crackle" };
+
+struct TextureState {
+    Biquad a, b, c;
+    AudioFxState am;                       // the am radio hiss is that chain on silence
+    unsigned rng = 0x9E3779B9u;
+    double   n = 0;                        // samples into the current second
+    int      built = -1;
+    inline float N() {                     // white, uniform, +-1
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        return (float)(rng >> 8) * (1.0f / 8388608.0f) - 1.0f;
+    }
+    void Build(int k) {
+        if (built == k) return;
+        built = k;
+        switch (k) {
+        case TEX_TAPE:    a.HighPass(3000.0f, 0.707f); b.LowPass(12000.0f, 0.707f); break;
+        case TEX_ROOM:    a.LowPass(150.0f, 0.707f); b.LowPass(150.0f, 0.707f);
+                          c.LowPass(400.0f, 0.707f); break;
+        case TEX_LINE:    a.HighPass(300.0f, 0.707f); b.LowPass(3400.0f, 0.707f); break;
+        case TEX_CRACKLE: a.LowPass(6000.0f, 0.707f); break;
+        default: break;
+        }
+    }
+    void Render(float* buf, ma_uint32 frames, int kind, float level) {
+        if (kind < 0 || kind >= TEX_COUNT || level <= 0.0001f) return;
+        Build(kind);
+        if (kind == TEX_AM) { am.Process(buf, frames, AFX_AM, level); return; }
+        const double TAU = 6.283185307179586;
+        for (ma_uint32 i = 0; i < frames; i++) {
+            const double t = n / SAMPLE_RATE;
+            float x = 0.0f;
+            switch (kind) {
+            case TEX_TAPE:
+                x = b.Run(0, a.Run(0, 0.02f * N()));
+                break;
+            case TEX_ROOM:
+                x = c.Run(0, b.Run(0, a.Run(0, 0.03f * N())));
+                break;
+            case TEX_HUM:
+                x = (float)(0.02 * sin(TAU * 50 * t) + 0.01 * sin(TAU * 150 * t) +
+                            0.005 * sin(TAU * 250 * t));
+                break;
+            case TEX_LINE:
+                x = b.Run(0, a.Run(0, 0.03f * N())) + (float)(0.006 * sin(TAU * 50 * t));
+                break;
+            case TEX_CRACKLE: {
+                float u = 0.5f * (N() + 1.0f);
+                float click = u < 0.0008f ? 0.4f * N() : 0.0f;
+                x = a.Run(0, click + 0.006f * N());
+                break;
+            }
+            }
+            x *= level;
+            buf[i * 2 + 0] += x;
+            buf[i * 2 + 1] += x;
+            n += 1.0;
+            if (n >= SAMPLE_RATE) n -= SAMPLE_RATE;   // every tone here repeats each second
+        }
+    }
+};
+
+// The export's recipe for a texture, applied to a stretch of silence. No commas
+// inside expressions: they would split the filter graph.
+static std::wstring TexFilter(int kind) {
+    switch (kind) {
+    case TEX_AM:   return AfxChain(AFX_AM);
+    case TEX_TAPE: return L"aformat=channel_layouts=mono,aeval=0.02*(random(0)*2-1),"
+                          L"highpass=f=3000,lowpass=f=12000,aformat=channel_layouts=stereo";
+    case TEX_ROOM: return L"aformat=channel_layouts=mono,aeval=0.03*(random(0)*2-1),"
+                          L"lowpass=f=150,lowpass=f=150,lowpass=f=400,"
+                          L"aformat=channel_layouts=stereo";
+    case TEX_HUM:  return L"aformat=channel_layouts=mono,"
+                          L"aeval=0.02*sin(2*PI*50*t)+0.01*sin(2*PI*150*t)+0.005*sin(2*PI*250*t),"
+                          L"aformat=channel_layouts=stereo";
+    case TEX_LINE: return L"aformat=channel_layouts=mono,aeval=0.03*(random(0)*2-1),"
+                          L"highpass=f=300,lowpass=f=3400,aeval=val(0)+0.006*sin(2*PI*50*t),"
+                          L"aformat=channel_layouts=stereo";
+    case TEX_CRACKLE: return L"aformat=channel_layouts=mono,"
+                             L"aeval=0.4*(random(1)*2-1)*floor(random(0)+0.0008)+0.006*(random(2)*2-1),"
+                             L"lowpass=f=6000,aformat=channel_layouts=stereo";
+    default: return L"";
+    }
 }
 
 
@@ -873,7 +974,7 @@ static std::atomic<bool>   g_hushClips(false);
 // Ripple editing. On, trimming or deleting a base shot closes the film up and
 // everything downstream follows. Off, the time is kept: what a shot gives up becomes
 // a gap card, and nothing after the edit moves.
-static bool g_rippleOn = true;
+static bool g_rippleOn = false;             // the app opens with ripple off
 
 // Where each shot sits on the film, once mutes and dissolves are taken into
 // account. Muted shots collapse onto the cut they sit on; a dissolve pulls the
@@ -1032,6 +1133,10 @@ struct VideoAudioBlock {
     bool reversed;
 };
 static std::vector<VideoAudioBlock> g_videoAudio;
+// Live filter state for blocks carrying a chain of their own, by block uid. Audio
+// thread only.
+static std::map<int, AudioFxState> g_blockFx;
+static std::map<int, TextureState> g_texState;   // noise beds, by block uid
 
 static void AudioCallback(ma_device*, void* out, const void*, ma_uint32 frames) {
     MixGuard lock;
@@ -1042,18 +1147,44 @@ static void AudioCallback(ma_device*, void* out, const void*, ma_uint32 frames) 
     long long current_frames = llround(ph * SAMPLE_RATE);
     // Every track, every block. A track with a chain on it is summed into its own
     // scratch first so the chain sees the whole track, then folded into the mix.
-    static std::vector<float> scratch;
+    static std::vector<float> scratch, bscratch;
     if (scratch.size() < (size_t)frames * 2) scratch.resize((size_t)frames * 2);
-    for (auto& tr : g_atracks) {
+    if (bscratch.size() < (size_t)frames * 2) bscratch.resize((size_t)frames * 2);
+    for (int ti = 0; ti < (int)g_atracks.size(); ti++) {
+        auto& tr = g_atracks[ti];
         if (tr->mute) continue;
         float gain = tr->volume * 0.9f;
         bool  fx = tr->fx > AFX_NONE && tr->fxMix > 0.0001f;
-        float* dst = fx ? scratch.data() : o;
-        if (fx) memset(dst, 0, sizeof(float) * frames * 2);
+        // A chain region on any unmuted track can run over this one, so the track
+        // needs a bus of its own for the region to work on.
+        bool region = false;
+        for (auto& t2 : g_atracks) {
+            if (t2->mute) continue;
+            for (auto& rb : t2->blocks) if (rb->gen == 2 && rb->target == ti) region = true;
+        }
+        const bool bus = fx || region;
+        float* dst = bus ? scratch.data() : o;
+        if (bus) memset(dst, 0, sizeof(float) * frames * 2);
         for (auto& sp : tr->blocks) {
             Song& s = *sp;
-            if (!s.loaded) continue;
+            if (!s.loaded || s.gen == 2) continue;          // a region makes no sound itself
             long long start_base = current_frames - llround(s.offset * SAMPLE_RATE);
+            if (s.gen == 1) {                                // noise bed: a texture from nothing
+                if (s.tex < 0 || s.tex >= TEX_COUNT || s.fxMix <= 0.0001f) continue;
+                long long len = llround((s.trimEnd - s.trimStart) * SAMPLE_RATE);
+                long long g0 = -start_base, g1 = len - start_base;
+                if (g0 < 0) g0 = 0;
+                if (g1 > (long long)frames) g1 = (long long)frames;
+                if (g1 <= g0) continue;
+                float* bd = bscratch.data();
+                memset(bd, 0, sizeof(float) * frames * 2);
+                g_texState[s.uid].Render(bd, frames, s.tex, s.fxMix);
+                for (long long i = g0; i < g1; i++) {
+                    dst[i * 2 + 0] += bd[i * 2 + 0] * gain;
+                    dst[i * 2 + 1] += bd[i * 2 + 1] * gain;
+                }
+                continue;
+            }
             long long lo = llround(s.trimStart * SAMPLE_RATE);
             long long hi = llround(s.trimEnd * SAMPLE_RATE);
             long long total = (long long)(s.pcm.size() / 2);
@@ -1066,26 +1197,58 @@ static void AudioCallback(ma_device*, void* out, const void*, ma_uint32 frames) 
             if (i0 < 0) i0 = 0;
             if (i1 > (long long)frames) i1 = (long long)frames;
             if (i1 <= i0) continue;
+            // A block with its own chain runs through it alone first, then joins
+            // the track (and the track's chain, if any).
+            const bool bfx = s.fx > AFX_NONE && s.fx < AFX_COUNT && s.fxMix > 0.0001f;
+            float* bd = dst;
+            if (bfx) { bd = bscratch.data(); memset(bd, 0, sizeof(float) * frames * 2); }
             const float* pcm = s.pcm.data();
             if (s.reversed) {
                 long long base = hi - 1 - start_base;
                 for (long long i = i0; i < i1; i++) {
                     const float* q = pcm + (base - i) * 2;
-                    dst[i * 2 + 0] += q[0] * gain;
-                    dst[i * 2 + 1] += q[1] * gain;
+                    bd[i * 2 + 0] += q[0] * gain;
+                    bd[i * 2 + 1] += q[1] * gain;
                 }
             } else {
                 const float* q = pcm + (lo + start_base + i0) * 2;
                 for (long long i = i0; i < i1; i++, q += 2) {
-                    dst[i * 2 + 0] += q[0] * gain;
-                    dst[i * 2 + 1] += q[1] * gain;
+                    bd[i * 2 + 0] += q[0] * gain;
+                    bd[i * 2 + 1] += q[1] * gain;
+                }
+            }
+            if (bfx) {
+                g_blockFx[s.uid].Process(bd, frames, s.fx, s.fxMix);
+                for (ma_uint32 k = 0; k < frames * 2; k++) dst[k] += bd[k];
+            }
+        }
+        // Chain regions over this track: inside a region's span the bus is its chain's
+        // output, outside it the bus passes untouched. Before the track's own chain.
+        if (region) {
+            for (auto& t2 : g_atracks) {
+                if (t2->mute) continue;
+                for (auto& rb : t2->blocks) {
+                    Song& r = *rb;
+                    if (r.gen != 2 || r.target != ti) continue;
+                    if (r.fx <= AFX_NONE || r.fx >= AFX_COUNT || r.fxMix <= 0.0001f) continue;
+                    long long sb = current_frames - llround(r.offset * SAMPLE_RATE);
+                    long long len = llround((r.trimEnd - r.trimStart) * SAMPLE_RATE);
+                    long long g0 = -sb, g1 = len - sb;
+                    if (g0 < 0) g0 = 0;
+                    if (g1 > (long long)frames) g1 = (long long)frames;
+                    if (g1 <= g0) continue;
+                    float* w = bscratch.data();
+                    memcpy(w, dst, sizeof(float) * frames * 2);
+                    g_blockFx[r.uid].Process(w, frames, r.fx, r.fxMix);
+                    for (long long i = g0; i < g1; i++) {
+                        dst[i * 2 + 0] = w[i * 2 + 0];
+                        dst[i * 2 + 1] = w[i * 2 + 1];
+                    }
                 }
             }
         }
-        if (fx) {
-            tr->fxs.Process(dst, frames, tr->fx, tr->fxMix);
-            for (ma_uint32 i = 0; i < frames * 2; i++) o[i] += dst[i];
-        }
+        if (fx) tr->fxs.Process(dst, frames, tr->fx, tr->fxMix);
+        if (bus) for (ma_uint32 i = 0; i < frames * 2; i++) o[i] += dst[i];
     }
     if (!g_hushClips.load(std::memory_order_relaxed))
     for (auto& c : g_videoAudio) {
@@ -1830,6 +1993,16 @@ static int    g_dropVTrack = -1;           // -1 base video, >=0 overlay track
 static double g_dropTime = 0.0;
 static int    g_dropATrack = -1;           // -2 new track, -1 wherever, else that track
 static void ResetDropTarget() { g_dropVTrack = -1; g_dropTime = 0.0; g_dropATrack = -1; }
+
+// A bin card let go over the timeline. Held for one frame and applied before the
+// next layout, so the lists never change under a timeline half drawn.
+struct BinDrop { int lib = -1; int rowKind = 0; int track = -1; double t = 0; };
+static BinDrop g_binDrop;
+static void DropLibraryItem(int lib, int rowKind, int track, double t);   // edit_workspace_ui.h
+// A texture block at the playhead: gen 1 plays texture `kind` (TEX_*), gen 2 runs
+// chain `kind` (AFX_*) over another track.
+static void AddGenBlock(int track, int gen, int kind);
+static void UndoCapture();                        // defined with the undo stack
 
 // One folder level deep: dropping a shoot folder should just work.
 static void ExpandFolders(std::vector<std::wstring>& paths) {
@@ -3030,6 +3203,20 @@ static float PlateAspect() {
     return i >= 0 ? g_aspects[i]->aspect : g_projPlateAr;
 }
 
+// A shot that plays through the projector is seen through the plate, not the canvas.
+// With the plate covering the canvas at an aspect of its own, only a centred part of
+// the canvas (rx by ry of it) ever reaches the gate, so a filling shot crops to that
+// part - and its keep anchor picks what the gate shows, instead of being cropped a
+// second time, always from the centre, by the plate.
+static bool PlateCropRegion(float canvasAr, float* rx, float* ry) {
+    *rx = *ry = 1.0f;
+    float pAr = PlateAspect();
+    if (g_projFit != 0 || pAr <= 0.01f || canvasAr <= 0.01f) return false;
+    if (canvasAr > pAr) *rx = pAr / canvasAr;
+    else                *ry = canvasAr / pAr;
+    return true;
+}
+
 // Editing the aspect from the projector panel writes to the point in force; with
 // no point in force it stays the plain global it always was.
 static void SetPlateAspect(float ar) {
@@ -3783,14 +3970,25 @@ static void StartExport(const std::wstring& outPath) {
     }
 
     // audio blocks, in track order
-    struct AudioIn { Song* s; int in; float vol; int fx; float fxMix; };
+    struct AudioIn { Song* s; int in; float vol; int fx; float fxMix; int track; };
     std::vector<AudioIn> aIns;
-    for (auto& tr : g_atracks) {
+    for (int ti = 0; ti < (int)g_atracks.size(); ti++) {
+        auto& tr = g_atracks[ti];
         if (tr->mute) continue;
         for (auto& b : tr->blocks) {
-            if (!b->loaded || b->path.empty()) continue;
-            cmd += L" -i \"" + b->path + L"\"";
-            aIns.push_back({ b.get(), nIn++, tr->volume, tr->fx, tr->fxMix });
+            if (!b->loaded || b->gen == 2) continue;        // regions act on other blocks
+            if (b->gen == 1) {                               // noise bed: silence, then its chain
+                double len = b->trimEnd - b->trimStart;
+                if (b->tex < 0 || b->tex >= TEX_COUNT || b->fxMix <= 0.0001f || len < 0.01)
+                    continue;
+                wchar_t gi[128];
+                swprintf(gi, 128, L" -f lavfi -t %.4f -i anullsrc=r=48000:cl=stereo", len);
+                cmd += gi;
+            } else {
+                if (b->path.empty()) continue;
+                cmd += L" -i \"" + b->path + L"\"";
+            }
+            aIns.push_back({ b.get(), nIn++, tr->volume, tr->fx, tr->fxMix, ti });
         }
     }
 
@@ -3817,46 +4015,61 @@ static void StartExport(const std::wstring& outPath) {
     // bed of its own, the alpha is the mask, so a layer shows the cut underneath and a
     // base cut shows the wall - the same as the preview's transparent canvas.
     auto FitOne = [&](int inIdx, const std::wstring& out, int lfit,
-                      int anchor = LANCHOR_CENTER) {
-        wchar_t seg[768];
+                      int anchor = LANCHOR_CENTER, bool throughPlate = false) {
+        wchar_t seg[1024];
         int u = scratch++;
+        // Through the projector only the plate's part of the canvas is seen, so every
+        // fit - fill, inside, blur bed, black bed - treats that part as its frame,
+        // and the rest of the canvas stays clear.
+        float rx = 1.0f, ry = 1.0f;
+        int cw = W, ch = H;
+        if (throughPlate && g_projOn && PlateCropRegion((float)W / (float)H, &rx, &ry)) {
+            cw = (int)lround(W * rx); cw += cw & 1;
+            ch = (int)lround(H * ry); ch += ch & 1;
+            if (cw > W) cw = W;
+            if (ch > H) ch = H;
+        }
         if (lfit == LFIT_BLUR) {           // opaque blurred bed, the layer whole on top
-            swprintf(seg, 768,
+            swprintf(seg, 1024,
                      L"[%d:v]fps=%d,setpts=PTS-STARTPTS,split=2[lb%d][lf%d];"
                      L"[lb%d]scale=%d:%d:force_original_aspect_ratio=increase,"
                      L"crop=%d:%d,gblur=sigma=%d[lbb%d];"
                      L"[lf%d]scale=%d:%d:force_original_aspect_ratio=decrease:"
                      L"flags=lanczos+accurate_rnd+full_chroma_int[lff%d];"
-                     L"[lbb%d][lff%d]overlay=(W-w)/2:(H-h)/2,format=rgba,setsar=1",
+                     L"[lbb%d][lff%d]overlay=(W-w)/2:(H-h)/2,format=rgba,"
+                     L"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=0x00000000,setsar=1",
                      inIdx, FPS, u, u,
-                     u, W, H, W, H, H / 48, u,
-                     u, W, H, u,
-                     u, u);
+                     u, cw, ch, cw, ch, ch / 48 > 0 ? ch / 48 : 1, u,
+                     u, cw, ch, u,
+                     u, u, W, H);
         } else if (lfit == LFIT_BLACK) {   // opaque black bed
-            swprintf(seg, 768,
+            swprintf(seg, 1024,
                      L"[%d:v]fps=%d,setpts=PTS-STARTPTS,"
                      L"scale=%d:%d:force_original_aspect_ratio=decrease:"
                      L"flags=lanczos+accurate_rnd+full_chroma_int,"
-                     L"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,format=rgba,setsar=1",
-                     inIdx, FPS, W, H, W, H);
+                     L"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,format=rgba,"
+                     L"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=0x00000000,setsar=1",
+                     inIdx, FPS, cw, ch, cw, ch, W, H);
         } else if (lfit == LFIT_FILL) {    // crop until it covers the frame
             float ax, ay;
             AnchorFrac(anchor, &ax, &ay);
             // The overflow is (iw-ow) wide; the anchor says how much of it comes
             // off the left, so the preview and the render keep the same part.
-            swprintf(seg, 768,
+            swprintf(seg, 1024,
                      L"[%d:v]fps=%d,setpts=PTS-STARTPTS,"
                      L"scale=%d:%d:force_original_aspect_ratio=increase:"
                      L"flags=lanczos+accurate_rnd+full_chroma_int,"
-                     L"crop=%d:%d:(iw-ow)*%.1f:(ih-oh)*%.1f,format=rgba,setsar=1",
-                     inIdx, FPS, W, H, W, H, ax, ay);
+                     L"crop=%d:%d:(iw-ow)*%.3f:(ih-oh)*%.3f,format=rgba,"
+                     L"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=0x00000000,setsar=1",
+                     inIdx, FPS, cw, ch, cw, ch, ax, ay, W, H);
         } else {
-            swprintf(seg, 768,
+            swprintf(seg, 1024,
                      L"[%d:v]fps=%d,setpts=PTS-STARTPTS,"
                      L"scale=%d:%d:force_original_aspect_ratio=decrease:"
                      L"flags=lanczos+accurate_rnd+full_chroma_int,format=rgba,"
+                     L"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=0x00000000,"
                      L"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=0x00000000,setsar=1",
-                     inIdx, FPS, W, H, W, H);
+                     inIdx, FPS, cw, ch, cw, ch, W, H);
         }
         fc += seg;
         fc += L"[" + out + L"];";
@@ -3983,7 +4196,7 @@ static void StartExport(const std::wstring& outPath) {
                 swprintf(seg, 768, L"[%d:v]fps=%d,format=rgba,setsar=1[%ls];", vIn[c.uid], FPS, stage.c_str());
             fc += seg;
         } else {
-            FitOne(vIn[c.uid], stage, c.lfit, c.lanchor);
+            FitOne(vIn[c.uid], stage, c.lfit, c.lanchor, words && look == LOOK_PROJECTOR);
         }
 
         if (reversed && c.kind != Clip::Image) {
@@ -4018,7 +4231,7 @@ static void StartExport(const std::wstring& outPath) {
         if (dit != dIn.end()) {            // double exposure
             wchar_t dl[32];
             swprintf(dl, 32, L"d%d", c.uid);
-            FitOne(dit->second, dl, c.lfit, c.lanchor);
+            FitOne(dit->second, dl, c.lfit, c.lanchor, words && look == LOOK_PROJECTOR);
             wchar_t out[32];
             swprintf(out, 32, L"x%d", c.uid);
             int bm = c.dxBlend;
@@ -4293,40 +4506,102 @@ static void StartExport(const std::wstring& outPath) {
         // One trimmed, delayed, level-set stream per audio block, then a single mix.
         for (auto& ai : aIns) {
             Song& s = *ai.s;
-            double effStart = s.trimStart + (s.offset < 0 ? -s.offset : 0.0);
-            double effEnd = s.trimEnd;
+            // A noise bed's source is its own length of silence, starting at 0.
+            double srcA = s.gen == 1 ? 0.0 : s.trimStart;
+            double effStart = srcA + (s.offset < 0 ? -s.offset : 0.0);
+            double effEnd = s.gen == 1 ? s.trimEnd - s.trimStart : s.trimEnd;
             int delayMs = s.offset > 0 ? (int)llround(s.offset * 1000.0) : 0;
             int volPct = (int)lround(ai.vol * 100.0f);
             wchar_t af[420];
             if (effStart >= effEnd) {          // trimmed entirely off-screen: silence
-                swprintf(af, 420, L";[%d:a]atrim=end=0,asetpts=PTS-STARTPTS,apad[p%d]",
+                swprintf(af, 420, L";[%d:a]atrim=end=0,asetpts=PTS-STARTPTS,apad[r%d]",
                          ai.in, ai.in);
             } else {
                 swprintf(af, 420,
                          L";[%d:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
                          L"atrim=start=%.4f:end=%.4f,asetpts=PTS-STARTPTS,"
                          L"%ls"
-                         L"adelay=%d|%d:all=1,volume=%d/100,apad[p%d]",
+                         L"adelay=%d|%d:all=1,volume=%d/100,apad[r%d]",
                          ai.in, effStart, effEnd,
                          s.reversed ? L"areverse," : L"",
                          delayMs, delayMs, volPct, ai.in);
             }
             fc += af;
+            // The block's own chain first, [r] -> [p], the same order as the mixer.
+            {
+                // a noise bed's "chain" is its texture recipe, on its silent source
+                std::wstring bchain = s.fxMix <= 0.0001f ? L""
+                                    : s.gen == 1 ? TexFilter(s.tex) : AfxChain(s.fx);
+                wchar_t bl[256];
+                if (bchain.empty()) {
+                    swprintf(bl, 256, L";[r%d]anull[p%d]", ai.in, ai.in);
+                    fc += bl;
+                } else if (s.fxMix >= 0.999f) {
+                    swprintf(bl, 256, L";[r%d]", ai.in);
+                    fc += bl; fc += bchain;
+                    swprintf(bl, 256, L"[p%d]", ai.in);
+                    fc += bl;
+                } else {
+                    swprintf(bl, 256, L";[r%d]asplit=2[bd%d][bw%d];[bw%d]",
+                             ai.in, ai.in, ai.in, ai.in);
+                    fc += bl; fc += bchain;
+                    swprintf(bl, 256,
+                             L"[bx%d];[bd%d][bx%d]amix=inputs=2:weights=%.3f %.3f:"
+                             L"normalize=0[p%d]",
+                             ai.in, ai.in, ai.in, 1.0f - s.fxMix, s.fxMix, ai.in);
+                    fc += bl;
+                }
+            }
+            // Chain regions over this block's track: inside a region's span the stream
+            // is its chain's output, outside it the stream passes dry - the same switch
+            // the mixer makes. The stream's t is timeline time (it was delayed into place).
+            std::wstring cur = L"p" + std::to_wstring(ai.in);
+            {
+                int rk = 0;
+                double bStart = s.offset, bEnd = s.offset + (s.trimEnd - s.trimStart);
+                for (auto& t2 : g_atracks) {
+                    if (t2->mute) continue;
+                    for (auto& rb : t2->blocks) {
+                        const Song& r = *rb;
+                        if (r.gen != 2 || r.target != ai.track) continue;
+                        std::wstring rc = r.fxMix > 0.0001f ? AfxChain(r.fx) : L"";
+                        if (rc.empty()) continue;
+                        double ra = r.offset, rbnd = r.offset + (r.trimEnd - r.trimStart);
+                        if (rbnd <= bStart || ra >= bEnd) continue;
+                        float m = r.fxMix > 1.0f ? 1.0f : r.fxMix;
+                        std::wstring nxt = L"q" + std::to_wstring(ai.in) + L"_" + std::to_wstring(rk);
+                        wchar_t rg[640];
+                        swprintf(rg, 640, L";[%ls]asplit=2[rd%d_%d][rw%d_%d];[rw%d_%d]",
+                                 cur.c_str(), ai.in, rk, ai.in, rk, ai.in, rk);
+                        fc += rg; fc += rc;
+                        swprintf(rg, 640,
+                                 L",volume='if(between(t,%.4f,%.4f),%.4f,0)':eval=frame[rx%d_%d];"
+                                 L"[rd%d_%d]volume='if(between(t,%.4f,%.4f),%.4f,1)':eval=frame[ry%d_%d];"
+                                 L"[ry%d_%d][rx%d_%d]amix=inputs=2:normalize=0[%ls]",
+                                 ra, rbnd, m, ai.in, rk,
+                                 ai.in, rk, ra, rbnd, 1.0f - m, ai.in, rk,
+                                 ai.in, rk, ai.in, rk, nxt.c_str());
+                        fc += rg;
+                        cur = nxt;
+                        rk++;
+                    }
+                }
+            }
             // The track's chain, on the block's own stream. Below full amount it
             // is a wet/dry mix, the same blend the preview mixer does.
             std::wstring chain = ai.fxMix > 0.0001f ? AfxChain(ai.fx) : L"";
             wchar_t fxl[256];
             if (chain.empty()) {
-                swprintf(fxl, 256, L";[p%d]anull[m%d]", ai.in, ai.in);
+                swprintf(fxl, 256, L";[%ls]anull[m%d]", cur.c_str(), ai.in);
                 fc += fxl;
             } else if (ai.fxMix >= 0.999f) {
-                swprintf(fxl, 256, L";[p%d]", ai.in);
+                swprintf(fxl, 256, L";[%ls]", cur.c_str());
                 fc += fxl; fc += chain;
                 swprintf(fxl, 256, L"[m%d]", ai.in);
                 fc += fxl;
             } else {
-                swprintf(fxl, 256, L";[p%d]asplit=2[d%d][w%d];[w%d]",
-                         ai.in, ai.in, ai.in, ai.in);
+                swprintf(fxl, 256, L";[%ls]asplit=2[d%d][w%d];[w%d]",
+                         cur.c_str(), ai.in, ai.in, ai.in);
                 fc += fxl; fc += chain;
                 swprintf(fxl, 256,
                          L"[x%d];[d%d][x%d]amix=inputs=2:weights=%.3f %.3f:"
@@ -5403,6 +5678,11 @@ static void DrawTextCardPopup() {
 static void DrawTimeline() {
     ImGuiIO& io = ImGui::GetIO();
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (g_binDrop.lib >= 0) {
+        BinDrop d = g_binDrop;
+        g_binDrop = BinDrop();
+        DropLibraryItem(d.lib, d.rowKind, d.track, d.t);
+    }
 
     const float RULER_H = 22.0f, CLIP_H = 58.0f, AUDIO_H = 44.0f, ROW_GAP = 3.0f;
     const float HDR_W = 104.0f;             // track-name column
@@ -5534,6 +5814,43 @@ static void DrawTimeline() {
     for (auto& r : rows) g_geom.rows.push_back({ r.y0, r.y1, r.kind, r.idx });
     g_geom.rows.push_back({ ghostVy0, ghostVy1, 3, -1 });   // drop = spawn a video track
     g_geom.rows.push_back({ ghostAy0, ghostAy1, 4, -1 });   // drop = spawn an audio track
+
+    // ---- a card dragged in from the bin: the row under the pointer picks the track
+    // (the strips spawn a new one), the pointer's x the time. A guide shows the spot.
+    {
+        ImRect box(origin, ImVec2(origin.x + avail.x, origin.y + (needH > viewH ? needH : viewH)));
+        if (ImGui::BeginDragDropTargetCustom(box, ImGui::GetID("##binDrop"))) {
+            const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("SLIDECUT_MEDIA_ORDER",
+                ImGuiDragDropFlags_AcceptBeforeDelivery | ImGuiDragDropFlags_AcceptNoDrawDefaultRect);
+            if (pl && io.MousePos.x > trackX) {
+                double t = XToSec(io.MousePos.x);
+                if (t < 0) t = 0;
+                if (!io.KeyAlt) t = round(t * g_fps) / g_fps;           // land on a frame
+                for (auto& r : g_geom.rows) {
+                    if (io.MousePos.y < r.y0 || io.MousePos.y > r.y1) continue;
+                    if (r.kind > 4) break;                               // aspect / mute rows
+                    float gx = SecToX(t);
+                    dl->AddRectFilled(ImVec2(trackX, r.y0), ImVec2(origin.x + avail.x, r.y1),
+                                      IM_COL32(255, 255, 255, 18));
+                    dl->AddLine(ImVec2(gx, r.y0), ImVec2(gx, r.y1), IM_COL32(255, 255, 255, 230), 2.0f);
+                    ImGui::SetTooltip("%s  %d:%05.2f",
+                                      r.kind == 0 ? "insert into the cut" :
+                                      r.kind == 1 ? "place on this layer" :
+                                      r.kind == 2 ? "place on this audio track" :
+                                      r.kind == 3 ? "new video track" : "new audio track",
+                                      (int)t / 60, fmod(t, 60.0));
+                    if (pl->IsDelivery()) {
+                        g_binDrop.lib = *(const int*)pl->Data;
+                        g_binDrop.rowKind = r.kind;
+                        g_binDrop.track = r.idx;
+                        g_binDrop.t = t;
+                    }
+                    break;
+                }
+            }
+            ImGui::EndDragDropTarget();
+        }
+    }
 
     // ---- ruler
     float rulerY = origin.y;
@@ -5810,7 +6127,9 @@ static void DrawTimeline() {
                            io.MousePos.x - rawX0 <= EDGE && io.MousePos.x < x1) {
                     hotEdgeClip = i; hotEdgeSide = -1;
                     hotBody = -1;
-                } else if (hotEdgeClip == -1 && fabsf(io.MousePos.x - x1) <= EDGE) {
+                } else if (hotEdgeClip == -1 && io.MousePos.x <= x1 &&
+                           x1 - io.MousePos.x <= EDGE && io.MousePos.x > x0) {
+                    // own side only: past x1 is the next shot's in-point band
                     hotEdgeClip = i; hotEdgeSide = +1;
                 } else if (hotEdgeClip == -1 && io.MousePos.x > x0 && io.MousePos.x < x1) {
                     hotBody = i;
@@ -5931,12 +6250,23 @@ static void DrawTimeline() {
             if (x1 - vx0 > 90)
                 dl->AddText(ImVec2(vx0 + 6, r.y1 - 20), IM_COL32(215, 215, 215, 200), lab);
 
-            if (inTracks && io.MousePos.y >= r.y0 && io.MousePos.y <= r.y1 &&
-                hotLayer == -1) {
-                if (fabsf(io.MousePos.x - x0) <= EDGE) { hotLayerTrack = r.idx; hotLayer = i; hotLayerSide = -1; }
-                else if (fabsf(io.MousePos.x - x1) <= EDGE) { hotLayerTrack = r.idx; hotLayer = i; hotLayerSide = +1; }
-                else if (io.MousePos.x > x0 && io.MousePos.x < x1) {
-                    hotLayerTrack = r.idx; hotLayer = i; hotLayerSide = 0;
+            // Each edge grabs only on its own clip's side, so a seam between two
+            // clips splits cleanly. Where clips touch or overlap, the selected clip
+            // beats an unselected neighbour, and an edge beats a plain body hit.
+            if (inTracks && io.MousePos.y >= r.y0 && io.MousePos.y <= r.y1) {
+                float mx = io.MousePos.x;
+                int side = 2;                              // 2 = not under the pointer
+                if (mx >= x0 && mx - x0 <= EDGE && mx < x1)      side = -1;
+                else if (mx <= x1 && x1 - mx <= EDGE && mx > x0) side = +1;
+                else if (mx > x0 && mx < x1)                     side = 0;
+                if (side != 2) {
+                    bool mine = SelHas(c.uid);
+                    bool hotSel = hotLayer >= 0 && hotLayerTrack == r.idx &&
+                                  SelHas(tr.clips[hotLayer]->uid);
+                    if (hotLayer == -1 || (mine && !hotSel) ||
+                        (mine == hotSel && side != 0 && hotLayerSide == 0)) {
+                        hotLayerTrack = r.idx; hotLayer = i; hotLayerSide = side;
+                    }
                 }
             }
         }
@@ -5959,7 +6289,9 @@ static void DrawTimeline() {
             bool selected = SelHas(s.uid);
             dl->AddRectFilled(ImVec2(ax0 < trackX ? trackX : ax0, r.y0 + 2),
                               ImVec2(ax1, r.y1 - 2),
-                              tr.mute ? IM_COL32(26, 26, 26, 255) : IM_COL32(42, 42, 42, 255), 5.0f);
+                              tr.mute ? IM_COL32(26, 26, 26, 255)
+                              : s.gen ? IM_COL32(38, 46, 56, 255)   // texture: no file under it
+                                      : IM_COL32(42, 42, 42, 255), 5.0f);
             float cy = r.y0 + rh * 0.5f;
             float amp = (rh - 12) * 0.5f;
             float px0 = ax0 > trackX ? ax0 : trackX;
@@ -5980,8 +6312,21 @@ static void DrawTimeline() {
             dl->AddRect(ImVec2(ax0 < trackX ? trackX : ax0, r.y0 + 2), ImVec2(ax1, r.y1 - 2),
                         selected ? IM_COL32(255, 255, 255, 255) : IM_COL32(255, 255, 255, 40),
                         5.0f, 0, selected ? 2.5f : 1.0f);
+            const char* blabel = s.label.c_str();
+            char glab[160];
+            if (s.gen) {                          // what it is, what it runs, and over what
+                const int f = std::clamp(s.fx, 0, AFX_COUNT - 1);
+                if (s.gen == 1)
+                    snprintf(glab, sizeof(glab), "noise bed - %s",
+                             kTexNames[std::clamp(s.tex, 0, TEX_COUNT - 1)]);
+                else
+                    snprintf(glab, sizeof(glab), "chain region - %s > %s", kAfxNames[f],
+                             s.target >= 0 && s.target < (int)g_atracks.size()
+                                 ? g_atracks[s.target]->name.c_str() : "no track");
+                blabel = glab;
+            }
             dl->AddText(ImVec2((ax0 > trackX ? ax0 : trackX) + 6, r.y0 + 4),
-                        IM_COL32(225, 225, 225, 220), s.label.c_str());
+                        IM_COL32(225, 225, 225, 220), blabel);
 
             // later blocks draw on top, so the last one under the mouse wins the hit
             if (inTracks && io.MousePos.y >= r.y0 && io.MousePos.y <= r.y1 &&
@@ -7697,7 +8042,7 @@ static void SetCB(const ProjCB& cb) {
 // Draw one texture into the offscreen canvas, cover- or contain-fitted.
 static void CompositeQuad(ID3D11ShaderResourceView* srv, float aspect, bool cover,
                           float alpha, int w, int h, const Grade* g = nullptr,
-                          int anchor = LANCHOR_CENTER) {
+                          int anchor = LANCHOR_CENTER, float rx = 1.0f, float ry = 1.0f) {
     if (!srv) return;
     ProjCB cb = {};
     if (g) {
@@ -7706,18 +8051,19 @@ static void CompositeQuad(ID3D11ShaderResourceView* srv, float aspect, bool cove
         cb.gSatM1 = (g->mono ? 0.0f : g->sat) - 1.0f;
         cb.gTemp = g->temp;
     }
-    float boxA = (float)w / (float)h;
+    // rx/ry: the box is only that centred part of the target (see PlateCropRegion)
+    float boxA = ((float)w * rx) / ((float)h * ry);
     float u0 = 0, v0 = 0, u1 = 1, v1 = 1;
-    float x0 = -1, y0 = -1, x1 = 1, y1 = 1;     // NDC, y up
+    float x0 = -rx, y0 = -ry, x1 = rx, y1 = ry;     // NDC, y up
     if (cover) {
         float ax, ay;
         AnchorFrac(anchor, &ax, &ay);
         if (aspect > boxA) { float f = boxA / aspect; u0 = (1.0f - f) * ax; u1 = u0 + f; }
         else               { float f = aspect / boxA; v0 = (1.0f - f) * ay; v1 = v0 + f; }
     } else {
-        float fw = 2.0f, fh = 2.0f;
-        if (aspect > boxA) fh = 2.0f * (boxA / aspect);
-        else               fw = 2.0f * (aspect / boxA);
+        float fw = 2.0f * rx, fh = 2.0f * ry;
+        if (aspect > boxA) fh *= boxA / aspect;
+        else               fw *= aspect / boxA;
         x0 = -fw * 0.5f; x1 = fw * 0.5f;
         y0 = -fh * 0.5f; y1 = fh * 0.5f;
     }
@@ -7803,7 +8149,7 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
                             float opacity, const Grade* grade, bool fitCover,
                             int bed = LFIT_INSIDE, int look = LOOK_PROJECTOR,
                             bool pillar = false, double effectTime = 0.0,
-                            int anchor = LANCHOR_CENTER) {
+                            int anchor = LANCHOR_CENTER, bool throughPlate = false) {
         if (!srv || opacity <= 0.001f) return;
         const int T = TargetBase(depth);
         const int stage = T + 2;
@@ -7817,8 +8163,15 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
         // The blurred bed is a cover-fitted copy of the layer under the whole frame.
         // The preview does not blur it - the export's gblur is the real thing - but it
         // is opaque and the right colours, so the cut underneath stays hidden here too.
-        if (bed == LFIT_BLUR) CompositeQuad(srv, ar, true, 1.0f, outW, outH, grade, anchor);
-        CompositeQuad(srv, ar, fitCover, 1.0f, outW, outH, grade, anchor);
+        // Through the projector the plate's part of the canvas is the frame for every
+        // fit, the bed included. A black bed can stay full canvas: past the plate's
+        // part nothing reaches the gate.
+        float rx = 1.0f, ry = 1.0f;
+        if (throughPlate && applyFilm)
+            PlateCropRegion((float)outW / (float)outH, &rx, &ry);
+        if (bed == LFIT_BLUR)
+            CompositeQuad(srv, ar, true, 1.0f, outW, outH, grade, anchor, rx, ry);
+        CompositeQuad(srv, ar, fitCover, 1.0f, outW, outH, grade, anchor, rx, ry);
 
         // 1b. a shot on its own screen runs the look here, on the element alone, so the
         // treatment lands before track blending rather than over the finished frame.
@@ -7919,8 +8272,10 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
             srv = c.tex;
             ar = c.texAspect;
         }
+        const bool plate = !claimed && c.look == LOOK_PROJECTOR;   // seen through the gate
         if (srv) blendElement(depth, srv, ar, mode, opacity, &c.grade,
-                              c.lfit == LFIT_FILL, c.lfit, look, c.look43, local, c.lanchor);
+                              c.lfit == LFIT_FILL, c.lfit, look, c.look43, local, c.lanchor,
+                              plate);
         if (c.dxOn) {
             ID3D11ShaderResourceView* lay = c.dxTex;
             float la = c.dxAspect;
@@ -7931,7 +8286,7 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
             // the double-exposure list starts at "screen", the layer list at "normal"
             if (lay) blendElement(depth, lay, la, c.dxBlend + 1, opacity * c.dxAmount,
                                   &c.grade, c.lfit == LFIT_FILL, c.lfit, look, c.look43, local,
-                                  c.lanchor);
+                                  c.lanchor, plate);
         }
     };
 
@@ -8390,7 +8745,35 @@ static void DrawClipInspector() {
         AudioTrack& tr = *g_atracks[g_selAT];
         Song& s = *tr.blocks[g_sel];
         ImGui::TextUnformatted(s.label.c_str());
-        ImGui::TextDisabled("%s / %.2f s", tr.name.c_str(), s.duration);
+        ImGui::TextDisabled("%s / %.2f s", tr.name.c_str(),
+                            s.gen ? s.trimEnd - s.trimStart : s.duration);
+        if (s.gen) {
+            // A texture block: a noise bed is its chain heard on its own; a chain
+            // region runs its chain over another track for as long as it lasts.
+            Prop("kind");
+            if (ImGui::RadioButton("noise bed", s.gen == 1)) s.gen = 1;
+            ImGui::SameLine();
+            if (ImGui::RadioButton("chain region", s.gen == 2)) {
+                s.gen = 2;
+                if (s.fx <= AFX_NONE || s.fx >= AFX_COUNT) s.fx = AFX_PHONE;
+            }
+            if (s.gen == 2) {
+                Prop("runs over");
+                const char* cur = s.target >= 0 && s.target < (int)g_atracks.size()
+                                      ? g_atracks[s.target]->name.c_str() : "(pick a track)";
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::BeginCombo("##rtarget", cur)) {
+                    for (int i = 0; i < (int)g_atracks.size(); i++) {
+                        if (i == g_selAT) continue;              // not its own track
+                        ImGui::PushID(i);
+                        if (ImGui::Selectable(g_atracks[i]->name.c_str(), s.target == i))
+                            s.target = i;
+                        ImGui::PopID();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+        }
         Prop("start");
         float off = (float)s.offset;
         if (ImGui::InputFloat("##aoff", &off, 0.1f, 1.0f, "%.3f s")) s.offset = off;
@@ -8402,18 +8785,29 @@ static void DrawClipInspector() {
             s.trimEnd = b > s.duration ? s.duration : b;
             if (s.trimEnd < s.trimStart + 0.1) s.trimEnd = s.trimStart + 0.1;
         }
-        Prop("level");
-        ImGui::SliderFloat("##alvl", &tr.volume, 0.0f, 2.0f, "%.2f");
-        Prop("chain");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::Combo("##afx", &tr.fx, kAfxNames, AFX_COUNT);
-        if (tr.fx > AFX_NONE) {
-            Prop("amount");
-            ImGui::SliderFloat("##afxmix", &tr.fxMix, 0.0f, 1.0f, "%.2f");
+        // This block's own chain: split a block to change the sound partway, and
+        // give a later block the same chain to bring it back.
+        // A noise bed plays a texture; a chain region and a plain block carry a chain.
+        if (s.gen == 1) {
+            Prop("sound");
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("##bedtex", &s.tex, kTexNames, TEX_COUNT))
+                ForEachOtherSelectedSong(s, [&](Song& o) { if (o.gen == 1) o.tex = s.tex; });
+        } else {
+            Prop(s.gen == 2 ? "chain" : "clip chain");
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("##bfx", &s.fx, kAfxNames, AFX_COUNT))
+                ForEachOtherSelectedSong(s, [&](Song& o) { o.fx = s.fx; });
         }
-        Prop("track");
-        ImGui::Checkbox("mute", &tr.mute);
-        ImGui::SameLine();
+        if (s.gen == 1 || s.fx > AFX_NONE) {
+            Prop(s.gen == 1 ? "level" : s.gen == 2 ? "amount" : "clip amount");
+            if (ImGui::SliderFloat("##bfxmix", &s.fxMix, 0.0f, 1.0f, "%.2f"))
+                ForEachOtherSelectedSong(s, [&](Song& o) { o.fxMix = s.fxMix; });
+        }
+        // The track's own settings (chain, level, mute) live in the tracks panel,
+        // not on a block: they belong to the track whether or not this block is on it.
+        ImGui::TextDisabled("track chain, level and mute: tracks panel");
+        Prop("");
         if (ImGui::Button("remove block", ImVec2(-1, 0))) {
             { MixGuard lock; tr.blocks.erase(tr.blocks.begin() + g_sel); }
             g_sel = -1;
@@ -8836,9 +9230,74 @@ static void DrawTracksPanel() {
             break;
         }
         ImGui::EndDisabled();
+        // Texture blocks: cut, trim, move and splice like any block on this track.
+        // Pick what it is first; the block panel changes it afterwards.
+        Prop("add");
+        float halfT = ColW(2);
+        if (ImGui::Button("noise bed...", ImVec2(halfT, 0))) ImGui::OpenPopup("##pickbed");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("a texture on this track, at the playhead");
+        ImGui::SameLine();
+        if (ImGui::Button("chain region...", ImVec2(-1, 0))) ImGui::OpenPopup("##pickregion");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("a chain over another track, from the playhead");
+        if (ImGui::BeginPopup("##pickbed")) {
+            for (int k = 0; k < TEX_COUNT; k++)
+                if (ImGui::MenuItem(kTexNames[k])) AddGenBlock(t, 1, k);
+            ImGui::EndPopup();
+        }
+        if (ImGui::BeginPopup("##pickregion")) {
+            for (int k = AFX_NONE + 1; k < AFX_COUNT; k++)
+                if (ImGui::MenuItem(kAfxNames[k])) AddGenBlock(t, 2, k);
+            ImGui::EndPopup();
+        }
         ImGui::PopID();
     }
     if (g_atracks.empty()) ImGui::TextDisabled("(none)");
+    Prop("");
+    float halfN = ColW(2);
+    if (ImGui::Button("new noise bed track...", ImVec2(halfN, 0))) ImGui::OpenPopup("##newbed");
+    ImGui::SameLine();
+    if (ImGui::Button("new chain track...", ImVec2(-1, 0))) ImGui::OpenPopup("##newregion");
+    if (ImGui::BeginPopup("##newbed")) {
+        for (int k = 0; k < TEX_COUNT; k++)
+            if (ImGui::MenuItem(kTexNames[k])) {
+                int nt = NewAudioTrack();
+                g_atracks[nt]->name = kTexNames[k];
+                AddGenBlock(nt, 1, k);
+            }
+        ImGui::EndPopup();
+    }
+    if (ImGui::BeginPopup("##newregion")) {
+        for (int k = AFX_NONE + 1; k < AFX_COUNT; k++)
+            if (ImGui::MenuItem(kAfxNames[k])) {
+                int nt = NewAudioTrack();
+                g_atracks[nt]->name = kAfxNames[k];
+                AddGenBlock(nt, 2, k);
+            }
+        ImGui::EndPopup();
+    }
+}
+
+static void AddGenBlock(int track, int gen, int kind) {
+    if (track < 0 || track >= (int)g_atracks.size()) return;
+    UndoCapture();
+    auto s = std::make_unique<Song>();
+    s->gen = gen;
+    s->loaded = true;
+    s->duration = GEN_MAX;
+    s->trimStart = 0.0;
+    s->trimEnd = 10.0;
+    s->offset = g_playhead.load();
+    if (gen == 1) s->tex = std::clamp(kind, 0, TEX_COUNT - 1);
+    else          s->fx = std::clamp(kind, AFX_NONE + 1, AFX_COUNT - 1);
+    s->fxMix = 1.0f;
+    s->label = gen == 1 ? "noise bed" : "chain region";
+    if (gen == 2)                              // runs over the first other track to hand
+        for (int i = 0; i < (int)g_atracks.size(); i++)
+            if (i != track) { s->target = i; break; }
+    int uid = s->uid;
+    { MixGuard lock; g_atracks[track]->blocks.push_back(std::move(s)); }
+    SelSet(uid);
+    SelPrimaryTo(uid);
 }
 
 static void DrawProjectorPanel() {
@@ -9004,6 +9463,11 @@ static void WriteSong(std::string& o, const Song& b, int track, int seq = 0) {
     PutN(o, "trimEnd", b.trimEnd);
     PutI(o, "reversed", b.reversed);
     PutI(o, "group", b.group);
+    PutI(o, "fx", b.fx);
+    PutN(o, "fxMix", b.fxMix);
+    PutI(o, "gen", b.gen);
+    PutI(o, "target", b.target);
+    PutI(o, "tex", b.tex);
 }
 static void WriteClip(std::string& o, const Clip& c, int track, int seq = 0) {
     o += "[clip]\r\n";
@@ -9209,6 +9673,21 @@ static bool SaveProjectTo(const std::wstring& path) {
 
 // ---- loading
 
+// ---- undo keeps what is already loaded
+// A restore rebuilds the project from text. With g_keepMedia set, ClearProject
+// parks decoded stills and sound blocks here, and keeps the video sources and their
+// proxy frames, so the restored clips pick them straight back up instead of
+// decoding everything again. Whatever the step no longer uses is freed afterwards.
+static bool g_keepMedia = false;
+static std::multimap<std::wstring, std::unique_ptr<Song>> g_songStash;
+static std::multimap<std::wstring, std::pair<ID3D11ShaderResourceView*, float>> g_texStash;
+
+static void FlushMediaStash() {
+    for (auto& t : g_texStash) RetireTexture(t.second.first);
+    g_texStash.clear();
+    g_songStash.clear();
+}
+
 static void ClearProject() {
     ClearWorkspacePreviews();
     g_library.clear();
@@ -9218,7 +9697,7 @@ static void ClearProject() {
     g_audition = false;
     bool wasPlaying = g_playing.exchange(false);
     if (g_songLoadFut.valid()) g_songLoadFut.wait();    // let the last restore land
-    Sleep(20);
+    if (!g_keepMedia) Sleep(20);
     {
         std::vector<Clip*> all;
         auto sweep = [&](std::vector<std::unique_ptr<Clip>>& v) {
@@ -9231,20 +9710,37 @@ static void ClearProject() {
             for (auto& t : q->over) sweep(t->clips);
         }
         for (Clip* c : all) {
-            if (c->kind != Clip::Video) RetireTexture(c->tex);
+            if (g_keepMedia && c->kind == Clip::Image && c->tex && !c->pending.valid()) {
+                g_texStash.emplace(c->path, std::make_pair(c->tex, c->texAspect));
+                c->tex = nullptr;
+            } else if (c->kind != Clip::Video) RetireTexture(c->tex);
             ClearDoubleExposure(*c);
         }
     }
     g_clips.clear();
     g_over.clear();
     g_aspects.clear();
-    { MixGuard lock; g_atracks.clear(); g_seqs.clear(); }
+    {
+        MixGuard lock;
+        if (g_keepMedia) {
+            auto park = [](std::vector<std::unique_ptr<AudioTrack>>& ts) {
+                for (auto& t : ts)
+                    for (auto& b : t->blocks)
+                        if (b && b->loaded) { std::wstring p = b->path; g_songStash.emplace(p, std::move(b)); }
+            };
+            park(g_atracks);
+            for (auto& q : g_seqs) park(q->atracks);
+        }
+        g_atracks.clear(); g_seqs.clear();
+    }
     g_baseOff = false;                      // monitor state, never part of a project
     g_nav.assign(1, 0);
     g_seqNext = 1;
     EnsureRootSeq();
-    for (auto& v : g_videoSources) ReleaseProxyCache(*v);
-    g_videoSources.clear();
+    if (!g_keepMedia) {                     // an undo keeps sources and their proxy frames
+        for (auto& v : g_videoSources) ReleaseProxyCache(*v);
+        g_videoSources.clear();
+    }
     g_sel = -1; g_selTrack = -1; g_selAT = -1;
     g_playhead.store(0.0);
     g_playing.store(wasPlaying && false);
@@ -9303,8 +9799,16 @@ static Clip* MakeClipFromKV(const KV& kv) {
     c->ovlShadow = kv.b("ovlShadow", true);
 
     if (c->kind == Clip::Video && !c->path.empty()) c->vid = GetVideoSource(c->path);
-    else if (c->kind == Clip::Image && !c->path.empty())
-        c->pending = std::async(std::launch::async, DecodeImage, c->path);
+    else if (c->kind == Clip::Image && !c->path.empty()) {
+        auto st = g_texStash.find(c->path);     // an undo: the still is already on the GPU
+        if (st != g_texStash.end()) {
+            c->tex = st->second.first;
+            c->texAspect = st->second.second;
+            g_texStash.erase(st);
+        } else {
+            c->pending = std::async(std::launch::async, DecodeImage, c->path);
+        }
+    }
 
     if (kv.b("dxOn") && !kv.str("dxPath").empty()) {
         SetDoubleExposure(*c, Widen(kv.str("dxPath")));   // resets the knobs, so set after
@@ -9391,7 +9895,8 @@ static bool LoadProjectFromText(const std::string& text, bool syncAudio = false)
     ClearProject();
 
     struct SongReq { std::wstring path; std::string label; int track; int seq;
-                     double offset, trimStart, trimEnd; bool reversed; int group; };
+                     double offset, trimStart, trimEnd; bool reversed; int group;
+                     int fx; float fxMix; int gen; int target; int tex; };
     std::vector<SongReq> songs;
 
     std::string section;
@@ -9451,7 +9956,11 @@ static bool LoadProjectFromText(const std::string& text, bool syncAudio = false)
         } else if (section == "song") {
             songs.push_back({ Widen(kv.str("path")), kv.str("label"), kv.i("track", 0),
                               kv.i("seq", 0),
-                              kv.num("offset"), kv.num("trimStart"), kv.num("trimEnd"), kv.b("reversed"), kv.i("group") });
+                              kv.num("offset"), kv.num("trimStart"), kv.num("trimEnd"), kv.b("reversed"), kv.i("group"),
+                              std::clamp(kv.i("fx", AFX_NONE), 0, AFX_COUNT - 1),
+                              (float)kv.num("fxMix", 1.0),
+                              std::clamp(kv.i("gen", 0), 0, 2), kv.i("target", -1),
+                              std::clamp(kv.i("tex", 0), 0, TEX_COUNT - 1) });
             g_groupNext = std::max(g_groupNext, kv.i("group") + 1);
         }
         kv.v.clear();
@@ -9513,8 +10022,25 @@ static bool LoadProjectFromText(const std::string& text, bool syncAudio = false)
     auto restoreSongs = [](const std::vector<SongReq>& reqs) {
         int ok = 0;
         for (auto& r : reqs) {
-            auto sp = DecodeSongFile(r.path);
+            // An undo hands back the samples the timeline already held; only a
+            // block that wasn't there a moment ago is decoded.
+            std::unique_ptr<Song> sp;
+            if (r.gen) {                         // a texture block has nothing to decode
+                sp = std::make_unique<Song>();
+                sp->loaded = true;
+                sp->duration = GEN_MAX;
+                sp->label = r.gen == 1 ? "noise bed" : "chain region";
+            } else {
+                auto st = g_songStash.find(r.path);
+                if (st != g_songStash.end()) { sp = std::move(st->second); g_songStash.erase(st); }
+                else sp = DecodeSongFile(r.path);
+            }
             if (!sp || r.track < 0) continue;
+            sp->fx = r.fx;
+            sp->fxMix = r.fxMix;
+            sp->gen = r.gen;
+            sp->target = r.target;
+            sp->tex = r.tex;
             sp->offset = r.offset;
             sp->trimStart = r.trimStart;
             sp->trimEnd = r.trimEnd > r.trimStart ? r.trimEnd : sp->duration;
@@ -9962,6 +10488,22 @@ static bool RestoreFromVault(const std::wstring& path) {
 // lose work by looking through it.
 // The film's own grade, on top of whatever each shot is already doing.
 static void DrawColorPanel() {
+    // The picked shot comes first: its own colour, pushed onto the rest of the
+    // selection only. The film grade underneath is labelled as reaching every shot,
+    // so it can't be mistaken for the shot's.
+    ImGui::SeparatorText("this shot");
+    if (Clip* c = SelectedClip()) {
+        int nSel = SelCount();
+        if (nSel > 1) ImGui::TextDisabled("editing %d selected shots", nSel);
+        else          ImGui::TextDisabled("%s", c->label.c_str());
+        if (int gch = GradeControls(c->grade, "pick"))
+            ForEachOtherSelected(*c, [&](Clip& o) { ApplyGradeFields(o.grade, c->grade, gch); });
+    } else {
+        ImGui::TextDisabled("pick a shot to grade it on its own");
+    }
+
+    ImGui::SeparatorText("whole film");
+    ImGui::TextDisabled("over every shot at once");
     GradeControls(g_grade, "film");
     Prop("");
     if (ImGui::Button("apply to every shot", ImVec2(-1, 0))) {
@@ -10134,7 +10676,10 @@ static void UndoStep(bool redo) {
     from.pop_back();
     (redo ? g_undo : g_redo).push_back(g_undoBase);
     g_undoBusy = true;
+    g_keepMedia = true;                    // reuse what's loaded; decode only what's new
     LoadProjectFromText(text, true);       // audio comes back with the step
+    g_keepMedia = false;
+    FlushMediaStash();
     g_undoBusy = false;
     g_undoBase = text;
     g_selUids.clear();
@@ -10503,7 +11048,13 @@ static void PasteClipboard() {
             s->trimEnd = b.num("trimEnd");
             s->reversed = b.i("reversed");
             s->group = b.i("group");
-            
+            s->fx = std::clamp(b.i("fx", AFX_NONE), 0, AFX_COUNT - 1);
+            s->fxMix = (float)b.num("fxMix", 1.0);
+            s->gen = std::clamp(b.i("gen", 0), 0, 2);
+            s->target = b.i("target", -1);
+            s->tex = std::clamp(b.i("tex", 0), 0, TEX_COUNT - 1);
+            if (s->gen) { s->loaded = true; s->duration = GEN_MAX; }
+
             int tr = b.i("track", -1);
             if (tr < 0) tr = 0;
             while (tr >= (int)g_atracks.size()) NewAudioTrack();
@@ -10619,8 +11170,9 @@ static void SaveProjectDialog(bool forceAsk) {
     if (!out.empty()) SaveProjectTo(out);
 }
 
-// A track exists only while it holds something: the last clip or block leaving it
-// takes the row with it.
+// A video layer exists only while it holds something: the last clip leaving it takes
+// the row with it. Audio tracks stay put when emptied - their name, volume, mute and
+// fx are set up by hand - and go only through "remove" in the tracks panel.
 static void PruneEmptyTracks() {
     if (g_tl.drag != TimelineState::None) return;
     if (g_projectLoading.load()) return;   // blocks are still arriving off-thread
@@ -10629,12 +11181,6 @@ static void PruneEmptyTracks() {
         g_over.erase(g_over.begin() + i);
         if (g_selTrack == i) { g_sel = -1; g_selTrack = -1; }
         else if (g_selTrack > i) g_selTrack--;
-    }
-    for (int i = (int)g_atracks.size() - 1; i >= 0; i--) {
-        if (!g_atracks[i]->blocks.empty()) continue;
-        { MixGuard lock; g_atracks.erase(g_atracks.begin() + i); }
-        if (g_selTrack == -2 && g_selAT == i) { g_sel = -1; g_selTrack = -1; g_selAT = -1; }
-        else if (g_selAT > i) g_selAT--;
     }
 }
 

@@ -1196,7 +1196,13 @@ static std::unique_ptr<Song> DecodeSongFile(const std::wstring& path) {
     {
         std::lock_guard<std::mutex> lk(g_songCacheMx);
         auto it = g_songCache.find(path);
-        if (it != g_songCache.end()) return std::make_unique<Song>(*it->second);
+        if (it != g_songCache.end()) {
+            // the cached copy carries the first decode's uid; a second block of the
+            // same file needs its own, or picking one picks every copy
+            auto sp = std::make_unique<Song>(*it->second);
+            sp->uid = g_uidNext++;
+            return sp;
+        }
     }
     auto sp = DecodeSongFileUncached(path);
     if (!sp) return nullptr;
@@ -4752,6 +4758,9 @@ struct TimelineState {
     int    clickCollapseUid = -1;         // clicked inside a multi-selection: if the
                                           // press turns out not to be a drag, the
                                           // release drops the selection to this one
+    int    clickCycleUid = -1;            // clicked a picked sound block with others
+                                          // stacked under it: a still release picks
+                                          // the next one down instead
     int    editIndex = -1;                // duration-edit popup target
     // (Fade is a drag kind: see TimelineState::Fade)
     int    editTrack = -1;                // -1 = base track, else overlay track
@@ -4795,7 +4804,7 @@ static bool HasRange() { return g_rangeIn >= 0 && g_rangeOut > g_rangeIn + 1e-3;
 static char  g_textBuf[1024] = "";
 static float g_textScale = 0.13f;
 static double g_textDur = 2.0;
-static int   g_textTarget = -1;           // -1 = creating a new card
+static int   g_textTarget = -1;           // uid of the card being edited, -1 = creating a new one
 static int   g_textTargetTrack = -1;      // which track the edited card lives on
 static bool  g_textInsert = true;         // drop the new card at the playhead
 static bool  g_textOpenNew = false;       // a child window asked for the editor
@@ -5372,13 +5381,15 @@ static void DrawTextCardPopup() {
     bool cancel = ImGui::Button("Cancel", ImVec2(90, 0));
     if (ok) {
         double d = g_textDur < MinClipDur() ? MinClipDur() : g_textDur;
-        auto* tv = TrackClips(g_textTargetTrack);
-        if (g_textTarget >= 0 && tv && g_textTarget < (int)tv->size()) {
-            Clip& c = *(*tv)[g_textTarget];
-            c.text = g_textBuf;
-            c.textScale = g_textScale;
-            c.duration = d;
-            c.label = FirstLine(c.text);
+        if (g_textTarget >= 0) {
+            // Editing a card: rewrite it wherever it now lives. If it's gone, the
+            // edit is dropped - never turned into a new card on the base track.
+            if (Clip* c = ClipByUid(g_textTarget)) {
+                c->text = g_textBuf;
+                c->textScale = g_textScale;
+                c->duration = d;
+                c->label = FirstLine(c->text);
+            }
         } else {
             int at = g_textInsert ? SplitPoint(g_playhead.load()) : -1;
             AddTextClip(g_textBuf, d, g_textScale, at);
@@ -5649,6 +5660,7 @@ static void DrawTimeline() {
     int hotEdgeClip = -1, hotEdgeSide = 0, hotBody = -1;          // base track
     int hotLayerTrack = -1, hotLayer = -1, hotLayerSide = 0;      // overlay tracks
     int hotAudTrack = -1, hotAudBlock = -1, hotAudSide = 0;
+    std::vector<int> audHits;              // every block under the mouse, bottom to top
     int hotAspect = -1;
 
     // ---- base video track
@@ -5971,8 +5983,13 @@ static void DrawTimeline() {
             dl->AddText(ImVec2((ax0 > trackX ? ax0 : trackX) + 6, r.y0 + 4),
                         IM_COL32(225, 225, 225, 220), s.label.c_str());
 
+            // later blocks draw on top, so the last one under the mouse wins the hit
             if (inTracks && io.MousePos.y >= r.y0 && io.MousePos.y <= r.y1 &&
-                hotAudBlock == -1) {
+                io.MousePos.x >= ax0 - EDGE && io.MousePos.x <= ax1 + EDGE) {
+                if (hotAudTrack != r.idx) audHits.clear();
+                audHits.push_back(b);
+            }
+            if (inTracks && io.MousePos.y >= r.y0 && io.MousePos.y <= r.y1) {
                 if (fabsf(io.MousePos.x - ax0) <= EDGE) { hotAudTrack = r.idx; hotAudBlock = b; hotAudSide = -1; }
                 else if (fabsf(io.MousePos.x - ax1) <= EDGE) { hotAudTrack = r.idx; hotAudBlock = b; hotAudSide = +1; }
                 else if (io.MousePos.x > ax0 && io.MousePos.x < ax1) {
@@ -6157,6 +6174,7 @@ static void DrawTimeline() {
     if (ImGui::IsItemActivated()) {
         g_tl.dragStartMouseX = io.MousePos.x;
         g_tl.clickCollapseUid = -1;
+        g_tl.clickCycleUid = -1;
         if (hotResizeKind >= 0) {
             g_tl.drag = TimelineState::RowResize;
             g_tl.rzKind = hotResizeKind;
@@ -6215,6 +6233,25 @@ static void DrawTimeline() {
                 else ImGui::OpenPopup("edit_duration");
             }
         } else if (hotAudBlock >= 0) {
+            // Stacked blocks: while the picked one is under the mouse the press stays
+            // on it (so a drag moves what you see picked), and a click that never
+            // moves steps down to the next block in the stack, wrapping at the bottom.
+            if (!io.KeyCtrl && !io.KeyShift && audHits.size() > 1 &&
+                g_selTrack == -2 && g_selAT == hotAudTrack) {
+                for (size_t k = 0; k < audHits.size(); k++) {
+                    if (audHits[k] != g_sel) continue;
+                    auto& bl = g_atracks[hotAudTrack]->blocks;
+                    hotAudBlock = g_sel;
+                    Song& cur = *bl[g_sel];
+                    double len = cur.trimEnd - cur.trimStart;
+                    float cx0 = SecToX(cur.offset), cx1 = SecToX(cur.offset + len);
+                    hotAudSide = fabsf(io.MousePos.x - cx0) <= EDGE ? -1
+                               : fabsf(io.MousePos.x - cx1) <= EDGE ? +1 : 0;
+                    size_t next = k == 0 ? audHits.size() - 1 : k - 1;
+                    g_tl.clickCycleUid = bl[audHits[next]]->uid;
+                    break;
+                }
+            }
             Song& s = *g_atracks[hotAudTrack]->blocks[hotAudBlock];
             if (io.KeyCtrl) SelToggle(s.uid);
             else if (io.KeyShift && g_selTrack == -2 && g_sel >= 0 && g_selAT == hotAudTrack) {
@@ -6737,7 +6774,15 @@ static void DrawTimeline() {
     if (ImGui::IsItemDeactivated()) {
         // A press inside a multi-selection that never turned into a drag was a
         // plain pick: keep only that shot (and its group).
-        if (g_tl.clickCollapseUid >= 0 &&
+        if (g_tl.clickCycleUid >= 0 &&
+            fabsf(io.MousePos.x - g_tl.dragStartMouseX) < 4.0f) {
+            // a still click on a stacked block: hand the pick to the one beneath
+            if (Song* ns = SongByUid(g_tl.clickCycleUid)) {
+                SelSet(ns->uid);
+                SelAddGroupOf(*ns);
+                SelPrimaryTo(ns->uid);
+            }
+        } else if (g_tl.clickCollapseUid >= 0 &&
             fabsf(io.MousePos.x - g_tl.dragStartMouseX) < 4.0f) {
             Clip* pc = ClipByUid(g_tl.clickCollapseUid);
             SelSet(g_tl.clickCollapseUid);
@@ -6855,6 +6900,7 @@ static void DrawTimeline() {
         g_tl.overwriteUid = -1;
         g_tl.rippleAt = -1e18;
         g_tl.clickCollapseUid = -1;
+        g_tl.clickCycleUid = -1;
         g_tl.drag = TimelineState::None;
         g_tl.dragIndex = -1;
         g_tl.dragTrack = -1;
@@ -6962,12 +7008,10 @@ static void DrawTimeline() {
         g_selUids.clear();
     } else if (g_tl.drag == TimelineState::None &&
         (ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace))) {
-        // A multi-selection is deleted wholesale unless the cursor is parked on
-        // something outside it, in which case that one clip goes instead.
-        bool hotOutside = (hotBody >= 0 && !SelHas(g_clips[hotBody]->uid)) ||
-                          (hotLayer >= 0 && !SelHas(g_over[hotLayerTrack]->clips[hotLayer]->uid)) ||
-                          (hotAudBlock >= 0 && !SelHas(g_atracks[hotAudTrack]->blocks[hotAudBlock]->uid));
-        if (!g_selUids.empty() && !hotOutside) {
+        // What's highlighted is what goes. Only with nothing picked does the clip
+        // under the cursor go instead - a hovered neighbour (or the block stacked
+        // over a picked one) must never be deleted in place of the selection.
+        if (!g_selUids.empty()) {
             {   // removing a base shot closes the film up, so whatever sat over it
                 // moves back by the same length. Back to front, so each seam is
                 // still measured in the world the one before it left behind.
@@ -11173,7 +11217,7 @@ static void DrawApp() {
             snprintf(g_textBuf, sizeof(g_textBuf), "%s", c.text.c_str());
             g_textScale = c.textScale;
             g_textDur = c.duration;
-            g_textTarget = g_tl.editIndex;
+            g_textTarget = c.uid;           // by uid: indices can shift while it's open
             g_textTargetTrack = g_tl.editTrack;
             ImGui::OpenPopup("Text card");
         }

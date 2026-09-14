@@ -323,7 +323,25 @@ struct Song {
     int     gen = 0;
     int     target = -1;                   // chain region: the audio track it runs over
     int     tex = 0;                       // noise bed: which texture it plays (TEX_*)
+    float   volume = 1.0f;                 // the block's own level, after its chain, under the track's
+    float   fadeIn = 0.0f;                 // seconds of ramp up from the block's start
+    float   fadeOut = 0.0f;                // seconds of ramp down into the block's end
 };
+
+// A block's fade level at timeline time t. Linear ramps that begin no earlier than
+// timeline 0, so the export's afade (which cannot start partway up) matches.
+static float SongFadeGain(const Song& s, double t) {
+    double len = s.trimEnd - s.trimStart, g = 1.0;
+    if (s.fadeIn > 0.001f) {
+        double a = s.offset > 0 ? s.offset : 0.0, b = s.offset + s.fadeIn;
+        if (t < b && b > a) g = std::min(g, (t - a) / (b - a));
+    }
+    if (s.fadeOut > 0.001f) {
+        double e = s.offset + len, a = std::max(e - s.fadeOut, 0.0);
+        if (t > a && e > a) g = std::min(g, (e - t) / (e - a));
+    }
+    return g < 0 ? 0.0f : (float)g;
+}
 // A texture block's source is endless; this is how far its out-point can be pulled.
 static const double GEN_MAX = 3600.0;
 
@@ -1191,9 +1209,12 @@ static void AudioCallback(ma_device*, void* out, const void*, ma_uint32 frames) 
                 float* bd = bscratch.data();
                 memset(bd, 0, sizeof(float) * frames * 2);
                 g_texState[s.uid].Render(bd, frames, s.tex, s.fxMix);
+                const bool bfade = s.fadeIn > 0.001f || s.fadeOut > 0.001f;
                 for (long long i = g0; i < g1; i++) {
-                    dst[i * 2 + 0] += bd[i * 2 + 0] * gain;
-                    dst[i * 2 + 1] += bd[i * 2 + 1] * gain;
+                    float gg = gain * s.volume;
+                    if (bfade) gg *= SongFadeGain(s, ph + (double)i / SAMPLE_RATE);
+                    dst[i * 2 + 0] += bd[i * 2 + 0] * gg;
+                    dst[i * 2 + 1] += bd[i * 2 + 1] * gg;
                 }
                 continue;
             }
@@ -1211,28 +1232,40 @@ static void AudioCallback(ma_device*, void* out, const void*, ma_uint32 frames) 
             if (i1 <= i0) continue;
             // A block with its own chain runs through it alone first, then joins
             // the track (and the track's chain, if any).
+            // A fading block also mixes alone, so its ramp lands after its own chain.
             const bool bfx = s.fx > AFX_NONE && s.fx < AFX_COUNT && s.fxMix > 0.0001f;
+            const bool bfade = s.fadeIn > 0.001f || s.fadeOut > 0.001f;
             float* bd = dst;
-            if (bfx) { bd = bscratch.data(); memset(bd, 0, sizeof(float) * frames * 2); }
+            if (bfx || bfade) { bd = bscratch.data(); memset(bd, 0, sizeof(float) * frames * 2); }
             const float* pcm = s.pcm.data();
+            // Without a chain the block's level is linear, so it rides in with the
+            // track's; with one it waits until after the chain, like the export.
+            const float bgain = bfx ? gain : gain * s.volume;
             if (s.reversed) {
                 long long base = hi - 1 - start_base;
                 for (long long i = i0; i < i1; i++) {
                     const float* q = pcm + (base - i) * 2;
-                    bd[i * 2 + 0] += q[0] * gain;
-                    bd[i * 2 + 1] += q[1] * gain;
+                    bd[i * 2 + 0] += q[0] * bgain;
+                    bd[i * 2 + 1] += q[1] * bgain;
                 }
             } else {
                 const float* q = pcm + (lo + start_base + i0) * 2;
                 for (long long i = i0; i < i1; i++, q += 2) {
-                    bd[i * 2 + 0] += q[0] * gain;
-                    bd[i * 2 + 1] += q[1] * gain;
+                    bd[i * 2 + 0] += q[0] * bgain;
+                    bd[i * 2 + 1] += q[1] * bgain;
                 }
             }
-            if (bfx) {
-                g_blockFx[s.uid].Process(bd, frames, s.fx, s.fxMix);
-                for (ma_uint32 k = 0; k < frames * 2; k++) dst[k] += bd[k];
+            if (bfx) g_blockFx[s.uid].Process(bd, frames, s.fx, s.fxMix);
+            const float post = bfx ? s.volume : 1.0f;
+            if (bfade || post != 1.0f) {
+                for (ma_uint32 k = 0; k < frames; k++) {
+                    float fg = post * (bfade ? SongFadeGain(s, ph + (double)k / SAMPLE_RATE) : 1.0f);
+                    bd[k * 2 + 0] *= fg;
+                    bd[k * 2 + 1] *= fg;
+                }
             }
+            if (bfx || bfade)
+                for (ma_uint32 k = 0; k < frames * 2; k++) dst[k] += bd[k];
         }
         // Chain regions over this track: inside a region's span the bus is its chain's
         // output, outside it the bus passes untouched. Before the track's own chain.
@@ -2228,7 +2261,9 @@ static bool SplitNest(int index, double off) {
                     tail->uid = g_uidNext++;
                     tail->trimStart = b.trimStart + (off - b.offset);
                     tail->offset = 0;
+                    tail->fadeIn = 0;                     // the cut is not a fade
                     b.trimEnd = tail->trimStart;
+                    b.fadeOut = 0;
                     nt->blocks.push_back(std::move(tail));
                     continue;
                 }
@@ -4568,6 +4603,38 @@ static void StartExport(const std::wstring& outPath) {
             // is its chain's output, outside it the stream passes dry - the same switch
             // the mixer makes. The stream's t is timeline time (it was delayed into place).
             std::wstring cur = L"p" + std::to_wstring(ai.in);
+            // The block's level and fades, after its own chain. The stream's t is
+            // timeline time.
+            {
+                double len = s.trimEnd - s.trimStart, e = s.offset + len;
+                std::wstring fd;
+                wchar_t fb[128];
+                if (fabsf(s.volume - 1.0f) > 0.0005f) {
+                    swprintf(fb, 128, L"volume=%.4f", s.volume);
+                    fd += fb;
+                }
+                if (s.fadeIn > 0.001f) {
+                    double a = s.offset > 0 ? s.offset : 0.0, b = s.offset + s.fadeIn;
+                    if (b > a) {
+                        swprintf(fb, 128, L"%lsafade=t=in:st=%.4f:d=%.4f",
+                                 fd.empty() ? L"" : L",", a, b - a);
+                        fd += fb;
+                    }
+                }
+                if (s.fadeOut > 0.001f) {
+                    double a = std::max(e - s.fadeOut, 0.0);
+                    if (e > a) {
+                        swprintf(fb, 128, L"%lsafade=t=out:st=%.4f:d=%.4f",
+                                 fd.empty() ? L"" : L",", a, e - a);
+                        fd += fb;
+                    }
+                }
+                if (!fd.empty()) {
+                    std::wstring nxt = L"f" + std::to_wstring(ai.in);
+                    fc += L";[" + cur + L"]" + fd + L"[" + nxt + L"]";
+                    cur = nxt;
+                }
+            }
             {
                 int rk = 0;
                 double bStart = s.offset, bEnd = s.offset + (s.trimEnd - s.trimStart);
@@ -6313,13 +6380,41 @@ static void DrawTimeline() {
             const double peakRate = (double)SAMPLE_RATE / s.framesPerPeak;
             const ImU32 wcol = tr.mute ? IM_COL32(105, 105, 105, 160)
                                        : IM_COL32(205, 205, 205, 210);
+            const bool faded = s.fadeIn > 0.001f || s.fadeOut > 0.001f;
             for (float x = px0; x < px1; x += 1.0f) {
-                double tIn = XToSec(x) - s.offset + s.trimStart;
+                double tl = XToSec(x);
+                double tIn = tl - s.offset + s.trimStart;
                 size_t p = (size_t)(tIn * peakRate);
                 if (p >= nPeaks) break;
                 float lo = pk[p * 2], hi = pk[p * 2 + 1];
                 if (hi <= lo) continue;                  // silence: nothing to draw
+                float g = s.volume * (faded ? SongFadeGain(s, tl) : 1.0f);
+                lo = std::max(lo * g, -1.0f); hi = std::min(hi * g, 1.0f);
                 dl->AddLine(ImVec2(x, cy - hi * amp), ImVec2(x, cy - lo * amp), wcol);
+            }
+            // Fades: a shaded wedge where the level is down, and its ramp drawn over it.
+            if (faded && s.gen != 2) {
+                const float by0 = r.y0 + 2, by1 = r.y1 - 2;
+                const ImU32 shade = IM_COL32(0, 0, 0, 90);
+                const ImU32 ramp = tr.mute ? IM_COL32(150, 150, 150, 160)
+                                           : IM_COL32(255, 200, 90, 230);
+                auto wedge = [&](double ta, double tb, bool in) {
+                    float xa = SecToX(ta), xb = SecToX(tb);
+                    if (xb - xa < 1.0f) return;
+                    ImVec2 pa(xa, in ? by1 : by0), pb(xb, in ? by0 : by1);
+                    ImVec2 top(in ? xa : xb, by0);       // the quiet corner above the ramp
+                    dl->AddTriangleFilled(pa, top, pb, shade);
+                    dl->AddLine(pa, pb, ramp, 1.5f);
+                };
+                double e = s.offset + blockLen;
+                if (s.fadeIn > 0.001f) {
+                    double a = s.offset > 0 ? s.offset : 0.0, b2 = s.offset + s.fadeIn;
+                    if (b2 > a) wedge(a, b2, true);
+                }
+                if (s.fadeOut > 0.001f) {
+                    double a = std::max(e - s.fadeOut, 0.0);
+                    if (e > a) wedge(a, e, false);
+                }
             }
             dl->AddRect(ImVec2(ax0 < trackX ? trackX : ax0, r.y0 + 2), ImVec2(ax1, r.y1 - 2),
                         selected ? IM_COL32(255, 255, 255, 255) : IM_COL32(255, 255, 255, 40),
@@ -7335,7 +7430,9 @@ static void DrawTimeline() {
                 t->uid = g_uidNext++;
                 t->offset = b.offset + off;
                 t->trimStart = b.trimStart + off;
+                t->fadeIn = 0;                           // fades stay at the outer ends
                 b.trimEnd = b.trimStart + off;
+                b.fadeOut = 0;
                 MixGuard lock;
                 v.insert(v.begin() + g_sel + 1, std::move(t));
                 did = true;
@@ -8759,6 +8856,15 @@ static void DrawClipInspector() {
         ImGui::TextUnformatted(s.label.c_str());
         ImGui::TextDisabled("%s / %.2f s", tr.name.c_str(),
                             s.gen ? s.trimEnd - s.trimStart : s.duration);
+        {
+            int nSel = 0;                            // edits below land on every picked block
+            for (auto& t : g_atracks) for (auto& o : t->blocks) if (SelHas(o->uid)) nSel++;
+            if (!SelHas(s.uid)) nSel++;
+            if (nSel > 1)
+                ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.35f, 1.0f),
+                                   "editing %d sound blocks%s", nSel,
+                                   s.group ? " (grouped)" : "");
+        }
         if (s.gen) {
             // A texture block: a noise bed is its chain heard on its own; a chain
             // region runs its chain over another track for as long as it lasts.
@@ -8815,6 +8921,32 @@ static void DrawClipInspector() {
             Prop(s.gen == 1 ? "level" : s.gen == 2 ? "amount" : "clip amount");
             if (ImGui::SliderFloat("##bfxmix", &s.fxMix, 0.0f, 1.0f, "%.2f"))
                 ForEachOtherSelectedSong(s, [&](Song& o) { o.fxMix = s.fxMix; });
+        }
+        if (s.gen != 2) {                        // a region makes no sound to fade
+            Prop("clip volume");
+            // In decibels, stored as a linear gain. The bottom of the travel is silence.
+            const float DB_MIN = -60.0f, DB_MAX = 6.0f;
+            float db = s.volume <= 0.001f ? DB_MIN : 20.0f * log10f(s.volume);
+            db = std::clamp(db, DB_MIN, DB_MAX);
+            const char* dbFmt = db <= DB_MIN + 0.01f ? "-inf dB" : "%+.1f dB";
+            bool volSet = ImGui::SliderFloat("##bvol", &db, DB_MIN, DB_MAX, dbFmt);
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) { db = 0.0f; volSet = true; }
+            if (volSet) {
+                s.volume = db <= DB_MIN + 0.01f ? 0.0f : std::min(powf(10.0f, db / 20.0f), 2.0f);
+                ForEachOtherSelectedSong(s, [&](Song& o) { if (o.gen != 2) o.volume = s.volume; });
+            }
+            float blen = (float)(s.trimEnd - s.trimStart);
+            float fmaxS = std::min(10.0f, std::max(blen, 0.0f));
+            Prop("fade in");
+            if (ImGui::SliderFloat("##bfin", &s.fadeIn, 0.0f, fmaxS, "%.2f s")) {
+                s.fadeIn = std::clamp(s.fadeIn, 0.0f, fmaxS);
+                ForEachOtherSelectedSong(s, [&](Song& o) { if (o.gen != 2) o.fadeIn = s.fadeIn; });
+            }
+            Prop("fade out");
+            if (ImGui::SliderFloat("##bfout", &s.fadeOut, 0.0f, fmaxS, "%.2f s")) {
+                s.fadeOut = std::clamp(s.fadeOut, 0.0f, fmaxS);
+                ForEachOtherSelectedSong(s, [&](Song& o) { if (o.gen != 2) o.fadeOut = s.fadeOut; });
+            }
         }
         // The track's own settings (chain, level, mute) live in the tracks panel,
         // not on a block: they belong to the track whether or not this block is on it.
@@ -9480,6 +9612,9 @@ static void WriteSong(std::string& o, const Song& b, int track, int seq = 0) {
     PutI(o, "gen", b.gen);
     PutI(o, "target", b.target);
     PutI(o, "tex", b.tex);
+    PutN(o, "volume", b.volume);
+    PutN(o, "fadeIn", b.fadeIn);
+    PutN(o, "fadeOut", b.fadeOut);
 }
 static void WriteClip(std::string& o, const Clip& c, int track, int seq = 0) {
     o += "[clip]\r\n";
@@ -9908,7 +10043,8 @@ static bool LoadProjectFromText(const std::string& text, bool syncAudio = false)
 
     struct SongReq { std::wstring path; std::string label; int track; int seq;
                      double offset, trimStart, trimEnd; bool reversed; int group;
-                     int fx; float fxMix; int gen; int target; int tex; };
+                     int fx; float fxMix; int gen; int target; int tex;
+                     float fadeIn, fadeOut, volume; };
     std::vector<SongReq> songs;
 
     std::string section;
@@ -9972,7 +10108,10 @@ static bool LoadProjectFromText(const std::string& text, bool syncAudio = false)
                               std::clamp(kv.i("fx", AFX_NONE), 0, AFX_COUNT - 1),
                               (float)kv.num("fxMix", 1.0),
                               std::clamp(kv.i("gen", 0), 0, 2), kv.i("target", -1),
-                              std::clamp(kv.i("tex", 0), 0, TEX_COUNT - 1) });
+                              std::clamp(kv.i("tex", 0), 0, TEX_COUNT - 1),
+                              (float)std::max(0.0, kv.num("fadeIn")),
+                              (float)std::max(0.0, kv.num("fadeOut")),
+                              (float)std::clamp(kv.num("volume", 1.0), 0.0, 2.0) });
             g_groupNext = std::max(g_groupNext, kv.i("group") + 1);
         }
         kv.v.clear();
@@ -10053,6 +10192,9 @@ static bool LoadProjectFromText(const std::string& text, bool syncAudio = false)
             sp->gen = r.gen;
             sp->target = r.target;
             sp->tex = r.tex;
+            sp->fadeIn = r.fadeIn;
+            sp->fadeOut = r.fadeOut;
+            sp->volume = r.volume;
             sp->offset = r.offset;
             sp->trimStart = r.trimStart;
             sp->trimEnd = r.trimEnd > r.trimStart ? r.trimEnd : sp->duration;
@@ -11065,6 +11207,9 @@ static void PasteClipboard() {
             s->gen = std::clamp(b.i("gen", 0), 0, 2);
             s->target = b.i("target", -1);
             s->tex = std::clamp(b.i("tex", 0), 0, TEX_COUNT - 1);
+            s->fadeIn = (float)std::max(0.0, b.num("fadeIn"));
+            s->fadeOut = (float)std::max(0.0, b.num("fadeOut"));
+            s->volume = (float)std::clamp(b.num("volume", 1.0), 0.0, 2.0);
             if (s->gen) { s->loaded = true; s->duration = GEN_MAX; }
 
             int tr = b.i("track", -1);

@@ -599,7 +599,7 @@ def main(argv: list[str] | None = None) -> int:
         body = Path(__file__).with_name("surveillance_shader.h").read_text(encoding="utf-8-sig")
         body = body.split('R"SIGNAL(', 1)[1].rsplit(')SIGNAL"', 1)[0]
         body = body.replace("tex0.Sample(samp, ", "texture(tex0, ")
-        for old, new in (("float2", "vec2"), ("float3", "vec3"), ("float4", "vec4"),
+        for old, new in (("uint3", "uvec3"), ("int3", "ivec3"), ("float2", "vec2"), ("float3", "vec3"), ("float4", "vec4"),
                          ("frac(", "fract("), ("lerp(", "mix("), ("fmod(", "mod(")):
             body = body.replace(old, new)
         signal_prog = ctx.program(vertex_shader=VERTEX, fragment_shader="""#version 330

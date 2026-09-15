@@ -51,3 +51,6 @@ slidecut_progress.txt
 *.mp4
 *.mov
 *.mkv
+
+# ---- python
+__pycache__/

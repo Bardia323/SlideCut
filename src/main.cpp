@@ -12588,33 +12588,6 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-// TEMP SELFTEST
-static void RunUndoTest() {
-    std::string log;
-    auto count = []{ size_t n = 0; for (auto& t : g_atracks) n += t->blocks.size(); return n; };
-    std::string text = ReadTextFile(L"O:\\Data\\Temp\\claude\\undotest.slidecut");
-    log += "text bytes " + std::to_string(text.size()) + "\n";
-    bool ok = LoadProjectFromText(text, true);
-    log += "load " + std::to_string(ok) + " tracks " + std::to_string(g_atracks.size()) +
-           " blocks " + std::to_string(count()) + "\n";
-    UndoCapture();
-    log += "base bytes " + std::to_string(g_undoBase.size()) + " stack " + std::to_string(g_undo.size()) + "\n";
-    if (!g_atracks.empty() && !g_atracks[0]->blocks.empty()) {
-        MixGuard lock; g_atracks[0]->blocks.erase(g_atracks[0]->blocks.begin());
-    }
-    PruneEmptyTracks();
-    log += "after delete tracks " + std::to_string(g_atracks.size()) +
-           " blocks " + std::to_string(count()) + "\n";
-    UndoCapture();
-    log += "stack after capture " + std::to_string(g_undo.size()) + "\n";
-    UndoStep(false);
-    log += "after undo tracks " + std::to_string(g_atracks.size()) +
-           " blocks " + std::to_string(count()) + " stack " + std::to_string(g_undo.size()) + "\n";
-    std::string now = ProjectToText(true);
-    log += "roundtrip identical " + std::to_string(now == g_undoBase) + "\n";
-    WriteWholeFile(L"O:\\Data\\Temp\\claude\\undotest.log", log);
-}
-
 #include "edit_workspace_tests.h"
 
 // --headless-export <out> [--range <in> <out>]: the autosaved project through the real
@@ -12693,7 +12666,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     if (wcsstr(GetCommandLineW(), L"--workspace-test")) return RunWorkspaceTests();
     if (wcsstr(GetCommandLineW(), L"--workspace-ui")) return RunWorkspaceUITests(hInst);
     if (wcsstr(GetCommandLineW(), L"--workspace-media")) return RunWorkspaceUITests(hInst, true);
-    if (wcsstr(GetCommandLineW(), L"--undotest")) { RunUndoTest(); return 0; }    InstallCrashHandler();          // before anything that can fault
+    InstallCrashHandler();          // before anything that can fault
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     std::wstring hlOut;
     double hlIn = -1, hlEnd = -1;

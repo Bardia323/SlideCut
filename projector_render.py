@@ -287,11 +287,19 @@ uniform int   u_gate_on;
 
 float gate_h1(float n) { return fract(sin(n) * 43758.5453); }
 
-// Dave Hoskins' sine-free hash: no spatial tiling/lattice.
-float hash13(vec3 p3) {
-    p3 = fract(p3 * 0.1031);
-    p3 += dot(p3, p3.zyx + 31.32);
-    return fract((p3.x + p3.y) * p3.z);
+// PCG3D integer hash (Jarzynski & Olano). The float "sine-free" hash this replaces
+// runs out of precision on pixel coordinates and frame numbers and leaves faint
+// diagonal lattices, which show on dark footage where only the light specks read.
+// Kept bit-identical to the HLSL in main.cpp.
+uvec3 pcg3d(uvec3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    return v;
+}
+float hash13(vec3 p) {
+    return float(pcg3d(uvec3(ivec3(p))).x) / 4294967295.0;
 }
 
 void main() {
@@ -329,7 +337,9 @@ void main() {
     // --- full-frame film grain over everything -----------------------------
     if (u_grain > 0.0) {
         vec2  gpx  = floor(tc * u_out_size);
-        float step_t = floor(u_time * u_grain_fps);
+        // rounded: u_time is frame / fps, and a plain floor lands one short on some
+        // frames, which then repeat the previous frame's grain
+        float step_t = floor(u_time * u_grain_fps + 0.5);
         float g = hash13(vec3(gpx, step_t)) - 0.5;          // -0.5 .. 0.5
         float ga = abs(g) * u_grain;
         vec3 gc = (g > 0.0) ? vec3(1.0) : vec3(0.0);
@@ -465,6 +475,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="how the source fills the plate (default cover)")
     p.add_argument("--margin", type=float, default=0.94,
                    help="plate size as a fraction of the frame (default 0.94)")
+    p.add_argument("--aspect-schedule", default=None,
+                   help="'firstFrame count aspect' lines: the plate aspect over the film "
+                        "(0 = follow the source); frames outside every run use --plate-ar")
     p.add_argument("--plate-ar", type=float, default=None,
                    help="force the plate aspect ratio (e.g. 2.39); default = source AR")
     p.add_argument("--gate-inset", type=float, default=0.0,
@@ -624,15 +637,36 @@ def main(argv: list[str] | None = None) -> int:
     out_comps = 4 if (args.lossless and not still_out) else 3
     fbo_out = ctx.framebuffer(color_attachments=[ctx.texture((out_w, out_h), out_comps)])
 
-    px, py, pw, ph = plate_rect(out_w, out_h, src_w, src_h, args.margin, args.plate_ar)
-    scale, offset = fit_uv(pw, ph, src_w, src_h, args.fit)
+    # The plate's aspect can change over the film (SlideCut's aspect track): a schedule
+    # of "firstFrame count aspect" runs, applied frame by frame. Without one, the single
+    # --plate-ar holds for the whole render.
+    aspect_runs: list[tuple[int, int, float]] = []
+    if args.aspect_schedule:
+        for line in Path(args.aspect_schedule).read_text(encoding="utf-8-sig").splitlines():
+            if line.strip():
+                first, count, ar = line.split()
+                aspect_runs.append((int(first), int(count), float(ar)))
+
+    def aspect_at(frame: int) -> float | None:
+        for first, count, ar in aspect_runs:
+            if first <= frame < first + count:
+                return ar if ar > 0.01 else None
+        return args.plate_ar
+
+    def set_plate(ar: float | None) -> tuple[float, float]:
+        """Point the plate and gate uniforms at a plate of this aspect."""
+        px, py, pw, ph = plate_rect(out_w, out_h, src_w, src_h, args.margin, ar)
+        scale, offset = fit_uv(pw, ph, src_w, src_h, args.fit)
+        prog_plate["u_plate_org"] = (px, py)
+        prog_plate["u_plate_size"] = (pw, ph)
+        prog_plate["u_src_scale"] = scale
+        prog_plate["u_src_offset"] = offset
+        prog_gate["u_ap"] = (max(2.0, pw - 2.0 * args.gate_inset) / 2.0,
+                             max(2.0, ph - 2.0 * args.gate_inset) / 2.0)
+        return pw, ph
 
     prog_plate["tex0"] = 0
     prog_plate["u_out_size"] = (float(out_w), float(out_h))
-    prog_plate["u_plate_org"] = (px, py)
-    prog_plate["u_plate_size"] = (pw, ph)
-    prog_plate["u_src_scale"] = scale
-    prog_plate["u_src_offset"] = offset
     prog_plate["u_intensity"] = float(np.clip(args.intensity, 0.0, 1.0))
     prog_plate["u_weave"]     = float(max(args.weave, 0.0))
     prog_plate["u_ripple"]    = float(max(args.ripple, 0.0))
@@ -644,11 +678,10 @@ def main(argv: list[str] | None = None) -> int:
     prog_plate["u_scratch"]   = float(max(args.scratch, 0.0))
     prog_plate["u_vignette"]  = float(max(args.vignette, 0.0))
 
-    ap_w = max(2.0, pw - 2.0 * args.gate_inset)
-    ap_h = max(2.0, ph - 2.0 * args.gate_inset)
     prog_gate["tex0"] = 0
     prog_gate["u_out_size"] = (float(out_w), float(out_h))
-    prog_gate["u_ap"] = (ap_w / 2.0, ap_h / 2.0)
+    plate_now = aspect_at(0)
+    pw, ph = set_plate(plate_now)
     prog_gate["u_wall"] = args.wall
     prog_gate["u_grain"] = max(0.0, args.grain)
     prog_gate["u_grain_fps"] = args.grain_fps
@@ -739,6 +772,10 @@ def main(argv: list[str] | None = None) -> int:
                 ctx.clear(0.0, 0.0, 0.0, 1.0)
                 copy_vao.render(moderngl.TRIANGLES)
             else:
+                want = aspect_at(written)
+                if want != plate_now:                  # the aspect track moved the plate
+                    plate_now = want
+                    pw, ph = set_plate(plate_now)
                 src_tex.use(0)
                 fbo_plate.use()
                 ctx.clear(0.0, 0.0, 0.0, 0.0)

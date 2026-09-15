@@ -11,6 +11,8 @@
 #include <windows.h>
 #include <shobjidl.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
+#include <psapi.h>
 #include <shlwapi.h>
 #include <shlobj.h>
 #include <dbghelp.h>
@@ -156,6 +158,7 @@ struct VideoSource {
     double  duration = 0;                  // full source length, seconds
     int     w = 0, h = 0;                  // source pixel size
     double  fps = 0;                       // source frame rate
+    double  startTime = 0;                 // container start time; -ss counts from it
     bool    hasAudio = false;
     std::atomic<bool> probed{ false };     // duration/size known
     std::atomic<bool> ready{ false };      // proxy extraction finished
@@ -215,6 +218,8 @@ static const char* LFIT_ITEMS = "Inside\0" "Fill\0" "Blur bed\0" "Black bed\0";
 // film treatment; the tube looks bypass the plate entirely, since a television set
 // has no gate to sit in.
 enum { LOOK_PROJECTOR, LOOK_CRT, LOOK_CCTV, LOOK_CCTV_CRT };
+// Not a look a clip can pick: LookAtTime's answer where nothing is on screen at all.
+static const int LOOK_NONE = -1;
 static const char* LOOK_ITEMS = "Projector\0CRT\0CCTV\0CCTV + CRT\0";
 
 struct Clip {
@@ -1670,7 +1675,7 @@ static void BuildProxy(std::shared_ptr<VideoSource> vs) {
     std::wstring info = vs->proxyDir + L"info.txt";
     if (!RunHidden(L"ffprobe -v error -select_streams v:0 "
                    L"-show_entries stream=width,height,r_frame_rate "
-                   L"-show_entries format=duration -of default=nw=1 \"" + vs->path + L"\"",
+                   L"-show_entries format=duration,start_time -of default=nw=1 \"" + vs->path + L"\"",
                    info)) {
         vs->probed.store(true);
         vs->ready.store(true);
@@ -1688,6 +1693,7 @@ static void BuildProxy(std::shared_ptr<VideoSource> vs) {
         vs->w = atoi(value("width").c_str());
         vs->h = atoi(value("height").c_str());
         vs->duration = atof(value("duration").c_str());
+        vs->startTime = atof(value("start_time").c_str());   // "N/A" reads as 0
         std::string rate = value("r_frame_rate");        // "60000/1001" style
         size_t slash = rate.find('/');
         double num = atof(rate.c_str());
@@ -2330,7 +2336,8 @@ static bool IsGap(const Clip& c) {
 // Put `dur` seconds of gap at base index `at`, folded into a gap already beside it
 // so repeated trims do not leave a row of slivers.
 static void InsertGap(int at, double dur) {
-    if (dur < MinClipDur() * 0.5) return;
+    // Even a single deleted frame leaves its gap: ripple off means nothing moves.
+    if (dur < 1e-6) return;
     if (at > 0 && at - 1 < (int)g_clips.size() && IsGap(*g_clips[at - 1])) {
         g_clips[at - 1]->duration += dur;
         return;
@@ -3255,9 +3262,11 @@ static float PlateAspect() {
 // the canvas (rx by ry of it) ever reaches the gate, so a filling shot crops to that
 // part - and its keep anchor picks what the gate shows, instead of being cropped a
 // second time, always from the centre, by the plate.
-static bool PlateCropRegion(float canvasAr, float* rx, float* ry) {
+// pAr < 0: the plate showing at the playhead (the preview). The export passes the
+// plate in force when the shot is on screen.
+static bool PlateCropRegion(float canvasAr, float* rx, float* ry, float pAr = -1.0f) {
     *rx = *ry = 1.0f;
-    float pAr = PlateAspect();
+    if (pAr < 0) pAr = PlateAspect();
     if (g_projFit != 0 || pAr <= 0.01f || canvasAr <= 0.01f) return false;
     if (canvasAr > pAr) *rx = pAr / canvasAr;
     else                *ry = canvasAr / pAr;
@@ -3333,7 +3342,9 @@ static std::wstring ProjectorArgs(int W, int H, bool still) {
              L" --vignette %.4f",
              W, H,
              g_projFit == 1 ? L"contain" : g_projFit == 2 ? L"stretch" : L"cover",
-             g_projMargin, g_projIntensity, g_projGrain, g_projGrainFps,
+             // grain refreshes once per film frame: any other rate beats against the
+             // frames and reads as a regular pattern drifting over the picture
+             g_projMargin, g_projIntensity, g_projGrain, (float)g_fps,
              g_projGateInset, g_projTimeOffset, g_projCrf,
              (int)(g_projWall[0] * 255) & 255, (int)(g_projWall[1] * 255) & 255,
              (int)(g_projWall[2] * 255) & 255,
@@ -3341,9 +3352,11 @@ static std::wstring ProjectorArgs(int W, int H, bool still) {
              g_fxFlicker, g_fxDust, g_fxHair, g_fxScratch, g_fxVignette);
     std::wstring s = buf;
     if (!g_projGate) s += L" --no-gate";
-    if (PlateAspect() > 0.01f) {
+    // The panel's own aspect, not whatever the playhead happens to sit on: over time the
+    // aspect track reaches the render as aspect.schedule.
+    if (g_projPlateAr > 0.01f) {
         wchar_t ar[48];
-        swprintf(ar, 48, L" --plate-ar %.5f", PlateAspect());
+        swprintf(ar, 48, L" --plate-ar %.5f", g_projPlateAr);
         s += ar;
     }
     if (still) s += L" --audio none";
@@ -3361,10 +3374,24 @@ static bool WriteWholeFile(const std::wstring& path, const std::string& data);
 static void LookAtTime(double t, int* look, int* pillar) {
     *look = LOOK_PROJECTOR;
     *pillar = 0;
-    if (g_baseOff) return;
     double start = 0;
-    int i = ClipAt(t, &start);
-    if (i < 0 || i >= (int)g_clips.size()) return;
+    int i = g_baseOff ? -1 : ClipAt(t, &start);
+    // Nothing on screen - a gap, a hidden base track, a blank card - with no layer over
+    // it: no film either. A projector with nothing in the gate shows no plate, no gate
+    // and no grain, so the frame stays the plain black it already is.
+    bool baseShows = i >= 0 && i < (int)g_clips.size() &&
+                     !(g_clips[i]->kind == Clip::Text && g_clips[i]->text.empty());
+    if (!baseShows) {
+        bool layerShows = false;
+        for (auto& tr : g_over) {
+            if (!tr->visible) continue;
+            for (auto& lc : tr->clips)
+                if (!lc->skip && t >= lc->start && t < lc->start + lc->duration) layerShows = true;
+        }
+        if (!layerShows) *look = LOOK_NONE;
+        return;
+    }
+    if (g_baseOff) return;
     Clip& c = *g_clips[i];
     if (c.look != LOOK_PROJECTOR) {
         *look = c.look;
@@ -3422,6 +3449,7 @@ struct ExportJob {
     int          stage = 1;               // 1 = ffmpeg encode, 2 = projector shader pass
     bool         wantProjector = false;   // run stage 2 when the encode succeeds
     bool         lookSchedule = false;    // some of the cut plays on its own screen
+    bool         aspectSchedule = false;  // the aspect track shapes the plate over time
     std::wstring stageTmp;                // stage-2 output, moved over outPath at the end
     bool         toClipboard = false;     // hand the finished file to the OS clipboard
     std::wstring stageExt;                // container the encode was actually built for
@@ -3430,6 +3458,14 @@ struct ExportJob {
     std::string  shaderStep;              // last "Clip shader n/N: name" the helper printed
     std::string  encNote;                 // why the encoder differs from the one picked, if it does
     std::wstring stage1;                  // lossless stage-1 intermediate the projector pass reads
+    // Stall watch: the final encode has been seen to sit for hours without a frame.
+    ULONGLONG    finalAt = 0;             // when the final ffmpeg started (0 = not yet)
+    ULONGLONG    progAt = 0;              // when out_time last moved
+    double       lastUs = -1;
+    ULONGLONG    watchAt = 0;             // last sample of the ffmpeg process
+    ULONGLONG    cpuPrev = 0;             // its CPU time then, 100 ns
+    DWORD        pidPrev = 0;
+    std::string  stallNote;               // shown next to the stage while it lasts
 } g_export;
 
 // Temp films rendered for the Windows clipboard. They are ours to clean up, so the
@@ -3966,8 +4002,56 @@ static void StartExport(const std::wstring& outPath) {
     DeleteFileW(g_export.progressFile.c_str());
 
     // -nostdin: the child has no console, so ffmpeg must not try to read the keyboard.
-    std::wstring cmd = L"ffmpeg -y -hide_banner -nostdin -loglevel error -nostats -progress \"" +
+    // Warnings too: when an encode stalls, what ffmpeg last complained about is the lead.
+    std::wstring cmd = L"ffmpeg -y -hide_banner -nostdin -loglevel level+warning -nostats -progress \"" +
                        g_export.progressFile + L"\"";
+    // The final encode does not take the files as -i inputs. ffmpeg 8 given a long cut's
+    // ~180 inputs into one filter graph spins one core forever without a single frame
+    // (bigger queues, fewer threads: no difference). Each input is also described as a
+    // source filter - movie/amovie/color/anullsrc - that the graph reads on demand, and
+    // the final command is rebuilt from those. The -i form below still feeds the
+    // per-shot screen passes, which only ever pull one shot. A looped layer video stays
+    // an -i input: movie's own loop never ends under a trim.
+    const size_t inputsAt = cmd.size();
+    struct GraphIn { std::wstring kept, v, a; };   // kept = the -i form, when it stays one
+    std::vector<GraphIn> gIn;
+    auto quoteP = [](const std::wstring& p) {      // a path as a quoted filter option value
+        std::wstring q = L"'";
+        for (wchar_t ch : p) {
+            if (ch == L'\\') q += L'/';
+            else if (ch == L':') q += L"\\:";
+            else if (ch == L'\'') q += L"'\\\\\\''";
+            else q += ch;
+        }
+        return q + L"'";
+    };
+    // movie hands out the file's own timestamps, and -ss counts from the container's
+    // start time: the trim starts there, or a file that does not begin at 0 is cut
+    // early by exactly that much.
+    // A cut that runs to the end of its file: -i tells the graph the stream ends one
+    // frame after the last one, movie ends it on the last frame itself, and fps then
+    // drops that frame. One cloned frame puts the end back where -i has it; fps never
+    // outputs the clone. A cut that stops mid-file already ends on the next real frame,
+    // and a clone there would add one.
+    auto fileIn = [&](const std::wstring& path, double ss, double dur, double st, bool toEnd) {
+        wchar_t b[256];
+        GraphIn g;
+        swprintf(b, 256, L":seek_point=%.4f,trim=start=%.6f:duration=%.4f,setpts=PTS-STARTPTS%ls",
+                 ss, ss + st, dur, toEnd ? L",tpad=stop_mode=clone:stop=1" : L"");
+        g.v = L"movie=" + quoteP(path) + b;
+        swprintf(b, 160, L":seek_point=%.4f,atrim=start=%.6f:duration=%.4f,asetpts=PTS-STARTPTS",
+                 ss, ss + st, dur);
+        g.a = L"amovie=" + quoteP(path) + b;
+        gIn.push_back(g);
+    };
+    auto stillIn = [&](const std::wstring& path, double dur) {
+        wchar_t b[128];
+        // an image opens at 1/25: without settb the held frames land on a 25 fps clock
+        swprintf(b, 128, L",loop=loop=-1:size=1,settb=1/%d,setpts=N,trim=duration=%.4f", FPS, dur);
+        GraphIn g;
+        g.v = L"movie=" + quoteP(path) + b;
+        gIn.push_back(g);
+    };
     // Inputs are no longer 1:1 with clips — double exposures, overlay tracks and
     // every audio block add their own — so record the index each one landed on.
     std::map<int, int> vIn, dIn;           // clip uid -> ffmpeg input index
@@ -3978,14 +4062,26 @@ static void StartExport(const std::wstring& outPath) {
             swprintf(seg, 128, L" -f lavfi -t %.4f -i color=c=black:s=%dx%d:r=%d",
                      c.duration, W, H, FPS);
             cmd += seg;
+            // frame-exact: -t on a lavfi input rounds to the nearest frame, color's own
+            // d= rounds up, and one extra frame on a card shifts every later shot
+            swprintf(seg, 128, L"color=c=black:s=%dx%d:r=%d,trim=end_frame=%lld", W, H, FPS,
+                     llround(c.duration * FPS));
+            gIn.push_back({ L"", seg, L"" });
         } else if (c.kind == Clip::Video) {
             swprintf(seg, 128, L" -ss %.4f -t %.4f -i ", c.trimIn, c.duration);
             cmd += seg;
             cmd += L"\"" + c.path + L"\"";
+            {   // does the cut run to the file's end (within half a source frame)?
+                double srcFps = c.vid && c.vid->fps > 0 ? c.vid->fps : FPS;
+                bool toEnd = c.vid && c.vid->duration > 0 &&
+                             c.trimIn + c.duration >= c.vid->duration - 0.5 / srcFps;
+                fileIn(c.path, c.trimIn, c.duration, c.vid ? c.vid->startTime : 0.0, toEnd);
+            }
         } else {
             swprintf(seg, 128, L" -loop 1 -framerate %d -t %.4f -i ", FPS, c.duration);
             cmd += seg;
             cmd += L"\"" + c.path + L"\"";
+            stillIn(c.path, c.duration);
         }
         vIn[c.uid] = nIn++;
         if (c.dxOn && !c.dxPath.empty()) {
@@ -3997,6 +4093,8 @@ static void StartExport(const std::wstring& outPath) {
                 swprintf(seg, 128, L" -loop 1 -framerate %d -t %.4f -i ", FPS, c.duration);
             cmd += seg;
             cmd += L"\"" + c.dxPath + L"\"";
+            if (c.dxIsVideo) gIn.push_back({ std::wstring(seg) + L"\"" + c.dxPath + L"\"", L"", L"" });
+            else stillIn(c.dxPath, c.duration);
             dIn[c.uid] = nIn++;
         }
     };
@@ -4012,6 +4110,9 @@ static void StartExport(const std::wstring& outPath) {
             swprintf(seg, 160, L" -f lavfi -t %.4f -i color=c=black:s=%dx%d:r=%d",
                      NestLen(*n), W, H, FPS);
             cmd += seg;
+            swprintf(seg, 160, L"color=c=black:s=%dx%d:r=%d,trim=end_frame=%lld", W, H, FPS,
+                     llround(NestLen(*n) * FPS));   // frame-exact, as for a card
+            gIn.push_back({ L"", seg, L"" });
             nestIn[n->uid] = nIn++;
         }
     }
@@ -4031,9 +4132,15 @@ static void StartExport(const std::wstring& outPath) {
                 wchar_t gi[128];
                 swprintf(gi, 128, L" -f lavfi -t %.4f -i anullsrc=r=48000:cl=stereo", len);
                 cmd += gi;
+                swprintf(gi, 128, L"anullsrc=r=48000:cl=stereo,atrim=duration=%.4f", len);
+                gIn.push_back({ L"", L"", gi });
             } else {
                 if (b->path.empty()) continue;
                 cmd += L" -i \"" + b->path + L"\"";
+                // -i starts a file at 0; amovie keeps its start time (0.025 s on an
+                // mp3), which would put the whole block late. A sound-only file's
+                // first timestamp is that start time, so this is the same shift.
+                gIn.push_back({ L"", L"", L"amovie=" + quoteP(b->path) + L",asetpts=PTS-STARTPTS" });
             }
             aIns.push_back({ b.get(), nIn++, tr->volume, tr->fx, tr->fxMix, ti });
         }
@@ -4057,6 +4164,14 @@ static void StartExport(const std::wstring& outPath) {
 
     std::wstring fc;
     int scratch = 0;                       // unique suffix for intermediate labels
+    // Film time the picture being built starts at, for the plate it fits into: the
+    // aspect track can give each shot a different plate, and the preview fits every
+    // shot inside the plate showing while it plays.
+    double plateAt = 0;
+    auto PlateAtNow = [&]() -> float {
+        int i = AspectAt(plateAt + 0.5 / FPS);     // the point in force on its first frame
+        return i >= 0 ? g_aspects[i]->aspect : g_projPlateAr;
+    };
     // Scale one input onto the canvas the way its own lfit asks, and name the result.
     // Everything lands on an rgba bed: where the clip does not reach and asks for no
     // bed of its own, the alpha is the mask, so a layer shows the cut underneath and a
@@ -4070,7 +4185,7 @@ static void StartExport(const std::wstring& outPath) {
         // and the rest of the canvas stays clear.
         float rx = 1.0f, ry = 1.0f;
         int cw = W, ch = H;
-        if (throughPlate && g_projOn && PlateCropRegion((float)W / (float)H, &rx, &ry)) {
+        if (throughPlate && g_projOn && PlateCropRegion((float)W / (float)H, &rx, &ry, PlateAtNow())) {
             cw = (int)lround(W * rx); cw += cw & 1;
             ch = (int)lround(H * ry); ch += ch & 1;
             if (cw > W) cw = W;
@@ -4141,15 +4256,28 @@ static void StartExport(const std::wstring& outPath) {
         swprintf(seg, 768, L"[%ls]format=rgba,split=2[%lsta%d][%lstb%d];[%lsta%d]alphaextract[%lsm%d];",
                  top.c_str(), tag, uid, tag, uid, tag, uid, tag, uid);
         fc += seg;
+        // Both sides pinned to planar RGB before the blend. blend does its maths on
+        // whatever format the two inputs agree on, and with the top in rgba and the
+        // cut in something else that can be YUV: difference, addition and the other
+        // modes then run on the chroma planes and turn the picture green or purple.
         swprintf(seg, 768,
-                 L"[%lstb%d][%lsba%d]blend=all_mode=%ls:all_opacity=%.4f:"
+                 L"[%lstb%d]format=gbrp[%lstg%d];[%lsba%d]format=gbrp[%lsbg%d];"
+                 L"[%lstg%d][%lsbg%d]blend=all_mode=%ls:all_opacity=%.4f:"
                  L"repeatlast=1:shortest=0,format=gbrp[%lsx%d];",
+                 tag, uid, tag, uid, tag, uid, tag, uid,
                  tag, uid, tag, uid, mode, opacity, tag, uid);
         fc += seg;
         swprintf(seg, 768, L"[%lsx%d][%lsm%d]alphamerge[%lsy%d];",
                  tag, uid, tag, uid, tag, uid);
         fc += seg;
-        swprintf(seg, 768, L"[%lsbb%d][%lsy%d]overlay=eof_action=pass", tag, uid, tag, uid);
+        // Both sides of the overlay pinned to full range. overlay converts them to YUV,
+        // and which range that conversion picks is left to format negotiation: with
+        // -i inputs something upstream narrowed it to full, with in-graph sources
+        // nothing does and it lands on unspecified - a visibly different picture.
+        swprintf(seg, 768,
+                 L"[%lsbb%d]format=color_ranges=pc[%lspb%d];[%lsy%d]format=color_ranges=pc[%lspy%d];"
+                 L"[%lspb%d][%lspy%d]overlay=eof_action=pass",
+                 tag, uid, tag, uid, tag, uid, tag, uid, tag, uid, tag, uid);
         fc += seg;
         fc += enable;
         // A sequence canvas is itself a layer further up, and its alpha is the mask
@@ -4365,6 +4493,7 @@ static void StartExport(const std::wstring& outPath) {
     std::function<std::wstring(Clip&, bool, std::vector<Words>*)> NestPicture;
     NestPicture = [&](Clip& n, bool rev, std::vector<Words>* claimed) -> std::wstring {
         const double len = NestLen(n);
+        const double seqAt = plateAt;      // this sequence's start on the film's clock
         const bool screen = !claimed && n.look != LOOK_PROJECTOR;
         const size_t chainStart = fc.size();
         std::vector<Words> own;
@@ -4392,7 +4521,9 @@ static void StartExport(const std::wstring& outPath) {
                         (*held)[k].e = std::min(e, (*held)[k].e + it.start);
                     }
             } else {
+                plateAt = seqAt + s;
                 ClipChain(*it.clip, true, it.rev, held ? LOOK_PROJECTOR : it.clip->look, !held);
+                plateAt = seqAt;
                 if (held) held->push_back({ it.clip, s, e });
                 swprintf(seg, 256, L"v%d", it.clip->uid);
                 layer = seg;
@@ -4420,8 +4551,12 @@ static void StartExport(const std::wstring& outPath) {
         return pic;
     };
 
-    for (auto& c : g_clips) {
+    std::vector<BaseSpan> baseLay;
+    BaseLayout(baseLay);
+    for (size_t bi = 0; bi < g_clips.size(); bi++) {
+        auto& c = g_clips[bi];
         if (c->skip) continue;
+        plateAt = baseLay[bi].start;
         if (c->kind != Clip::Nest) { ClipChain(*c, false, c->reversed, c->look); continue; }
         // A sequence left whole for its screen, into its slot of the cut.
         std::wstring pic = NestPicture(*c, c->reversed, nullptr);
@@ -4429,7 +4564,11 @@ static void StartExport(const std::wstring& outPath) {
         swprintf(seg, 160, L"[%ls]setsar=1[v%d];", pic.c_str(), c->uid);
         fc += seg;
     }
-    for (Clip* c : layers)  if (c->kind != Clip::Nest) ClipChain(*c, true, c->reversed, c->look);
+    for (Clip* c : layers)
+        if (c->kind != Clip::Nest) {
+            plateAt = c->start < 0 ? 0 : c->start;
+            ClipChain(*c, true, c->reversed, c->look);
+        }
 
     if (clipAudio) {                       // one audio block per clip, exact length
         // A sequence's block is the blocks of its own cut end to end - the sound that
@@ -4479,11 +4618,22 @@ static void StartExport(const std::wstring& outPath) {
     // already cut to its shot's exact length, so the two stay in step on their own.
     size_t nCat = 0;
     std::wstring vCat, aCat;
-    for (auto& cp : g_clips) {             // concat only walks the base track
+    for (size_t bi = 0; bi < g_clips.size(); bi++) {   // concat only walks the base track
+        auto& cp = g_clips[bi];
         if (cp->skip) continue;            // muted shots are not in the film at all
         nCat++;
-        wchar_t seg[32];
-        swprintf(seg, 32, L"[v%d]", cp->uid);
+        // Each shot gets exactly the frames its span covers on the film's frame grid.
+        // A length that is not a whole number of frames, rounded per shot, adds up
+        // over the cut: later cuts landed frames late against the layers above and
+        // the look schedule (a shot losing its screen before its cut).
+        long long f0 = llround(baseLay[bi].start * g_fps), f1 = llround((baseLay[bi].end - baseLay[bi].fade) * g_fps);
+        long long nf = f1 - f0 > 1 ? f1 - f0 : 1;
+        wchar_t seg[200];
+        swprintf(seg, 200, L"[v%d]setpts=N/(%.6f*TB),tpad=stop_mode=clone:stop=%lld,"
+                           L"trim=end_frame=%lld[vq%d];",
+                 cp->uid, (double)g_fps, nf, nf, cp->uid);
+        fc += seg;
+        swprintf(seg, 200, L"[vq%d]", cp->uid);
         vCat += seg;
         swprintf(seg, 32, L"[a%d]", cp->uid);
         aCat += seg;
@@ -4512,6 +4662,7 @@ static void StartExport(const std::wstring& outPath) {
         if (e > total) e = total;
         std::wstring pic;
         if (c->kind == Clip::Nest) {
+            plateAt = s;                   // its shots fit the plate from its own start
             pic = NestPicture(*c, c->reversed, nullptr);
         } else {
             wchar_t v[32];
@@ -4546,6 +4697,12 @@ static void StartExport(const std::wstring& outPath) {
             swprintf(fo, 96, L",fade=t=out:st=%.3f:d=%.3f", st, g_fadeOut);
             fc += fo;
         }
+        // Hard stop at the last shot of the base track, in the graph itself: looped
+        // layers and padded audio are endless, and the output -t alone has let a
+        // whole-film render run on forever.
+        wchar_t vtrim[64];
+        swprintf(vtrim, 64, L",trim=duration=%.4f", total);
+        fc += vtrim;
         fc += L"[v]";
     }
 
@@ -4598,11 +4755,23 @@ static void StartExport(const std::wstring& outPath) {
                              ai.in, ai.in, ai.in, 1.0f - s.fxMix, s.fxMix, ai.in);
                     fc += bl;
                 }
+                {
+                    // Every block's stream is padded with silence out to the whole film
+                    // (the mix needs every stream that long). A texture, or a chain with
+                    // hiss in it (am radio), would make noise on that padding from the
+                    // first frame to the last. Keep it to its own block.
+                    double a0 = s.offset > 0 ? s.offset : 0.0;
+                    double a1 = s.offset + (s.trimEnd - s.trimStart);
+                    wchar_t gate[160];
+                    swprintf(gate, 160, L";[p%d]volume=0:enable='not(between(t,%.4f,%.4f))'[pg%d]",
+                             ai.in, a0, a1, ai.in);
+                    fc += gate;
+                }
             }
             // Chain regions over this block's track: inside a region's span the stream
             // is its chain's output, outside it the stream passes dry - the same switch
             // the mixer makes. The stream's t is timeline time (it was delayed into place).
-            std::wstring cur = L"p" + std::to_wstring(ai.in);
+            std::wstring cur = L"pg" + std::to_wstring(ai.in);
             // The block's level and fades, after its own chain. The stream's t is
             // timeline time.
             {
@@ -4688,12 +4857,19 @@ static void StartExport(const std::wstring& outPath) {
                          ai.in, ai.in, ai.in, 1.0f - ai.fxMix, ai.fxMix, ai.in);
                 fc += fxl;
             }
+            {   // the track's chain can hiss too: same gate, with room for an echo tail
+                double a0 = s.offset > 0 ? s.offset : 0.0;
+                double a1 = s.offset + (s.trimEnd - s.trimStart) + 0.25;
+                swprintf(fxl, 256, L";[m%d]volume=0:enable='not(between(t,%.4f,%.4f))'[mg%d]",
+                         ai.in, a0, a1, ai.in);
+                fc += fxl;
+            }
         }
         fc += L";";
         if (clipAudio) fc += L"[ac]";
         for (auto& ai : aIns) {
             wchar_t lab[32];
-            swprintf(lab, 32, L"[m%d]", ai.in);
+            swprintf(lab, 32, L"[mg%d]", ai.in);
             fc += lab;
         }
         int nMix = (int)aIns.size() + (clipAudio ? 1 : 0);
@@ -4723,13 +4899,62 @@ static void StartExport(const std::wstring& outPath) {
             swprintf(fo, 96, L"%lsafade=t=out:st=%.3f:d=%.3f", any ? L"," : L"", st, g_fadeOut);
             fc += fo; any = true;
         }
-        if (!any) fc += L"anull";
+        wchar_t atr[64];                   // same hard stop as the picture
+        swprintf(atr, 64, L"%lsatrim=duration=%.4f", any ? L"," : L"", total);
+        fc += atr;
         fc += L"[a]";
     }
 
     wchar_t tbuf[64];
     swprintf(tbuf, 64, L"%.4f", total);
-    cmd += L" -filter_complex \"" + fc + L"\" -map \"[v]\"";
+    {   // The final command: -i only for inputs that stay one, everything else a source
+        // filter at the head of the graph, and the graph in a file (cwd is the work dir)
+        // - with every source spelled out it is far past the 32k command line.
+        std::vector<int> remap(gIn.size(), -1);
+        std::wstring keptIn;
+        int nKept = 0;
+        for (size_t i = 0; i < gIn.size(); i++)
+            if (!gIn[i].kept.empty()) { keptIn += gIn[i].kept; remap[i] = nKept++; }
+        std::wstring heads, body;
+        body.reserve(fc.size());
+        for (size_t p = 0; p < fc.size(); ) {
+            // an input pad reference: [<index>:v] or [<index>:a]
+            size_t q = p + 1;
+            while (fc[p] == L'[' && q < fc.size() && iswdigit(fc[q])) q++;
+            if (fc[p] == L'[' && q > p + 1 && q + 2 < fc.size() && fc[q] == L':' &&
+                (fc[q + 1] == L'v' || fc[q + 1] == L'a') && fc[q + 2] == L']') {
+                int idx = _wtoi(fc.c_str() + p + 1);
+                wchar_t kind = fc[q + 1];
+                if (idx >= 0 && idx < (int)gIn.size()) {
+                    // concatenated, not %lc: MinGW's swprintf misreads wide conversions
+                    std::wstring lab;
+                    if (remap[idx] >= 0) {
+                        lab = L"[" + std::to_wstring(remap[idx]) + L":" + kind + L"]";
+                    } else {
+                        lab = L"[in" + std::to_wstring(idx) + kind + L"]";
+                        const std::wstring& src = kind == L'v' ? gIn[idx].v : gIn[idx].a;
+                        heads += src + lab + L";";
+                    }
+                    body += lab;
+                    p = q + 3;
+                    continue;
+                }
+            }
+            body += fc[p++];
+        }
+        // final.inputs is the same run with every input an -i, the form the final encode
+        // used before it hung on long cuts: kept beside the graph so any export can be
+        // replayed that way and the two compared frame for frame.
+        WriteWholeFile(g_workDir + L"final.inputs", Narrow(lookInputs));
+        if (!WriteWholeFile(g_workDir + L"final.graph", Narrow(heads + body))) {
+            g_export.failed = true;
+            g_export.message = "Could not write the export's filter graph.";
+            return;
+        }
+        cmd.resize(inputsAt);
+        cmd += keptIn;
+    }
+    cmd += L" -filter_complex_script final.graph -map \"[v]\"";
     // Platforms re-encode everything on upload. The master they transcode from should
     // be native resolution, native frame rate, high bitrate and fixed-GOP: that is what
     // keeps their encoder from spending its budget on our compression artifacts.
@@ -4818,6 +5043,7 @@ static void StartExport(const std::wstring& outPath) {
     // Shots that play on a screen of their own are rendered one at a time first, so
     // a helper drives the whole run: the per-shot passes, then this command. Without
     // any, ffmpeg is launched directly exactly as before.
+    WriteWholeFile(g_workDir + L"final.cmd", Narrow(cmd));   // the encode itself, beside final.inputs
     std::wstring launch = cmd;
     if (!lookJobs.empty()) {
         std::wstring helper = ClipShaderScriptPath();
@@ -4881,6 +5107,12 @@ static void StartExport(const std::wstring& outPath) {
     g_export.clipShaders = !lookJobs.empty();
     g_export.encoding = false;
     g_export.shaderStep.clear();
+    g_export.finalAt = lookJobs.empty() ? GetTickCount64() : 0;   // the helper announces its own
+    g_export.progAt = g_export.watchAt = g_export.cpuPrev = 0;
+    g_export.pidPrev = 0;
+    g_export.lastUs = -1;
+    g_export.stallNote.clear();
+    DeleteFileW((g_export.logFile + L".watch.txt").c_str());
     // The screens are already baked in by the per-shot passes above, so stage 2 is
     // only ever the film look. The schedule tells it which frames to leave alone:
     // a shot that played on a tube must not then be projected onto a wall.
@@ -4889,6 +5121,28 @@ static void StartExport(const std::wstring& outPath) {
     g_export.wantProjector = g_projOn;
     g_export.lookSchedule = anyLook && g_projOn;
     if (g_export.lookSchedule) WriteWholeFile(g_workDir + L"looks.schedule", schedule);
+    {   // The plate aspect over the film, frame by frame, as runs: the aspect track where
+        // it has a point in force, the panel's value before the first one.
+        std::string runs;
+        const int n = (int)(TotalDuration() * FPS + 0.5);
+        int runStart = 0;
+        float runAr = 0;
+        for (int f = 0; f <= n; f++) {
+            float ar = 0;
+            if (f < n) {
+                int i = AspectAt((f + 0.5) / FPS);
+                ar = i >= 0 ? g_aspects[i]->aspect : g_projPlateAr;
+            }
+            if (f == 0) { runAr = ar; continue; }
+            if (f < n && fabsf(ar - runAr) < 1e-5f) continue;
+            char line[64];
+            snprintf(line, sizeof(line), "%d %d %.5f\n", runStart, f - runStart, runAr);
+            runs += line;
+            runAr = ar; runStart = f;
+        }
+        g_export.aspectSchedule = !g_aspects.empty() &&
+                                  WriteWholeFile(g_workDir + L"aspect.schedule", runs);
+    }
     g_export.message = "Encoding…";
 }
 
@@ -4915,6 +5169,8 @@ static bool StartProjectorPass() {
     if (g_export.lookSchedule)
         cmd += L" --look-schedule \"" + g_workDir + L"looks.schedule\"";
     cmd += L" --venc-file \"" + g_workDir + L"projector.venc\"";   // same encoder as stage 1
+    if (g_export.aspectSchedule)
+        cmd += L" --aspect-schedule \"" + g_workDir + L"aspect.schedule\"";
     g_export.cmd = Narrow(cmd);
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
@@ -4949,6 +5205,84 @@ static bool StartProjectorPass() {
     return true;
 }
 
+// The ffmpeg.exe doing the export's encode: the export process itself, or the one the
+// clip-shader helper spawned under it.
+static DWORD ExportFfmpegPid(DWORD& threads) {
+    DWORD root = GetProcessId(g_export.process), found = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    std::map<DWORD, DWORD> parent;
+    std::vector<std::pair<DWORD, DWORD>> ff;                 // pid, threads
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+        parent[pe.th32ProcessID] = pe.th32ParentProcessID;
+        if (!_wcsicmp(pe.szExeFile, L"ffmpeg.exe")) ff.push_back({ pe.th32ProcessID, pe.cntThreads });
+    }
+    CloseHandle(snap);
+    for (auto& e : ff) {
+        DWORD p = e.first;
+        for (int d = 0; d < 4 && p; d++) {
+            if (p == root) { found = e.first; threads = e.second; break; }
+            auto it = parent.find(p);
+            p = it == parent.end() ? 0 : it->second;
+        }
+    }
+    return found;
+}
+
+// A final encode that has not moved for a minute gets sampled every 30 s: an idle
+// ffmpeg (next to no CPU) is deadlocked, a busy one is only slow. Each sample goes to
+// <log>.watch.txt and the latest shows next to the stage in the export panel.
+static void WatchExportStall(ULONGLONG nowMs) {
+    if (g_export.stage != 1 || !g_export.finalAt) return;
+    ULONGLONG since = g_export.progAt > g_export.finalAt ? g_export.progAt : g_export.finalAt;
+    ULONGLONG quiet = nowMs - since;
+    if (quiet < 60000) {
+        if (!g_export.stallNote.empty()) {
+            if (FILE* w = _wfopen((g_export.logFile + L".watch.txt").c_str(), L"a")) {
+                fprintf(w, "progress resumed\n");
+                fclose(w);
+            }
+            g_export.stallNote.clear();
+        }
+        return;
+    }
+    if (g_export.watchAt && nowMs - g_export.watchAt < 30000) return;
+    DWORD threads = 0;
+    DWORD pid = ExportFfmpegPid(threads);
+    ULONGLONG cpu = 0, mb = 0;
+    if (HANDLE h = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr) {
+        FILETIME c, e, k, u;
+        if (GetProcessTimes(h, &c, &e, &k, &u))
+            cpu = (((ULONGLONG)k.dwHighDateTime << 32) | k.dwLowDateTime) +
+                  (((ULONGLONG)u.dwHighDateTime << 32) | u.dwLowDateTime);
+        PROCESS_MEMORY_COUNTERS pmc = { sizeof(pmc) };
+        if (K32GetProcessMemoryInfo(h, &pmc, sizeof(pmc))) mb = pmc.WorkingSetSize >> 20;
+        CloseHandle(h);
+    }
+    char note[256];
+    if (!pid) {
+        snprintf(note, sizeof(note), "no encode progress for %llum%02llus, ffmpeg not found",
+                 quiet / 60000, quiet / 1000 % 60);
+    } else {
+        bool fresh = g_export.pidPrev == pid && g_export.watchAt;
+        double busy = fresh ? (cpu - g_export.cpuPrev) / 1e7 / ((nowMs - g_export.watchAt) / 1000.0) : -1;
+        snprintf(note, sizeof(note),
+                 "no encode progress for %llum%02llus - ffmpeg %lu: %lu threads, %llu MB, %s",
+                 quiet / 60000, quiet / 1000 % 60, (unsigned long)pid, (unsigned long)threads, mb,
+                 busy < 0 ? "sampling CPU" :
+                 busy < 0.05 ? "idle, likely deadlocked - cancel and see the log" : "busy, still working");
+    }
+    g_export.stallNote = note;
+    g_export.watchAt = nowMs;
+    g_export.cpuPrev = cpu;
+    g_export.pidPrev = pid;
+    if (FILE* w = _wfopen((g_export.logFile + L".watch.txt").c_str(), L"a")) {
+        fprintf(w, "%s\n", note);
+        fclose(w);
+    }
+}
+
 static void PumpExport() {
     if (!g_export.active) return;
     // Progress: last out_time_us= line in the progress file. Reopening and reading
@@ -4972,6 +5306,8 @@ static void PumpExport() {
                 std::string buf(want, 0);
                 DWORD rd = 0;
                 ReadFile(lf, buf.data(), want, &rd, nullptr);
+                if (!g_export.finalAt && buf.rfind("Final encode") != std::string::npos)
+                    g_export.finalAt = nowMs;
                 size_t p = buf.rfind("Clip shader ");
                 if (p != std::string::npos) {
                     size_t e = buf.find_first_of("\r\n", p);
@@ -4995,6 +5331,7 @@ static void PumpExport() {
             size_t p = buf.rfind("out_time_us=");
             if (p != std::string::npos) {
                 double us = atof(buf.c_str() + p + 12);
+                if (us > g_export.lastUs) { g_export.lastUs = us; g_export.progAt = nowMs; }
                 g_export.encoding = true;
                 if (g_export.totalDur > 0)
                     g_export.progress = (float)fmin(us / 1e6 / g_export.totalDur, 1.0);
@@ -5003,7 +5340,15 @@ static void PumpExport() {
         CloseHandle(f);
         lastProgRead = nowMs;
     }
+    WatchExportStall(nowMs);
     if (WaitForSingleObject(g_export.process, 0) == WAIT_OBJECT_0) {
+        if (!g_export.stallNote.empty()) {
+            if (FILE* w = _wfopen((g_export.logFile + L".watch.txt").c_str(), L"a")) {
+                fprintf(w, "export process ended while stalled\n");
+                fclose(w);
+            }
+            g_export.stallNote.clear();
+        }
         DWORD code = 1;
         GetExitCodeProcess(g_export.process, &code);
         CloseHandle(g_export.process);
@@ -7846,10 +8191,18 @@ float hash2(float2 p) {
     p += dot(p, p + 45.32);
     return frac(p.x * p.y);
 }
-float hash13(float3 p3) {
-    p3 = frac(p3 * 0.1031);
-    p3 += dot(p3, p3.zyx + 31.32);
-    return frac((p3.x + p3.y) * p3.z);
+// PCG3D integer hash, bit-identical to projector_render.py. The float hash this
+// replaced ran out of precision on pixel coordinates and left a faint grid, which
+// shows on dark footage.
+uint3 pcg3d(uint3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    return v;
+}
+float hash13(float3 p) {
+    return float(pcg3d(uint3(int3(p))).x) / 4294967295.0;
 }
 float4 sampleSrc(float2 uv) {
     return tex0.Sample(samp, clamp(uv, 0.0, 1.0) * srcScale + srcOffset);
@@ -8003,7 +8356,9 @@ float4 PSProjector(VSOut input) : SV_Target {
     // ---- full-frame grain
     if (grain > 0.0) {
         float2 gpx = floor(tc * outSize);
-        float stepT = floor(time * grainFps);
+        // rounded: time is frame / fps, and floor of that times fps lands one short
+        // on some frames, which then repeat the previous frame's grain
+        float stepT = floor(time * grainFps + 0.5);
         float g = hash13(float3(gpx, stepT)) - 0.5;
         float ga = abs(g) * grain;
         float3 gc = (g > 0.0) ? float3(1, 1, 1) : float3(0, 0, 0);
@@ -8466,7 +8821,7 @@ static ID3D11ShaderResourceView* RenderProjectorGPU(int outW, int outH, double t
     cb.time = (float)(t + g_projTimeOffset);
     cb.intensity = g_projIntensity < 0 ? 0 : (g_projIntensity > 1 ? 1 : g_projIntensity);
     cb.grain = g_projGrain < 0 ? 0 : g_projGrain;
-    cb.grainFps = g_projGrainFps;
+    cb.grainFps = (float)g_fps;            // one grain per film frame, as the export
     float apW = pw - 2.0f * g_projGateInset, apH = phh - 2.0f * g_projGateInset;
     cb.ap[0] = (apW < 2 ? 2 : apW) * 0.5f;
     cb.ap[1] = (apH < 2 ? 2 : apH) * 0.5f;
@@ -9457,7 +9812,7 @@ static void DrawProjectorPanel() {
     Prop("grain");
     ImGui::SliderFloat("##pgr", &g_projGrain, 0.0f, 0.6f, "%.3f");
     Prop("grain fps");
-    ImGui::SliderFloat("##pgf", &g_projGrainFps, 6.0f, 60.0f, "%.0f");
+    ImGui::TextDisabled("%d - follows the film", g_fps);
     Prop("gate");
     ImGui::Checkbox("ragged", &g_projGate);
     ImGui::SameLine();
@@ -11050,6 +11405,11 @@ static void TrimToRange(double r0, double r1) {
             b.offset = fmax(s, r0) - r0;
             i++;
         }
+
+    // Aspect points onto the range's clock. A point before the range pins to 0 and
+    // keeps its order, so the one in force when the range opens still holds from its
+    // first frame.
+    for (auto& a : g_aspects) a->offset = fmax(0.0, a->offset - r0);
 }
 
 // The delivery name with the range in it, so a test render is never mistaken for the film.
@@ -11716,6 +12076,7 @@ static void DrawApp() {
                         snprintf(pct, sizeof(pct), " (%d%%)", (int)(g_export.progress * 100));
                     what = std::string("Encoding with ffmpeg") + pct;
                 }
+                if (!g_export.stallNote.empty()) what += "  - " + g_export.stallNote;
                 ImGui::TextDisabled("Stage %d/%d: %s%s%s%s", at, total, what.c_str(),
                                     g_export.toClipboard ? "  - for the clipboard" : "",
                                     g_export.encNote.empty() ? "" : "  - ",
@@ -12238,12 +12599,100 @@ static void RunUndoTest() {
 
 #include "edit_workspace_tests.h"
 
+// --headless-export <out> [--range <in> <out>]: the autosaved project through the real
+// export with the window hidden, each stage timed into %TEMP%\slidecut_headless.txt.
+// The process exits when the export does: 0 done, 1 failed, 2 never started.
+struct HeadlessRun {
+    int         phase = 0;                 // 0 waiting for the project to settle, 1 exporting
+    ULONGLONG   settle = 0, t0 = 0, beat = 0;
+    std::string step;
+    bool        enc = false, fin = false;
+    std::string stall;
+    int         stage = 1;
+    int         code = 0;
+    FILE*       log = nullptr;
+};
+
+static bool HeadlessTick(HeadlessRun& h, const std::wstring& out, double rin, double rout) {
+    ULONGLONG now = GetTickCount64();
+    auto note = [&](const std::string& what) {
+        if (!h.log) return;
+        fprintf(h.log, "%9.1f s  %s\n", (now - h.t0) / 1000.0, what.c_str());
+        fflush(h.log);
+    };
+    if (h.phase == 0) {
+        if (g_projectLoading.load() || g_songPending.valid()) { h.settle = 0; return false; }
+        if (!h.settle) h.settle = now;
+        if (now - h.settle < 2000) return false;   // let pending media loads land
+        wchar_t tmp[MAX_PATH];
+        GetTempPathW(MAX_PATH, tmp);
+        h.log = _wfopen((std::wstring(tmp) + L"slidecut_headless.txt").c_str(), L"w");
+        h.t0 = h.beat = now;
+        if (rin >= 0 && rout > rin) {
+            g_rangeIn = rin; g_rangeOut = rout;
+            note("range export " + std::to_string(rin) + " - " + std::to_string(rout));
+            ExportRange(out);
+        } else {
+            note("whole film, base track ends at " + std::to_string(TotalDuration()) +
+                 " s, timeline at " + std::to_string(TimelineEnd()) + " s");
+            ExportFlattened(out);
+        }
+        if (!g_export.active) {
+            note("did not start: " + g_export.message);
+            h.code = 2;
+            return true;
+        }
+        note("stage 1 started");
+        h.phase = 1;
+        return false;
+    }
+    if (g_export.shaderStep != h.step) { h.step = g_export.shaderStep; note(h.step); }
+    if (g_export.finalAt && !h.fin) { h.fin = true; note("final ffmpeg started"); }
+    if (g_export.encoding && !h.enc) { h.enc = true; note("final ffmpeg reporting progress"); }
+    if (g_export.stallNote != h.stall) {
+        h.stall = g_export.stallNote;
+        note(h.stall.empty() ? "progress resumed" : "STALL: " + h.stall);
+    }
+    if (g_export.active && g_export.stage != h.stage) {
+        h.stage = g_export.stage;
+        note("stage 2 (projector) started");
+    }
+    if (g_export.active && now - h.beat >= 30000) {
+        h.beat = now;
+        char b[64];
+        snprintf(b, 64, "  progress %.1f%%", g_export.progress * 100.0f);
+        note(b);
+    }
+    if (g_export.active) return false;
+    note((g_export.failed ? "FAILED: " : "done: ") + g_export.message);
+    h.code = g_export.failed ? 1 : 0;
+    fclose(h.log);
+    h.log = nullptr;
+    return true;
+}
+
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     if (wcsstr(GetCommandLineW(), L"--workspace-test")) return RunWorkspaceTests();
     if (wcsstr(GetCommandLineW(), L"--workspace-ui")) return RunWorkspaceUITests(hInst);
     if (wcsstr(GetCommandLineW(), L"--workspace-media")) return RunWorkspaceUITests(hInst, true);
     if (wcsstr(GetCommandLineW(), L"--undotest")) { RunUndoTest(); return 0; }    InstallCrashHandler();          // before anything that can fault
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    std::wstring hlOut;
+    double hlIn = -1, hlEnd = -1;
+    {
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        for (int i = 1; argv && i < argc; i++) {
+            if (!wcscmp(argv[i], L"--headless-export") && i + 1 < argc) hlOut = argv[++i];
+            else if (!wcscmp(argv[i], L"--range") && i + 2 < argc) {
+                hlIn = _wtof(argv[++i]);
+                hlEnd = _wtof(argv[++i]);
+            }
+        }
+        if (argv) LocalFree(argv);
+    }
+    const bool headless = !hlOut.empty();
+    HeadlessRun hl;
     ImGui_ImplWin32_EnableDpiAwareness();
 
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, hInst,
@@ -12265,7 +12714,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
             }
         }
     }
-    ShowWindow(hWnd, SW_SHOWMAXIMIZED);
+    ShowWindow(hWnd, headless ? SW_HIDE : SW_SHOWMAXIMIZED);
     UpdateWindow(hWnd);
 
     IMGUI_CHECKVERSION();
@@ -12318,11 +12767,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         PumpPendingLoads();
         PumpProxyPrefetch();               // frames the prefetch thread finished
         PumpSceneSplit();
-        Autosave();
+        if (!headless) Autosave();         // a headless run must not touch the session
         PumpExport();
         if (g_songPending.valid() &&
             g_songPending.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
             g_songPending.get();
+        if (headless && HeadlessTick(hl, hlOut, hlIn, hlEnd)) break;
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -12339,7 +12789,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         if (++framesDrawn == 3) StartupMarkClear();   // it draws: no longer suspect
     }
 
-    if (!crashLoop) Autosave(true);        // last word before the window goes away
+    if (!crashLoop && !headless) Autosave(true);   // last word before the window goes away
     SweepClipboardTemps();                 // the clipboard's temp films die with us
     StartupMarkClear();
     g_playing.store(false);
@@ -12385,5 +12835,5 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     DestroyWindow(hWnd);
     UnregisterClassW(wc.lpszClassName, hInst);
     CoUninitialize();
-    return 0;
+    return headless ? hl.code : 0;
 }

@@ -32,6 +32,19 @@ def windows_args(command):
         free(ptr)
 
 
+def graph_from_file(args, folder):
+    """Move any inline filter graph into a script file: a long graph overflows the
+    32k Windows command line limit (WinError 206)."""
+    args = list(args)
+    for i, arg in enumerate(args[:-1]):
+        if arg == '-filter_complex':
+            script = Path(folder) / f'graph_{i}_{len(args)}.txt'
+            script.write_text(args[i + 1], encoding='utf-8')
+            args[i:i + 2] = ['-filter_complex_script', str(script)]
+            break
+    return args
+
+
 def main():
     read = lambda name: Path(name).read_text(encoding='utf-8-sig')
     inputs = windows_args(read('looks.inputs'))
@@ -59,9 +72,10 @@ def main():
 
                 # 1. this shot alone, straight out of the export's own graph
                 graph = read(name + '.graph').rstrip(';')
-                subprocess.run(inputs + ['-filter_complex', graph, '-map', f'[v{uid}]',
-                                         '-an', '-t', duration,
-                                         '-c:v', 'ffv1', '-pix_fmt', 'bgra', raw], check=True)
+                subprocess.run(graph_from_file(
+                    inputs + ['-filter_complex', graph, '-map', f'[v{uid}]',
+                              '-an', '-t', duration,
+                              '-c:v', 'ffv1', '-pix_fmt', 'bgra', raw], temporary), check=True)
 
                 # 2. the same shader the preview runs, on that shot by itself
                 subprocess.run([sys.executable, str(renderer), raw, '-o', output]
@@ -71,7 +85,9 @@ def main():
                                + (['--pillarbox'] if pillar == '1' else []), check=True)
 
             # 3. the export itself, with those files standing in for those shots
-            subprocess.run(windows_args(read('looks.final')), check=True)
+            print('Final encode', flush=True)       # SlideCut's stall watch starts here
+            subprocess.run(graph_from_file(windows_args(read('looks.final')), temporary),
+                           check=True)
     finally:
         for output in outputs:
             Path(output).unlink(missing_ok=True)

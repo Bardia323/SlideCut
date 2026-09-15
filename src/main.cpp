@@ -3379,8 +3379,24 @@ static void LookAtTime(double t, int* look, int* pillar) {
     // Nothing on screen - a gap, a hidden base track, a blank card - with no layer over
     // it: no film either. A projector with nothing in the gate shows no plate, no gate
     // and no grain, so the frame stays the plain black it already is.
-    bool baseShows = i >= 0 && i < (int)g_clips.size() &&
-                     !(g_clips[i]->kind == Clip::Text && g_clips[i]->text.empty());
+    auto blank = [](int k) {
+        return k < 0 || k >= (int)g_clips.size() ||
+               (g_clips[k]->kind == Clip::Text && g_clips[k]->text.empty());
+    };
+    bool baseShows = !blank(i);
+    if (!baseShows && !g_baseOff) {
+        // A crossfade out of a blank card: ClipAt names the card, but the next shot is
+        // already fading in over it. Those frames are that shot's, film look and all.
+        std::vector<BaseSpan> lay;
+        BaseLayout(lay);
+        for (int k = 0; k < (int)g_clips.size(); k++) {
+            if (g_clips[k]->skip || blank(k) || t < lay[k].start || t >= lay[k].end) continue;
+            i = k;
+            start = lay[k].start;
+            baseShows = true;
+            break;
+        }
+    }
     if (!baseShows) {
         bool layerShows = false;
         for (auto& tr : g_over) {
@@ -4681,7 +4697,9 @@ static void StartExport(const std::wstring& outPath) {
             vstage = L"fg";
         }
         wchar_t vt[256];
-        swprintf(vt, 256, L"[%ls]fps=%d,format=yuv420p,"
+        // explicit matrix: format= alone converts RGB with BT.601, which setparams then
+        // merely relabels BT.709 - reds came out hotter than the preview
+        swprintf(vt, 256, L"[%ls]fps=%d,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,"
                           L"setparams=color_primaries=bt709:color_trc=bt709:"
                           L"colorspace=bt709:range=tv", vstage.c_str(), FPS);
         fc += vt;

@@ -3371,11 +3371,11 @@ static bool WriteWholeFile(const std::wstring& path, const std::string& data);
 
 // Which screen the cut is playing on at time t. A sequence claims the screen for
 // everything inside it; otherwise the shot resolved out of it speaks for itself.
-static void LookAtTime(double t, int* look, int* pillar) {
+// `i` is the base shot on screen at t and `start` where it sits, already resolved:
+// the export reads them off the frame grid the concat actually built, not off t.
+static void LookForShot(int i, double start, double t, int* look, int* pillar) {
     *look = LOOK_PROJECTOR;
     *pillar = 0;
-    double start = 0;
-    int i = g_baseOff ? -1 : ClipAt(t, &start);
     // Nothing on screen - a gap, a hidden base track, a blank card - with no layer over
     // it: no film either. A projector with nothing in the gate shows no plate, no gate
     // and no grain, so the frame stays the plain black it already is.
@@ -3426,18 +3426,68 @@ static void LookAtTime(double t, int* look, int* pillar) {
     }
 }
 
+static void LookAtTime(double t, int* look, int* pillar) {
+    double start = 0;
+    int i = g_baseOff ? -1 : ClipAt(t, &start);
+    LookForShot(i, start, t, look, pillar);
+}
+
+// The base cut's frames exactly as the export's concat lays them down: each shot
+// gets max(1, its span on the frame grid) frames, one block after another. A shot
+// too short to fill a frame still costs one, so a block's first frame is not
+// llround(start*fps) - it is wherever the blocks before it ended. Sampling the look
+// at (f+0.5)/fps instead let the two grids part company over a cut, and every frame
+// of that gap made the film look start late on the shot after it.
+struct LookBlock { int clip; long long first; long long count; double start; };
+static void BaseFrameBlocks(std::vector<LookBlock>& out) {
+    out.clear();
+    std::vector<BaseSpan> lay;
+    BaseLayout(lay);
+    long long at = 0;
+    for (size_t bi = 0; bi < g_clips.size(); bi++) {
+        if (g_clips[bi]->skip) continue;
+        long long f0 = llround(lay[bi].start * g_fps);
+        long long f1 = llround((lay[bi].end - lay[bi].fade) * g_fps);
+        long long nf = f1 - f0 > 1 ? f1 - f0 : 1;
+        out.push_back({ (int)bi, at, nf, lay[bi].start });
+        at += nf;
+    }
+}
+
 // The same answer for every frame of the cut, run-length encoded as
 // "firstFrame frameCount look pillar", so the offline renderer can switch screens
 // frame by frame in one pass rather than the file being cut into pieces and joined
 // back up. Returns false when the whole cut is the projector and needs no schedule.
 static bool LookSchedule(std::string& out) {
     out.clear();
-    const int n = (int)(TotalDuration() * g_fps + 0.5);
+    std::vector<LookBlock> blocks;
+    BaseFrameBlocks(blocks);
+    long long n = blocks.empty() ? 0 : blocks.back().first + blocks.back().count;
+    {   // Layer clips and sound are parked in absolute time, so the film can run on
+        // past the base cut's last frame.
+        long long e = (long long)(TimelineEnd() * g_fps + 0.5);
+        if (e > n) n = e;
+    }
     bool any = false;
-    int runLook = LOOK_PROJECTOR, runPillar = 0, runStart = 0;
-    for (int f = 0; f <= n; f++) {
+    size_t bi = 0;
+    int runLook = LOOK_PROJECTOR, runPillar = 0;
+    long long runStart = 0;
+    for (long long f = 0; f <= n; f++) {
         int look = LOOK_PROJECTOR, pillar = 0;
-        if (f < n) LookAtTime((f + 0.5) / g_fps, &look, &pillar);
+        if (f < n) {
+            while (bi < blocks.size() && f >= blocks[bi].first + blocks[bi].count) bi++;
+            int ci = -1;
+            double start = 0, t = (double)(f + 0.5) / g_fps;
+            if (!g_baseOff && bi < blocks.size() && f >= blocks[bi].first) {
+                ci = blocks[bi].clip;
+                start = blocks[bi].start;
+                // Where the frame sits inside the shot on the concat's grid; the layer
+                // tracks above still live in absolute time, so t stays the shot's own
+                // place on the film plus that offset.
+                t = start + (double)(f - blocks[bi].first + 0.5) / g_fps;
+            }
+            LookForShot(ci, start, t, &look, &pillar);
+        }
         if (f == 0) { runLook = look; runPillar = pillar; continue; }
         if (f < n && look == runLook && pillar == runPillar) continue;
         out += std::to_string(runStart) + " " + std::to_string(f - runStart) + " "
@@ -4079,9 +4129,15 @@ static void StartExport(const std::wstring& outPath) {
                      c.duration, W, H, FPS);
             cmd += seg;
             // frame-exact: -t on a lavfi input rounds to the nearest frame, color's own
-            // d= rounds up, and one extra frame on a card shifts every later shot
+            // d= rounds up, and one extra frame on a card shifts every later shot.
+            // Never zero: a card shorter than half a frame still stands on the film for
+            // one, the way the concat below counts it (max(1, ...)). end_frame=0 handed
+            // the concat an empty block - tpad has nothing to clone from - and every
+            // later shot arrived a frame early against the look schedule, which is what
+            // made the film look start late on the shot after a gap.
+            long long cardFrames = llround(c.duration * FPS);
             swprintf(seg, 128, L"color=c=black:s=%dx%d:r=%d,trim=end_frame=%lld", W, H, FPS,
-                     llround(c.duration * FPS));
+                     cardFrames > 1 ? cardFrames : 1);
             gIn.push_back({ L"", seg, L"" });
         } else if (c.kind == Clip::Video) {
             swprintf(seg, 128, L" -ss %.4f -t %.4f -i ", c.trimIn, c.duration);
@@ -4126,8 +4182,9 @@ static void StartExport(const std::wstring& outPath) {
             swprintf(seg, 160, L" -f lavfi -t %.4f -i color=c=black:s=%dx%d:r=%d",
                      NestLen(*n), W, H, FPS);
             cmd += seg;
+            long long nestFrames = llround(NestLen(*n) * FPS);   // frame-exact, as for a card
             swprintf(seg, 160, L"color=c=black:s=%dx%d:r=%d,trim=end_frame=%lld", W, H, FPS,
-                     llround(NestLen(*n) * FPS));   // frame-exact, as for a card
+                     nestFrames > 1 ? nestFrames : 1);
             gIn.push_back({ L"", seg, L"" });
             nestIn[n->uid] = nIn++;
         }
@@ -4697,9 +4754,18 @@ static void StartExport(const std::wstring& outPath) {
             vstage = L"fg";
         }
         wchar_t vt[256];
+        // settb+setpts, never fps: the layer tracks reach this point with timestamps a
+        // fraction off the frame grid (tpad pads a layer's head by a whole number of
+        // frames, its start is any moment), and fps= answers that by dropping a frame
+        // here and duplicating one there. Every frame after such a drop then sat one
+        // place earlier than the cut says it does, so the look schedule - which counts
+        // frames - put the film look on the wrong ones, and a shot after a gap came up
+        // unprojected for its first frame. Renumbering keeps every frame, in order, on
+        // the grid the schedule and the concat both count in.
         // explicit matrix: format= alone converts RGB with BT.601, which setparams then
         // merely relabels BT.709 - reds came out hotter than the preview
-        swprintf(vt, 256, L"[%ls]fps=%d,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,"
+        swprintf(vt, 256, L"[%ls]settb=1/%d,setpts=N,"
+                          L"scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,"
                           L"setparams=color_primaries=bt709:color_trc=bt709:"
                           L"colorspace=bt709:range=tv", vstage.c_str(), FPS);
         fc += vt;
@@ -5142,19 +5208,29 @@ static void StartExport(const std::wstring& outPath) {
     {   // The plate aspect over the film, frame by frame, as runs: the aspect track where
         // it has a point in force, the panel's value before the first one.
         std::string runs;
-        const int n = (int)(TotalDuration() * FPS + 0.5);
-        int runStart = 0;
+        // On the concat's frame grid, like the look schedule: an aspect point belongs
+        // to the moment of the film the shot under it is playing, and frame f is only
+        // at f/FPS while no shot has been rounded up to a frame of its own.
+        std::vector<LookBlock> blocks;
+        BaseFrameBlocks(blocks);
+        long long n = blocks.empty() ? 0 : blocks.back().first + blocks.back().count;
+        size_t abi = 0;
+        long long runStart = 0;
         float runAr = 0;
-        for (int f = 0; f <= n; f++) {
+        for (long long f = 0; f <= n; f++) {
             float ar = 0;
             if (f < n) {
-                int i = AspectAt((f + 0.5) / FPS);
+                while (abi < blocks.size() && f >= blocks[abi].first + blocks[abi].count) abi++;
+                double t = (double)(f + 0.5) / FPS;
+                if (abi < blocks.size() && f >= blocks[abi].first)
+                    t = blocks[abi].start + (double)(f - blocks[abi].first + 0.5) / FPS;
+                int i = AspectAt(t);
                 ar = i >= 0 ? g_aspects[i]->aspect : g_projPlateAr;
             }
             if (f == 0) { runAr = ar; continue; }
             if (f < n && fabsf(ar - runAr) < 1e-5f) continue;
             char line[64];
-            snprintf(line, sizeof(line), "%d %d %.5f\n", runStart, f - runStart, runAr);
+            snprintf(line, sizeof(line), "%lld %lld %.5f\n", runStart, f - runStart, runAr);
             runs += line;
             runAr = ar; runStart = f;
         }
